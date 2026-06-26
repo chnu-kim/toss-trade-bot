@@ -246,6 +246,72 @@ func TestClient_RetriesOn5xx(t *testing.T) {
 	}
 }
 
+func TestClient_RetriesOn429(t *testing.T) {
+	var pings int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth2/token":
+			tokenJSON(t, w, "tok-1", 86400)
+		case "/api/v1/ping":
+			if atomic.AddInt32(&pings, 1) <= 2 {
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv)
+	resp, err := c.Get(context.Background(), "/api/v1/ping")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after 429 backoff", resp.StatusCode)
+	}
+	drainClose(resp)
+	if n := atomic.LoadInt32(&pings); n != 3 {
+		t.Fatalf("ping called %d times, want 3 (two 429 then ok)", n)
+	}
+}
+
+func TestClient_PostRetriesTokenAcquisitionButNotTheWrite(t *testing.T) {
+	var issues, posts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth2/token":
+			if atomic.AddInt32(&issues, 1) == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable) // transient token outage
+				return
+			}
+			tokenJSON(t, w, "tok-1", 86400)
+		case "/api/v1/orders":
+			atomic.AddInt32(&posts, 1)
+			w.WriteHeader(http.StatusCreated)
+		}
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv)
+	resp, err := c.Post(context.Background(), "/api/v1/orders", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 after token reacquired", resp.StatusCode)
+	}
+	drainClose(resp)
+	if n := atomic.LoadInt32(&issues); n != 2 {
+		t.Fatalf("token issued %d times, want 2 (transient retry before send)", n)
+	}
+	// The order itself must be sent exactly once — pre-send token retry is safe,
+	// but the write is never resubmitted.
+	if n := atomic.LoadInt32(&posts); n != 1 {
+		t.Fatalf("order POST sent %d times, want 1", n)
+	}
+}
+
 func TestClient_PostDoesNotRetryOn5xx(t *testing.T) {
 	var posts int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

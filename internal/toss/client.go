@@ -77,21 +77,14 @@ func WithAccount(accountSeq string) RequestOption {
 	}
 }
 
-// Get performs an authenticated GET. It retries 5xx/network failures with
+// Get performs an authenticated GET. It retries 429/5xx/network failures with
 // exponential backoff and reissues the token once on a 401, both bounded.
 func (c *Client) Get(ctx context.Context, path string, opts ...RequestOption) (*http.Response, error) {
 	backoffs := 0
 	triedRefresh := false
 	for {
-		token, err := c.tokens.get(ctx)
+		token, err := c.acquireToken(ctx)
 		if err != nil {
-			if isTransient(err) && backoffs < maxRetries {
-				backoffs++
-				if werr := c.sleep(ctx, backoffDelay(backoffs)); werr != nil {
-					return nil, werr
-				}
-				continue
-			}
 			return nil, err
 		}
 
@@ -119,7 +112,7 @@ func (c *Client) Get(ctx context.Context, path string, opts ...RequestOption) (*
 			continue
 		}
 
-		if resp.StatusCode >= 500 && backoffs < maxRetries {
+		if isRetryableStatus(resp.StatusCode) && backoffs < maxRetries {
 			backoffs++
 			drainClose(resp)
 			if werr := c.sleep(ctx, backoffDelay(backoffs)); werr != nil {
@@ -132,11 +125,36 @@ func (c *Client) Get(ctx context.Context, path string, opts ...RequestOption) (*
 	}
 }
 
-// Post performs an authenticated POST. Writes are NOT auto-retried: a re-sent
-// order could double-fill. A 401 invalidates the cached token (it is known bad)
-// so the next call refreshes, but the body is never resubmitted here.
+// acquireToken returns a valid token, retrying transient (429/5xx/network)
+// issuance failures with bounded backoff. This is safe for any caller — GET or
+// POST — because it runs before a request is sent: retrying token issuance
+// never resubmits a write. Credential/4xx failures are terminal and returned
+// immediately.
+func (c *Client) acquireToken(ctx context.Context) (string, error) {
+	backoffs := 0
+	for {
+		token, err := c.tokens.get(ctx)
+		if err == nil {
+			return token, nil
+		}
+		if isTransient(err) && backoffs < maxRetries {
+			backoffs++
+			if werr := c.sleep(ctx, backoffDelay(backoffs)); werr != nil {
+				return "", werr
+			}
+			continue
+		}
+		return "", err
+	}
+}
+
+// Post performs an authenticated POST. The pre-send token acquisition retries
+// transient outages (no write is in flight yet), but the write itself is NEVER
+// auto-retried: a re-sent order could double-fill. A 401 invalidates the cached
+// token (it is known bad) so the next call refreshes, but the body is never
+// resubmitted here.
 func (c *Client) Post(ctx context.Context, path string, body io.Reader, opts ...RequestOption) (*http.Response, error) {
-	token, err := c.tokens.get(ctx)
+	token, err := c.acquireToken(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +213,7 @@ func (c *Client) issueToken(ctx context.Context) (string, time.Duration, error) 
 
 	if resp.StatusCode != http.StatusOK {
 		oerr := decodeOAuthError(resp)
-		if resp.StatusCode >= 500 {
+		if isRetryableStatus(resp.StatusCode) {
 			return "", 0, &transientError{err: oerr}
 		}
 		return "", 0, oerr
@@ -243,6 +261,12 @@ func (e *transientError) Unwrap() error { return e.err }
 func isTransient(err error) bool {
 	var t *transientError
 	return errors.As(err, &t)
+}
+
+// isRetryableStatus reports whether an HTTP status warrants a backoff retry for
+// safe (read/token) requests: rate limiting (429) and server errors (5xx).
+func isRetryableStatus(code int) bool {
+	return code == http.StatusTooManyRequests || code >= 500
 }
 
 // backoffDelay is exponential with a cap; attempt starts at 1.
