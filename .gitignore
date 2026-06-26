@@ -1,0 +1,16 @@
+# Compiled binaries
+/bin/
+/toss-trade-bot
+*.exe
+
+# Secrets / local env (never commit credentials)
+.env
+.env.*
+!configs/env.example
+
+# Dependencies
+/vendor/
+
+# OS / editor
+.DS_Store
+*.swp
