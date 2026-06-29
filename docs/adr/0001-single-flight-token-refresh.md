@@ -1,6 +1,6 @@
 # ADR-0001: OAuth2 토큰은 단일 매니저에서 single-flight로 발급·갱신한다
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-06-29
 - **Deciders**: chnu-kim
 - **관련 이슈/PR**: #1, PR #5
