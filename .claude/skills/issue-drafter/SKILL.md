@@ -30,10 +30,13 @@ SLUG="$owner/$repo"
 ## 1. 기존 ADR 읽기 (이 스킬의 핵심 추가)
 
 ```bash
-ls "$REPO"/docs/adr/ 2>/dev/null && cat "$REPO"/docs/adr/[0-9]*.md
+# Accepted ADR만 지배 근거로 쓴다 — template(0000)·Proposed·Superseded는 제외한다.
+for f in "$REPO"/docs/adr/[0-9][0-9][0-9][0-9]-*.md; do
+  grep -q '^- \*\*Status\*\*: Accepted' "$f" && { echo "=== $f ==="; cat "$f"; }
+done
 ```
 
-분해를 시작하기 전에 **현재 Accepted된 아키텍처 결정**을 머리에 넣는다. 분해 도중:
+분해를 시작하기 전에 **현재 `Status: Accepted`인 아키텍처 결정만** 머리에 넣는다. **Proposed/Superseded/template은 지배 근거로 쓰지 않는다** — 미승인·폐기된 결정을 이슈에 박으면 안 된다(아직 승인 안 된 ADR을 따라 구현이 진행되는 사고 방지). Proposed ADR이 이 이슈의 전제라면, 링크하지 말고 `## 미정 사항`에 "ADR-NNNN 승인 대기"로 남기거나 사용자에게 먼저 승인을 요청한다. 분해 도중:
 
 - 어떤 이슈가 특정 ADR이 정한 결정에 의존하면 → 그 이슈에 **지배 ADR을 링크**한다(아래 `## 설계 근거`).
 - 어떤 이슈를 제대로 명세하려는데 **아직 결정 안 된 아키텍처 포크**에 부딪히면(예: "주문 재시도를 어떻게 멱등하게?"인데 관련 ADR 없음) → **분해를 멈추고** 사용자에게 알린다: "이 이슈는 아직 결정 안 된 설계 X에 의존한다. `/architect <X>`로 ADR을 먼저 만든 뒤 다시 부르라." **아키텍처를 여기서 추측해 이슈 본문에 박지 않는다.**

@@ -69,6 +69,8 @@ gh issue view N --repo "$SLUG" --json number,title,body,labels,state
 **지배 ADR 읽기**: 이슈 본문의 `## 설계 근거`에 `ADR-NNNN` / `docs/adr/NNNN-*.md` 링크가 있으면 해당 파일을
 `cat`해 전문을 확보한다. 이 결정의 *근거와 버린 대안*을 서브에이전트가 모르면 구현 중 결정을 모른 채 위반한다
 (이 파이프라인이 실제로 겪은 통증). 확보한 ADR 전문은 3단계 프롬프트에 첨부한다.
+**단, 링크된 ADR의 `Status`를 확인한다** — `Accepted`가 아니면(Proposed/Superseded) **중단하고 사용자에게 알린다**:
+미승인·폐기된 결정을 확정 근거로 구현하면 안 된다. 사용자가 그 ADR을 Accepted로 올리거나 이슈 링크를 고친 뒤 재개한다.
 
 작업 트리가 깨끗한지 확인하고 main을 최신화한다:
 
