@@ -32,10 +32,9 @@ Toss Open API 실측(jq로 `openapi.json` 직접 검증):
    - **`orderId` 있음(`acked`)** → **`GET /api/v1/orders/{orderId}` 상세로 진실 확인.** 열림 상태면 추적, 닫힘(FILLED/CANCELED/REJECTED 등)이면 결과를 기록하고 종결. 상세조회는 *조회*이므로 실패 시 지수 백오프 재시도. 이 경로가 재시작 복구의 대부분을 해결한다.
    - **`submit-attempted` 있고 `orderId` 없음 = ambiguous submit** → 아래 3.
 
-3. **ambiguous submit은 best-effort 식별 후, 확정 못 하면 fail-closed한다.** orderId가 없으므로:
-   - (a) **OPEN 휴리스틱 매칭**: `GET /orders?status=OPEN`을 나열해 journal payload(symbol/side/quantity/price/orderedAt 근접)와 대조한다. **확신할 만큼 유일하게 매칭되면** 그 orderId를 journal(`acked`)에 기록하고 2의 상세조회 경로로 합류한다. 동일 후보가 복수면 매칭하지 않는다(오결합 금지).
-   - (b) **매칭 실패 시 ABSENT로 강등하지 않는다.** "OPEN에 없음"은 "안 들어감"과 "이미 체결됨"을 구분 못 하기 때문이다(CLOSED 조회 불가). intent를 **`unresolved-ambiguous`**로 두고 **국소 fail-closed**: 해당 **symbol에 한해** 신규 주문을 보류하고 외부 알림을 낸다. 나머지 종목은 정상 운영한다.
-   - (c) **빈발 시 전역 킬 스위치로 에스컬레이션.** ambiguous submit이 임계(연속/단위시간당 횟수)를 넘으면 네트워크·API 장애 같은 시스템 문제 신호이므로 봇 전체 신규 주문을 멈춘다. (킬 스위치 메커니즘 자체는 별도 ADR, 이 ADR은 트리거 조건을 정의·링크한다.)
+3. **orderId 없는 ambiguous submit은 곧장 fail-closed한다 — 추측 binding을 하지 않는다.** orderId가 없으면 진실을 확정할 수단이 없다: "OPEN에 없음"은 "안 들어감"과 "이미 체결됨"을 구분 못 하고(CLOSED 조회 불가), OPEN 목록을 payload(symbol/side/quantity/price)로 대조하는 것은 **API 기반 identity가 아니라 추측**이다 — 단일 매칭 OPEN 주문이 사실은 다른 봇 intent·동일 파라미터의 동시 전략 결정·수동/API 주문일 수 있어, 잘못된 orderId를 `acked`로 기록하면 무관한 주문을 이 intent의 진실로 취급해 중복 노출을 은폐하고 journal을 오염시킨다. 따라서:
+   - (a) intent를 **`unresolved-ambiguous`**로 두고 **국소 fail-closed**: 해당 **symbol에 한해** 신규 주문을 보류하고 외부 알림을 낸다. 나머지 종목은 정상 운영한다. **ABSENT로 강등하지도, payload 매칭으로 auto-ack하지도 않는다** — 해결은 사람 개입(또는 아래 불변식이 확립된 미래의 자동 복구)에 맡긴다.
+   - (b) **빈발 시 전역 킬 스위치로 에스컬레이션.** ambiguous submit이 임계(연속/단위시간당 횟수)를 넘으면 네트워크·API 장애 같은 시스템 문제 신호이므로 봇 전체 신규 주문을 멈춘다. (킬 스위치 메커니즘 자체는 별도 ADR, 이 ADR은 트리거 조건을 정의·링크한다.)
 
 4. **order 계층은 어떤 경우에도 자동 재제출/재전송하지 않는다.** terminal로 닫힌 intent(`aborted-before-submit`, 닫힌 주문)의 재시도 결정 주인은 의미를 아는 전략이다 — 새 intentId로, 현재 가격 기준으로 재발행한다. 근거: 같은 clientOrderId 재사용 backstop은 서버 dedup이 미정의라 신뢰 불가하고, 무인에서 order가 자동 전송하면 중복 체결·stale 결정을 유발한다.
 
@@ -44,6 +43,7 @@ Toss Open API 실측(jq로 `openapi.json` 직접 검증):
 - **OPEN+CLOSED 나열 후 clientOrderId로 매칭(이전 버전의 토대)** — 기각: **원천 불가능**. clientOrderId는 목록·상세에 없고 CLOSED 나열은 400. orderId 상세조회로 대체한다.
 - **CLOSED lookback 동적 창** — 기각: `status=CLOSED`가 미지원(400)이라 나열 자체가 불가. 닫힌 주문은 orderId 상세조회로만 닿는다.
 - **ambiguous submit에서 "OPEN에 없으면 즉시 ABSENT"** — 기각: CLOSED 조회가 없어 "체결됨"을 "없음"으로 오판 → 전략 재발행 → 중복 체결. ABSENT를 확정할 수단이 없으므로 fail-closed가 정답이다.
+- **ambiguous submit을 OPEN payload 휴리스틱 매칭으로 auto-ack** — 기각(codex adversarial-review 지적): payload(symbol/side/quantity/price/orderedAt) 유일성은 API·암호학 기반 identity가 아니라 **결과 집합 내 추측**이다. 단일 매칭 OPEN 주문이 다른 봇 intent·동시 동일 파라미터 결정·이미 알던 다른 주문·수동/API 주문일 수 있어, 잘못된 orderId를 `acked`로 박으면 무관한 주문을 진실로 취급해 중복 노출 은폐·잘못된 취소/상태 처리·journal 오염을 부른다. 안전한 자동 복구는 enforceable 불변식(① known journal orderId 전부 제외 ② 봇 전용 계정/namespace 가정 ③ 매칭 창 내 동시 same-symbol·side·price·quantity 주문 불가)이 **증명될 때만** 가능한데, 현재 이 불변식을 보장할 수 없으므로 fail-closed가 정답이다.
 - **ambiguous submit 시 같은 clientOrderId로 1회 자동 재제출** — 기각: 서버 dedup 미정의 + 나열-재제출 레이스로 중복 체결 잔여 위험. CLAUDE.md "주문 자동 재시도 금지"의 안전한 해석은 "order는 재전송하지 않는다".
 - **전역 fail-closed(ambiguous 1건에 봇 전체 정지)** — 기각: blind spot이 "응답 유실" 하나로 줄어 빈도가 극히 낮은데, 1건마다 전체를 멈추면 무인성을 과하게 희생한다. 국소(symbol) 차단 + 빈발 시 전역 에스컬레이션이 비례적이다.
 - **holdings 집계로 추정 후 진행(중복 감수)** — 기각: 집계 포지션은 동시 다른 체결과 섞여 disambiguate가 약하고, 비가역 자금에서 "추정 후 진행"은 중복 체결을 사후 교정에 맡긴다 — 폭발 반경이 가장 크다.
@@ -55,6 +55,6 @@ Toss Open API 실측(jq로 `openapi.json` 직접 검증):
 - (좋음) orderId 상세조회로 "응답을 받은 주문"은 항상 진실에 닿는다 → 재시작 복구 대부분이 결정적으로 해결된다.
 - (좋음) prepare 도중 크래시가 영속 UNKNOWN→킬 스위치로 번지지 않는다(`submit-attempted` 분기 → `aborted-before-submit`).
 - (좋음) fail-safe 방향이 명확하다: 확정 못 하는 ambiguous는 국소 차단, 빈발 시 전역 정지. 중복 체결을 구조적으로 억제하고 무인성 손실은 해당 symbol·장애 상황으로 국한한다.
-- (비용) ambiguous submit의 OPEN 휴리스틱 매칭은 best-effort이며 오결합을 피하려 보수적이다 — 매칭 실패율(=국소 차단 빈도)이 운영 지표가 된다. settle/임계/매칭 기준 같은 파라미터는 단위 테스트(시계·mock 나열 주입)로 경계를 커버한다.
+- (비용) **orderId 없는 ambiguous submit은 자동 복구하지 않고 국소 차단한다** — OPEN payload 추측 binding으로 journal을 오염시키느니 사람 개입을 택한다. 국소 차단 빈도(=실제 응답 유실률)가 운영 지표가 되고, 이 값이 낮다는 전제가 fail-closed의 무인성 비용을 수용 가능하게 만든다. settle window·빈발 임계 파라미터는 단위 테스트(시계·mock 주입)로 경계를 커버한다.
 - (제약 전파) 전략은 terminal로 닫힌 intent(`aborted-before-submit`, 닫힌 주문)의 재시도를 새 intentId·현재 가격으로 책임진다.
-- (후속) **킬 스위치 메커니즘**(국소·전역 차단 상태, 빈발 임계, 해제 절차, 알림 채널)은 별도 ADR. ambiguous 휴리스틱 매칭의 정확한 기준과 OPEN 나열 빈도는 구현 이슈로 분리한다.
+- (후속) **킬 스위치 메커니즘**(국소·전역 차단 상태, 빈발 임계, 해제 절차, 알림 채널)은 별도 ADR. **ambiguous submit 자동 복구**를 미래에 원한다면, 위 Alternatives의 세 불변식(known orderId 제외·봇 전용 계정 namespace·매칭 창 내 동시 동일주문 불가)을 먼저 확립하는 별도 ADR이 선행해야 한다 — 그 전까지 기본은 국소 fail-closed다.
