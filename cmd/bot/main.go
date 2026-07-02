@@ -6,17 +6,23 @@ package main
 
 import (
 	"context"
-	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/chnu-kim/toss-trade-bot/internal/config"
+	"github.com/chnu-kim/toss-trade-bot/internal/runtime"
 	"github.com/chnu-kim/toss-trade-bot/internal/toss"
 )
 
+// shutdownTimeout bounds how long we wait for supervised goroutines to drain
+// after a shutdown signal, so an unattended restart is never blocked forever by
+// a stuck loop.
+const shutdownTimeout = 10 * time.Second
+
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	logger := runtime.NewLogger(os.Stdout)
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -29,11 +35,21 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Every long-lived loop launches via sup.Go so a panic in one is logged
+	// and contained instead of crashing the process. No loops exist yet; the
+	// supervisor is the boundary they will attach to as strategy/order logic
+	// lands.
+	sup := runtime.NewSupervisor(logger)
+
 	client := toss.NewClient(cfg.BaseURL, cfg.ClientID, cfg.ClientSecret)
 	_ = client // wired into the trading loop as strategy/order logic lands.
 
 	logger.Info("toss-trade-bot starting", "base_url", cfg.BaseURL)
 
 	<-ctx.Done()
-	logger.Info("shutting down")
+	logger.Info("shutting down", "drain_timeout", shutdownTimeout.String())
+	if !sup.Wait(shutdownTimeout) {
+		logger.Warn("shutdown timed out with goroutines still running", "drain_timeout", shutdownTimeout.String())
+	}
+	logger.Info("shutdown complete")
 }
