@@ -43,8 +43,9 @@
 
 6. **보존(retention): terminal만, 보존창 경과 후 prune. reconciler가 필요한 상태는 절대 prune하지 않는다.** 저장소 크기를 **동시 in-flight 주문 수 + 상태 몇 줄**로 유계로 유지한다.
    - **절대 prune 안 함**: 비-terminal intent(`prepared`, 미해결 `submit-attempted`, `unresolved-ambiguous`), 현재 halt 상태, 영속 카운터.
-   - **prune 대상**: terminal로 닫힌 intent(`aborted-before-submit`, 종결 주문)만, **보존창 경과 후**. 결과는 그 전에 감사 로그로 나간다.
-   - 보존창 길이·prune 주기는 구현 이슈(파라미터, 단위 테스트로 경계 커버). 이 ADR은 규칙("terminal만, 창 경과 후, reconciler 필요분 불가")만 고정한다.
+   - **prune 대상**: terminal로 닫힌 intent(`aborted-before-submit`, 종결 주문)만, **보존창 경과 후 + 감사 내구성 ack 확인 후**(아래 prune-gating).
+   - **prune-gating(감사 내구성 계약)**: terminal 행은 **감사 sink가 대응 주문/체결/에러 기록을 durable하게 ack하기 전까지 prune하지 않는다.** "결과가 감사 로그로 나갔다"는 단정만으로 지우지 않는다 — 감사 sink는 point 5에서 저장소 밖 별도 계층이라, 로그 write 실패·회전 유실·수집기 다운·terminal화 직후 durable 영속 전 크래시 시 그 기록이 **비가역 자금행위의 유일한 사본**일 수 있다(CLAUDE.md "모든 주문/체결/에러 영속 기록" 불변식). 따라서 **ack를 못 받으면 보존 쪽으로 fail한다(삭제 아님)** — fail-safe 방향이 "잃음"이 아니라 "남김"이다. ack 추적은 둘 중 하나로 구현한다: (a) 감사 sink의 durable ack를 store에 트랜잭션으로 기록하고 그 플래그가 선 행만 prune 대상, 또는 (b) sink가 멱등·재시도 가능하게 ingest를 확인하기 전까지 **최소 terminal 감사 레코드를 SQLite에 fallback 보존**. 감사 sink의 내구성·재시도·멱등 계약 자체는 **prune을 활성화하기 전에** 정의한다(감사 sink 설계 후속 이슈의 선행 조건).
+   - 보존창 길이·prune 주기·ack 추적 방식은 구현 이슈(파라미터, 단위 테스트로 경계 커버). 이 ADR은 규칙("terminal만, 창 경과 후, **감사 ack 후**, reconciler 필요분 불가, ack 부재 시 보존")만 고정한다.
    - **durable append 실패(디스크 풀 포함)는 fail-closed 취급** — 기록하지 못하면 안전하게 제출할 수 없다. 트리거로서의 처리(전역 halt 에스컬레이션)는 killswitch(ADR-0004) 영역이며 이 ADR은 조건만 링크한다.
 
 7. **ADR-0002와의 관계 = substrate-only supersede.** 이 ADR은 ADR-0002가 추상적으로 남긴 substrate(*"append-only 파일 + fsync"*)를 **구체화**한다. ADR-0002의 실제 결정(2-마커 모델, orderId 1차 키, clientOrderId deterministic 도출)은 바뀌지 않는다 — 그것이 얹히는 저장 매체만 SQLite 트랜잭션 store로 확정된다. 따라서 ADR-0002를 전체 `Superseded`로 표시하지 않는다. ADR-0002의 "append-only 파일 + fsync" 표현은 **substrate 한정으로만** 이 ADR에 의해 대체된다(내구성 계약 point 4가 그 fsync 의도를 그대로 이어받는다).
@@ -62,6 +63,7 @@
 - **감사 로그를 트랜잭션 저장소에 함께 적재** — 기각: 라이브 상태 저장소를 히스토리로 부풀리고, 감사 볼륨을 commit 내구성 비용에 묶는다. 관측성은 구조화 로깅으로 분리한다.
 - **journal을 영원히 보존(prune 안 함)** — 기각: 무인 24/7에서 무한 성장 → 디스크 풀 → `submit-attempted` append 불가 → 새 ambiguous submit. 성장은 안전 문제다.
 - **비-terminal까지 prune(단순 시간 기준 일괄 삭제)** — 기각: reconciler가 재시작에 필요한 미해결 intent·halt·카운터를 지우면 복구가 깨진다. prune은 terminal에만, 보존창 뒤에만.
+- **"결과가 감사 로그로 나갔다" 단정만으로 terminal prune(감사 ack 게이팅 없음)** — 기각(codex adversarial-review 지적): 감사 sink는 저장소 밖 별도 계층(point 5)이라, 로그 write 실패·회전 유실·수집기 다운·terminal화 직후 크래시 시 그 기록이 비가역 자금행위의 유일한 사본일 수 있다. reconciler가 더는 필요로 하지 않는 terminal 행을 prune이 지우면 감사 이력이 영구 소실된다(CLAUDE.md 관측성 불변식 위반). prune을 감사 durable ack에 게이팅하고, ack 부재 시 보존 쪽으로 fail한다.
 
 ## Consequences
 
@@ -69,7 +71,7 @@
 - (좋음) 도메인 인지형 store에 스키마·마이그레이션·직렬화가 한 곳에 모여, stateless 구현자·검수자가 "무엇을 어떻게 영속하나"를 한 파일에서 읽는다. 소비자는 인터페이스에 의존해 가짜로 테스트하고, 내구성·크래시 검증은 실제 엔진(temp dir)으로 돌린다.
 - (좋음) 순수 Go SQLite로 `CGO_ENABLED=0` 정적 바이너리·크로스컴파일·distroless 이미지가 공짜다 → 무인 배포·OSS 재현성이 단순하다.
 - (좋음) SQL 모델·안정적 store 인터페이스 덕에 미래 Postgres/MySQL 전환이 드라이버+방언 교체로 축소된다(전면 재작성 아님).
-- (좋음) 저장소가 라이브 상태만 담고 terminal을 보존창 뒤 prune하므로 크기가 in-flight 주문 수로 유계다 → 디스크 풀발 안전사고를 구조적으로 억제한다.
+- (좋음) 저장소가 라이브 상태만 담고 terminal을 보존창 뒤 prune하므로 크기가 in-flight 주문 수로 유계다 → 디스크 풀발 안전사고를 구조적으로 억제한다. **prune이 감사 durable ack에 게이팅되어(ack 부재 시 보존) 자금행위 감사 이력을 잃지 않는다** — 유계와 무손실이 양립한다.
 - (좋음) 내구성 완화 금지를 ADR에 명시해, 미래 "최적화"가 2-마커 crash-safety를 조용히 무효화하는 fail-open을 봉쇄한다.
 - (비용) POST 경로에 마커별 fsync commit이 다회(`prepared`/`submit-attempted`/`acked`) 들어간다. 폴링 기반이라 수용하지만, "하나의 사건이 journal + halt를 동시에 건드릴 때만 원자 결합"이라는 경계를 구현이 정확히 지켜야 한다.
 - (비용) 도메인 인지형 store는 영속 레코드 타입을 아는 "살짝 뚱뚱한 leaf"다. 스키마 변경은 마이그레이션을 동반한다.
@@ -79,7 +81,7 @@
   - **`internal/store` 구현 이슈** — 스키마·마이그레이션 도구·인터페이스 형태(`Tx` 추상·타입 메서드 시그니처)·실제 엔진 크래시/원자성 테스트(temp dir, `go test -race`).
   - **단일 writer 직렬화** — SQLite는 단일 writer인데 ADR-0001은 다수 goroutine이 돈다. `Atomically`는 쓰기를 직렬화(예: 전용 write 커넥션 1개)해야 order 경로에서 `SQLITE_BUSY`발 허위 fail-closed가 나지 않는다. 이 성질을 구현이 보장하고 `-race`로 검증한다.
   - **보존창 길이·prune 주기 파라미터** — 단위 테스트로 경계 커버. "미해결 intent는 절대 prune 안 됨"을 반드시 테스트.
-  - **감사/관측성 로그 sink 설계** — 구조화 로깅 포맷·대상·회전(rotation). 저장소와의 경계 유지.
+  - **감사/관측성 로그 sink 설계** — 구조화 로깅 포맷·대상·회전(rotation). 저장소와의 경계 유지. **내구성·재시도·멱등·ack 계약을 정의하고, 이 계약이 서기 전까지 terminal prune을 활성화하지 않는다**(point 6 prune-gating의 선행 조건).
   - **디스크 풀 → 전역 halt 트리거 배선** — durable append 실패를 killswitch(ADR-0004) 트리거로 연결.
   - **이벤트 + 아웃박스 패턴 도입 검토** — journal이 이미 outbox이므로, 미래에 이벤트 발행/외부 소비를 붙일 때 이 저장소 위에서 확장 검토.
   - **미래 Postgres/MySQL 전환 ADR** — 프로세스 밖 저장소가 실제 필요해질 때(운영 툴링·백업 인프라 요구) 드라이버+방언 전환을 별도 ADR로.
