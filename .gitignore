@@ -11,6 +11,11 @@
 # Dependencies
 /vendor/
 
+# SQLite store artifacts (live order/halt state — never commit)
+*.db
+*.db-wal
+*.db-shm
+
 # OS / editor
 .DS_Store
 *.swp
