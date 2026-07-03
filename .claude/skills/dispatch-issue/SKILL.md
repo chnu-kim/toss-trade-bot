@@ -154,10 +154,12 @@ git -C "$REPO" worktree add "$WT" "$BR"
 
 ```bash
 # $FRICTION/$JUDGMENT/$CODEX 는 위 게이트를 통과한 public-safe 요약이어야 한다.
-gh pr comment <PR> --repo "$SLUG" --body "$(printf '## 회고 증거 (retro evidence)\n- 마찰: %s\n- 판단/모호: %s\n- codex 대응: %s\n' "$FRICTION" "$JUDGMENT" "$CODEX")"
+# §0 규칙: active gh 계정이 명령 사이 되돌아갈 수 있으므로 검증 계정으로 핀 후 같은 셸에서 게시.
+gh auth switch --user <§0 검증 계정> >/dev/null && \
+  gh pr comment <PR> --repo "$SLUG" --body "$(printf '## 회고 증거 (retro evidence)\n- 마찰: %s\n- 판단/모호: %s\n- codex 대응: %s\n' "$FRICTION" "$JUDGMENT" "$CODEX")"
 ```
 
-이 handoff가 없으면 §6 회고가 증거 없이 돌아 학습을 skip하거나 낡은 컨텍스트로 추론한다(codex adversarial 지적, PR #21).
+게시 후 코멘트가 실제로 붙었는지 확인한다. **실패하면 persist된 척 계속하지 말고 §4 리포트에 handoff 실패로 알린다** — §6이 나중에 이 코멘트에 의존하므로, 조용히 증거 없는 회고로 degrade시키지 않는다. 이 handoff가 없으면 §6 회고가 증거 없이 돌아 학습을 skip하거나 낡은 컨텍스트로 추론한다(codex adversarial 지적, PR #21).
 
 ---
 
@@ -187,8 +189,10 @@ git -C "$REPO" branch -d "$BR"
 **증거는 컨텍스트가 아니라 PR 코멘트에서 fetch한다** — cleanup은 dispatch와 다른 세션일 수 있어 서브에이전트 반환이 컨텍스트에 없다. §4가 남긴 "회고 증거" 코멘트를 읽는다:
 
 ```bash
-gh pr view <PR> --repo "$SLUG" --json comments \
-  --jq '.comments[] | select(.body|startswith("## 회고 증거")) | .body'
+# §0 규칙대로 검증 계정 핀 후 같은 셸에서 fetch.
+gh auth switch --user <§0 검증 계정> >/dev/null && \
+  gh pr view <PR> --repo "$SLUG" --json comments \
+    --jq '.comments[] | select(.body|startswith("## 회고 증거")) | .body'
 ```
 
 이 코멘트의 **마찰·판단·codex 대응**이 회고 증거다. 너는 서브에이전트 transcript를 못 봤으므로 회고를 그 증거 + 오케스트레이션 수준으로 한정한다(retro §1의 서브에이전트 맹점). 코멘트가 없으면(구버전 PR 등) 증거 부재를 인정하고 오케스트레이션 수준으로만 회고하거나 skip한다 — 없는 걸 추측하지 않는다. 학습이 memory면 자율 기록, CLAUDE.md·ADR·스킬급이면 프리뷰 후 승인받는다.
