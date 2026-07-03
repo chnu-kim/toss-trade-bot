@@ -139,27 +139,34 @@ git -C "$REPO" worktree add "$WT" "$BR"
 
 ## 4. 사람 게이트 2 + 보고 (메인 에이전트)
 
-서브에이전트 결과를 받아 사용자에게 간결히 보고:
+머지 안내를 하기 **전에** 회고 증거를 먼저 handoff한다(4a) — 그래야 성공/실패를 알고 사용자 리포트(4b)에 그 상태를 함께 담아, 실패를 모른 채 머지시키지 않는다.
+
+### 4a. 회고 증거 durable handoff (§6 선행, 리포트보다 먼저)
+
+cleanup·회고는 **다른 세션에서 머지 후** 돌 수 있어 그때 서브에이전트 반환이 컨텍스트에 없다. 그래서 지금(반환이 손에 있을 때) 서브에이전트의 **마찰·판단·codex 대응**을 PR 코멘트로 persist한다 — 세션에 안 묶이고 PR에 붙는 유일한 durable 표면이다.
+
+> ⚠️ **게시 전 public-readiness 게이트(필수).** PR 코멘트는 durable GitHub 히스토리인데 **커밋-타임 `opensource-maintainer` 게이트를 우회**한다. 이 레포는 언제든 public 전환 가능하므로, 반환 필드를 raw로 덤프하지 말고 **큐레이션한 구조적 요약**으로 옮기며 시크릿·`/Users/…` 등 개인 경로·account/tool 식별자·env 값·raw 명령 출력/로그가 없는지 확인한다(opensource-maintainer와 같은 기준). **안전하게 못 쓰겠으면 게시하지 말고** handoff 상태를 `민감으로 skip`으로 둔다.
+
+**코멘트는 self-identifying해야 한다** — §6이 낡은/다른 코멘트를 evidence로 오인하지 않도록 헤더에 issue#·PR#·시각을 박는다. (PR 코멘트는 사람·자동화가 편집·추가할 수 있어 마커만 맞으면 옛 retry 코멘트를 소비할 위험. **solo private repo라 author 위조 방어는 과설계로 스코프 아웃**하고, staleness/중복만 막는다.)
+
+```bash
+# $FRICTION/$JUDGMENT/$CODEX 는 위 게이트를 통과한 public-safe 요약. TS=실행 시각(date -u +%FT%TZ).
+# §0 규칙: active gh 계정이 명령 사이 되돌아갈 수 있으므로 검증 계정으로 핀 후 같은 셸에서 게시.
+gh auth switch --user <§0 검증 계정> >/dev/null && \
+  gh pr comment <PR> --repo "$SLUG" --body "$(printf '## 회고 증거 (retro evidence) · issue #%s · PR #%s · %s\n- 마찰: %s\n- 판단/모호: %s\n- codex 대응: %s\n' "$N" "$PR" "$TS" "$FRICTION" "$JUDGMENT" "$CODEX")"
+```
+
+게시 후 코멘트가 검증 계정 author로 실제 붙었는지 확인한다. **handoff 상태**를 `게시·검증됨` / `민감 skip` / `실패` 중 하나로 확정한다. 실패면 persist된 척 계속하지 않는다(§6이 이 코멘트에 의존).
+
+### 4b. 사용자 보고
 
 - PR URL (← 사용자가 **검수하고 직접 머지**)
 - 테스트/검증 게이트 통과 현황
 - 서브에이전트가 보고한 판단·모호했던 점
+- **회고 handoff 상태**(4a): `게시·검증됨` / `민감 skip` / `실패` — skip·실패면 "cleanup 회고가 오케스트레이션 수준으로 한정됨"을 명시.
 - 안내: "검수 후 머지하면 `/dispatch-issue --cleanup {N}` 로 worktree·브랜치를 정리하겠습니다."
 
 **메인은 절대 머지하지 않는다.**
-
-**회고 증거를 durable하게 handoff한다(§6 선행).** cleanup·회고는 **다른 세션에서 머지 후** 돌 수 있어 그때 서브에이전트 반환이 컨텍스트에 없다. 그래서 지금(반환이 손에 있을 때) 서브에이전트의 **마찰·판단·codex 대응**을 PR 코멘트로 persist한다 — 세션에 안 묶이고 PR에 붙는 유일한 durable 표면이다.
-
-> ⚠️ **게시 전 public-readiness 게이트(필수).** PR 코멘트는 durable GitHub 히스토리인데 **커밋-타임 `opensource-maintainer` 게이트를 우회**한다. 이 레포는 언제든 public 전환 가능하므로, 반환 필드를 raw로 덤프하지 말고 **큐레이션한 구조적 요약**으로 옮기며 시크릿·`/Users/…` 등 개인 경로·account/tool 식별자·env 값·raw 명령 출력/로그가 없는지 확인한다(opensource-maintainer와 같은 기준). **안전하게 못 쓰겠으면 게시하지 말고**(`회고 증거 없음(민감)` 한 줄만) §4 사용자 리포트에서 그 사실을 알린다 — 회고는 그때 오케스트레이션 수준으로 한정된다.
-
-```bash
-# $FRICTION/$JUDGMENT/$CODEX 는 위 게이트를 통과한 public-safe 요약이어야 한다.
-# §0 규칙: active gh 계정이 명령 사이 되돌아갈 수 있으므로 검증 계정으로 핀 후 같은 셸에서 게시.
-gh auth switch --user <§0 검증 계정> >/dev/null && \
-  gh pr comment <PR> --repo "$SLUG" --body "$(printf '## 회고 증거 (retro evidence)\n- 마찰: %s\n- 판단/모호: %s\n- codex 대응: %s\n' "$FRICTION" "$JUDGMENT" "$CODEX")"
-```
-
-게시 후 코멘트가 실제로 붙었는지 확인한다. **실패하면 persist된 척 계속하지 말고 §4 리포트에 handoff 실패로 알린다** — §6이 나중에 이 코멘트에 의존하므로, 조용히 증거 없는 회고로 degrade시키지 않는다. 이 handoff가 없으면 §6 회고가 증거 없이 돌아 학습을 skip하거나 낡은 컨텍스트로 추론한다(codex adversarial 지적, PR #21).
 
 ---
 
@@ -189,10 +196,12 @@ git -C "$REPO" branch -d "$BR"
 **증거는 컨텍스트가 아니라 PR 코멘트에서 fetch한다** — cleanup은 dispatch와 다른 세션일 수 있어 서브에이전트 반환이 컨텍스트에 없다. §4가 남긴 "회고 증거" 코멘트를 읽는다:
 
 ```bash
-# §0 규칙대로 검증 계정 핀 후 같은 셸에서 fetch.
+# §0 규칙대로 검증 계정 핀 후 같은 셸에서 fetch. 이 PR 마커 + 검증 계정 author로 좁히고 최신 하나만.
 gh auth switch --user <§0 검증 계정> >/dev/null && \
-  gh pr view <PR> --repo "$SLUG" --json comments \
-    --jq '.comments[] | select(.body|startswith("## 회고 증거")) | .body'
+  gh pr view <PR> --repo "$SLUG" --json comments --jq \
+    '[.comments[] | select(.author.login=="<§0 검증 계정>" and (.body|startswith("## 회고 증거")) and (.body|contains("PR #<PR>")))] | sort_by(.createdAt) | last | .body // "NONE"'
 ```
+
+`NONE`이면 증거 부재 — 오케스트레이션 수준으로만 회고하거나 skip한다(없는 걸 추측하지 않는다). 후보가 모순되게 여럿이면(예: 서로 다른 재실행 흔적) 최신을 쓰되 사용자에게 그 사실을 알려 확인받는다.
 
 이 코멘트의 **마찰·판단·codex 대응**이 회고 증거다. 너는 서브에이전트 transcript를 못 봤으므로 회고를 그 증거 + 오케스트레이션 수준으로 한정한다(retro §1의 서브에이전트 맹점). 코멘트가 없으면(구버전 PR 등) 증거 부재를 인정하고 오케스트레이션 수준으로만 회고하거나 skip한다 — 없는 걸 추측하지 않는다. 학습이 memory면 자율 기록, CLAUDE.md·ADR·스킬급이면 프리뷰 후 승인받는다.
