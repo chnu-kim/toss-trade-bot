@@ -48,9 +48,9 @@
    - **체결**: per-fill id가 없으므로(**실측**) **스냅샷 버전**으로 다룬다 — `orderId + 재무필드 digest`(filledQuantity·averageFilledPrice·filledAmount·commission·tax·settlementDate에 대한 결정적 다이제스트)로 합성한다. **누적 filledQuantity 증가만이 아니라 재무필드 중 하나라도 바뀌면 감사 레코드를 방출**한다. 같은 스냅샷 재폴링은 digest 일치로 자연 dedup되지만, **동일 수량에서의 수수료·세금·결제일(settlementDate) 정정은 새 digest → 새(정정) 레코드로 감사에 남는다**(재구성·수수료·세금·결제 진단에 필요 — 누적량만으로 dedup하면 이 정정이 중복으로 억제돼 소실된다).
    - **에러**: 자연키가 없다 → `(intentId|orderId|"global") + 연산(operation) + 에러클래스 + 발생시퀀스`로 합성하되, **발생시퀀스는 별도 카운터가 아니라 로컬 durable append 위치(감사 로그 offset/record id)에서 파생**한다 — seq 할당과 레코드 append를 **하나의 크래시-복구 가능한 연산**으로 묶어, 카운터 전진과 레코드 durability 사이 크래시가 seq를 건너뛰거나 같은 에러를 다른 키로 재방출하는 것을 원천 차단한다. **재구성 불가하므로 발생 시점 durable write가 필수**이고(1의 근거), fsync 미완(torn tail)은 재시작 시 폐기(ack 안 됨)되어 downstream 미관측이므로 새 위치로 재방출해도 정합하며, durable append 자체 실패는 point 6 fail-closed로 수렴한다.
 
-4. **prune을 여는 "durable ack" = 로컬 fsync 완료. 원격 수집기 확인이 아니다.** terminal intent의 감사 레코드(최종 execution 스냅샷 포함)가 **로컬 durable 파일에 fsync된 순간** ack가 성립하고, 그 ack를 받아야 prune이 열린다. 원격 확인에 게이팅하지 않는다 — 수집기 다운이 journal 무한 성장 → 디스크 풀(ADR-0005가 봉쇄한 실패)로 되돌아가기 때문이다. 로컬 fsync는 디스크 풀이 아닌 한 항상 달성 가능하고, **디스크 풀 자체는 fail-closed(point 6)**라 안전 방향으로 수렴한다. 원격 배송은 5에서 분리한다.
+4. **prune을 여는 "durable ack" = 로컬 fsync 완료. 원격 수집기 확인이 아니다.** intent의 **모든 lifecycle 감사 레코드**(각 마커 `prepared`·`submit-attempted`·`acked` 전이 + 최종 execution 스냅샷을 담은 terminal)가 **로컬 durable 파일에 fsync된 순간** 그 intent의 ack가 성립하고, 그 ack를 받아야 prune이 열린다. **terminal 레코드 하나만으로 게이팅하지 않는다** — 마커가 store journal에 커밋된 뒤 그 마커의 감사 write가 fsync되기 전에 크래시했는데 terminal만 ack돼 prune이 journal(그 중간 마커 감사의 **유일한 durable outbox**)을 지우면, 재구성 불가한 중간 lifecycle 감사가 영구 소실되어 "모든 주문 감사" 불변식이 깨진다. 원격 확인에 게이팅하지 않는다 — 수집기 다운이 journal 무한 성장 → 디스크 풀(ADR-0005가 봉쇄한 실패)로 되돌아가기 때문이다. 로컬 fsync는 디스크 풀이 아닌 한 항상 달성 가능하고, **디스크 풀 자체는 fail-closed(point 6)**라 안전 방향으로 수렴한다. 원격 배송은 5에서 분리한다.
 
-   **prune-gate 구현 = ADR-0005 후보 (a).** terminal intent 행에 **ack 플래그/타임스탬프**를 store 트랜잭션으로 기록하고(감사 *내용*이 아니라 boolean/timestamp만 — store를 히스토리로 부풀리지 않는다, point 5), 그 플래그가 선 terminal 행만 prune 대상이 된다. 후보 (b)(terminal 감사 내용을 SQLite에 fallback 보존)는 기각 — 감사 히스토리를 트랜잭션 저장소로 밀어넣어 point 5를 위반한다. **복구 루프**: terminal화 후 감사 fsync 전에 크래시하면 재시작 시 reconciler가 **ack 미표시 terminal intent를 감사 sink로 re-emit**한다(멱등이라 소비 측에서 병합). ack가 서면 그때만 prune-eligible. 즉 store journal이 **주문 수명주기 감사의 durable outbox** 역할을 하고, ack 플래그가 그 위의 prune-gate 층이다. (체결·에러는 3의 자체 durable 경로로 보장되며 개별적으로 journal prune을 게이팅하지 않는다 — terminal 감사 레코드가 최종 체결 스냅샷을 포함해 그 시점의 자금 결과를 봉인한다.)
+   **prune-gate 구현 = ADR-0005 후보 (a).** intent 행에 **"모든 lifecycle 감사 레코드 durable ack 완료" 플래그/타임스탬프**를 store 트랜잭션으로 기록하고(감사 *내용*이 아니라 boolean/timestamp만 — store를 히스토리로 부풀리지 않는다, point 5), 그 플래그가 선 intent만 prune 대상이 된다. 후보 (b)(감사 내용을 SQLite에 fallback 보존)는 기각 — 감사 히스토리를 트랜잭션 저장소로 밀어넣어 point 5를 위반한다. **복구 루프**: 마커 커밋 후 그 감사 fsync 전에 크래시하면, 재시작 시 reconciler가 **아직 fully-audited로 ack되지 않은 intent의 모든 lifecycle 감사 레코드를 journal 상태(마커·orderId·상태·시각)에서 결정적으로 재구성해 re-emit**한다(중간 마커 전이 감사를 포함, 멱등키로 소비 측 병합). journal이 마커 히스토리를 prune 전까지 들고 있으므로 재구성이 성립한다 — 모든 lifecycle 레코드가 durable ack된 뒤에만 그 intent가 prune-eligible. 즉 store journal이 **주문 수명주기 감사(중간 마커 포함)의 durable outbox** 역할을 하고, per-intent fully-audited 플래그가 그 위의 prune-gate 층이다. (체결·에러는 3의 자체 durable 경로로 보장되며 개별적으로 journal prune을 게이팅하지 않는다.)
 
 5. **원격 배송(shipping)은 로컬 durable 스테이지에서 분리된 async best-effort이고, 자체 보존·재시도를 가지며 prune을 게이팅하지 않는다.** 로컬 durable 파일을 원격 sink로 밀어보내는 일은 별도 파이프라인이다 — 실패해도 **주문 루프를 막지 않고**, 지수 백오프로 재시도하며, 배송 확인 전까지 로컬 파일을 보존한다(회전 시 미배송분 유실 금지). 이 보존은 **prune-gating과 독립**이다(prune은 로컬 fsync ack에만 게이팅, 4). 원격이 오래 다운되면 로컬 파일이 커지므로, 로컬 감사 디스크 사용도 **모니터링 대상**이며 임계 초과는 운영 알림(대상 미정)으로 승격한다.
 
@@ -62,6 +62,7 @@
 - **"durable ack" = 원격 수집기 확인** — 기각: 수집기 다운 시 terminal 행이 prune되지 않아 journal 무한 성장 → 디스크 풀(ADR-0005 point 6이 봉쇄한 바로 그 fail 모드)로 되돌아간다. 더 강한 보증처럼 보이나, 무인 24/7에서는 오히려 안전사고를 재도입한다. 로컬 fsync를 ack로 삼고 원격 배송을 분리(재시도·모니터링)하는 편이 유계와 무손실을 양립시킨다.
 - **"durable ack" = 메모리 버퍼 적재(async flush)** — 기각: 크래시로 자금행위 기록이 소실된다(관측성 불변식 위반). ADR-0005 point 4의 "내구성 완화 금지"와 동일 정신 — 도장을 찍었다고 믿는데 안 남는 fail-open.
 - **prune-gate 후보 (b): terminal 감사 내용을 SQLite에 fallback 보존** — 기각: 감사 히스토리를 트랜잭션 저장소로 밀어넣어 ADR-0005 point 5(라이브 상태 store를 히스토리로 부풀리지 않음)를 위반한다. (a)는 boolean/timestamp 플래그만 store에 두어 내용은 sink에 남긴다.
+- **prune을 terminal 감사 레코드 하나의 ack에만 게이팅** — 기각(codex GitHub 리뷰 P2 지적): 마커(`prepared`/`submit-attempted`/`acked`)가 journal에 커밋된 뒤 그 마커 감사가 fsync 전 크래시로 유실됐는데 terminal만 ack되면, prune이 journal(그 중간 마커 감사의 유일한 durable outbox)을 지워 **재구성 불가한 중간 lifecycle 감사가 영구 소실**된다(모든 주문 감사 불변식 위반). ack를 intent의 **모든 lifecycle 레코드**로 확장하고, 재시작 시 미-ack lifecycle 레코드를 journal에서 결정적으로 재구성해 re-emit한 뒤에만 prune-eligible로 넘긴다.
 - **exactly-once 전달** — 기각: 분산 원자 커밋(감사 write ↔ 소비 확인)을 요구하는데 로컬 파일·단일 프로세스에서 실질 불가·과설계다. at-least-once + 결정적 멱등키가 같은 안전성을 훨씬 싸게 준다.
 - **체결 멱등키 = per-fill 식별자** — 기각(**원천 불가능, 실측**): `openapi.json` jq 검증 결과 `OrderExecution`은 orderId당 누적 집계 스냅샷일 뿐 per-fill id·이벤트 목록이 없고, `/api/v1/trades`는 시장 틱이지 계좌 체결이 아니다. `orderId + 재무필드 digest`로 스냅샷 버전화한다.
 - **체결 멱등키 = `orderId + 누적 filledQuantity`만(수량 증가 시에만 방출)** — 기각(codex adversarial-review 지적): 동일 수량에서 averageFilledPrice·filledAmount·commission·tax·settlementDate가 정정되면 그 스냅샷이 중복으로 억제돼 감사에서 **재무 변화가 소실**된다(재구성·수수료·세금·결제 진단 누락). 재무필드 digest로 키를 잡고 필드 변화 시마다 방출해 정정을 보존한다.
@@ -77,19 +78,19 @@
 - (좋음) "모든 주문/체결/에러" 관측성 불변식이 sink의 발생-시점 fsync 경로로 **전 스트림에서** 성립한다 — 재구성 불가한 에러·관측-시점에 묶인 체결까지 크래시를 견딘다.
 - (좋음) prune이 **로컬 fsync ack**에 게이팅되어 유계(디스크 풀 방지)와 무손실(자금행위 감사 보존)이 양립한다. 원격 수집기 상태가 journal 성장·주문 루프에 영향을 주지 않는다.
 - (좋음) ADR-0005 point 6의 선행 조건(감사 내구성·재시도·멱등·durable-ack 계약)이 확정되어, **terminal prune을 안전하게 활성화**할 수 있다.
-- (좋음) prune-gate가 store에 boolean/timestamp 플래그만 두어(내용은 sink) ADR-0005 point 5의 "store를 히스토리로 부풀리지 않음"을 지킨다. store journal이 주문 수명주기 감사의 durable outbox, ack 플래그가 그 위 prune-gate 층으로 깔끔히 층화된다.
+- (좋음) prune-gate가 store에 boolean/timestamp 플래그만 두어(내용은 sink) ADR-0005 point 5의 "store를 히스토리로 부풀리지 않음"을 지킨다. store journal이 주문 수명주기 감사(**중간 마커 포함**)의 durable outbox, per-intent fully-audited 플래그가 그 위 prune-gate 층으로 깔끔히 층화된다 — 모든 lifecycle 레코드가 durable ack되기 전에는 prune이 outbox를 지우지 못한다.
 - (좋음) 결정적 멱등키(부류별 합성)로 at-least-once 재전송·재시작 re-emit이 안전하게 병합된다 — 체결의 per-fill id 부재를 **재무필드 digest로 스냅샷 버전화**(동일 수량 정정도 보존)하고, 에러 seq를 **durable append 위치에서 파생**해 할당=append를 원자화(카운터 desync·다른-키 재방출 봉쇄)한다.
 - (비용) POST/폴링 경로에 감사 fsync가 동기로 들어간다(주문 이벤트는 store 마커 fsync에 더해). 폴링 기반이라 수용하나, "하나의 사건이 store 마커 + 감사 + (필요 시) halt를 건드릴 때"의 경계를 구현이 정확히 지켜야 한다.
 - (비용) 이중 관리: 라이브 상태(store) · 감사 히스토리(로컬 durable + 원격 배송) · 운영 진단(slog). 세 경로의 역할 경계를 구현·리뷰가 유지해야 한다.
 - (비용) 로컬 감사 파일이 원격 배송 지연 시 성장한다 → 로컬 감사 디스크도 모니터링·알림 대상(별도 라이브 상태 store 유계와 무관하게).
 - (제약 전파)
-  - **reconciler(ADR-0003)**는 재시작 시 ack 미표시 terminal intent를 감사 sink로 re-emit하고, 감사 ack가 선 뒤에만 prune-eligible로 넘긴다.
+  - **reconciler(ADR-0003)**는 재시작 시 fully-audited로 ack되지 않은 intent의 **모든 lifecycle 감사 레코드**(중간 마커 포함)를 journal에서 재구성해 감사 sink로 re-emit하고, 전부 ack가 선 뒤에만 prune-eligible로 넘긴다.
   - **killswitch(ADR-0004)**는 감사 durable write 실패를 트립 조건으로 받되, 트립 경로가 감사 write에 의존하지 않도록(store 라이브 상태에 트립) 배선한다.
-  - **store(ADR-0005)**는 terminal intent 행에 감사 ack 플래그/타임스탬프 컬럼을 갖고, prune 쿼리가 그 플래그를 조건에 포함한다.
+  - **store(ADR-0005)**는 intent 행에 "모든 lifecycle 감사 레코드 durable ack 완료" 플래그/타임스탬프 컬럼을 갖고, prune 쿼리가 그 플래그를 조건에 포함한다.
   - **order/전략(ADR-0002)**은 감사 이벤트 방출 지점(marker 전이·orderId 확보·에러)에서 audit 인터페이스를 호출한다.
 - (후속)
   - **`internal/audit` 구현 이슈** — 레코드 스키마·직렬화·로컬 durable writer(fsync·회전)·멱등키 도출·ack 신호·인터페이스 형태. **에러 seq는 durable append 위치에서 파생하고 부분쓰기(torn tail)는 재시작 시 폐기, 체결은 재무필드 digest로 스냅샷 버전화** — 이 두 크래시-복구 프로토콜을 반드시 단위 테스트로 커버(회전이 append 위치 파생 seq의 단조성을 깨지 않는지 포함). 실제 writer 크래시/부분쓰기/재개 테스트(temp dir, `go test -race`).
-  - **감사 ack ↔ store 플래그 배선 이슈** — terminal화 → 감사 fsync → store 트랜잭션 ack 기록 → prune-eligible의 원자성·복구(re-emit) 경계. "ack 없으면 보존" 단위 테스트.
+  - **감사 ack ↔ store 플래그 배선 이슈** — 각 lifecycle 마커 감사 fsync → store 트랜잭션 ack 기록 → 전부 ack 시 prune-eligible의 원자성·복구(재시작 시 미-ack lifecycle 레코드 journal 재구성 re-emit) 경계. "중간 마커 감사 유실 후 terminal만 ack돼도 prune 안 됨"·"ack 없으면 보존" 단위 테스트.
   - **원격 배송 파이프라인 이슈** — async 백오프 재시도·미배송분 보존·로컬 파일 회전 안전·로컬 감사 디스크 모니터링. (대상 sink·프로토콜 미정.)
   - **감사 실패 → killswitch 트리거 배선 이슈** — 순환 방지(store 경로 트립) 포함. ADR-0004·0005 point 6 디스크 풀 트리거와 통합.
   - **운영 알림 채널 결정** — 로컬 감사 디스크 임계·원격 배송 장기 실패·killswitch 트립의 외부 알림 대상(CLAUDE.md "치명적 상황은 외부 알림(미정)").
