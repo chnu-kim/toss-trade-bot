@@ -79,6 +79,15 @@ git -C "$REPO" status --porcelain   # 비어 있어야 함
 git -C "$REPO" checkout main && git -C "$REPO" pull --ff-only
 ```
 
+**서브에이전트 preflight** (worktree 만들기 *전* — stateful 셋업이 시작되면 늦다): 3단계는
+`subagent_type: go-tdd-implementer`에 전적으로 의존하고, 프롬프트엔 변수만 담겨 규칙이 없다. 따라서 **이
+에이전트가 사용 가능한지 먼저 확인한다** — `Agent` 툴의 "Available agent types" 목록(시스템 리마인더)에
+`go-tdd-implementer`가 있어야 한다. 없으면(`.claude/agents/go-tdd-implementer.md` 미로드·이름 변경·해당 런타임이
+프로젝트 에이전트 미지원 등) **worktree를 만들기 전에 중단**하고 사용자에게 알린다(예: "go-tdd-implementer
+에이전트가 로드되지 않았다 — .claude/agents/ 확인 필요"). **절대 general-purpose로 폴백하지 마라** — 지금
+프롬프트엔 TDD·검증 게이트·PR·리뷰 루프 규칙이 빠져 있어, 규칙 없는 일반 에이전트가 구현을 시도하면 무인 안전
+계약이 통째로 사라진다(조용한 성능 저하가 하드 실패보다 나쁘다).
+
 ---
 
 ## 2. 브랜치 + worktree 격리 (메인 에이전트)
