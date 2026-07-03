@@ -148,9 +148,12 @@ git -C "$REPO" worktree add "$WT" "$BR"
 
 **메인은 절대 머지하지 않는다.**
 
-**회고 증거를 durable하게 handoff한다(§6 선행).** cleanup·회고는 **다른 세션에서 머지 후** 돌 수 있어 그때 서브에이전트 반환이 컨텍스트에 없다. 그래서 지금(반환이 손에 있을 때) 서브에이전트의 **마찰·판단·codex 대응**을 PR 코멘트로 persist한다 — 세션에 안 묶이고 PR에 붙는 유일한 durable 표면이다:
+**회고 증거를 durable하게 handoff한다(§6 선행).** cleanup·회고는 **다른 세션에서 머지 후** 돌 수 있어 그때 서브에이전트 반환이 컨텍스트에 없다. 그래서 지금(반환이 손에 있을 때) 서브에이전트의 **마찰·판단·codex 대응**을 PR 코멘트로 persist한다 — 세션에 안 묶이고 PR에 붙는 유일한 durable 표면이다.
+
+> ⚠️ **게시 전 public-readiness 게이트(필수).** PR 코멘트는 durable GitHub 히스토리인데 **커밋-타임 `opensource-maintainer` 게이트를 우회**한다. 이 레포는 언제든 public 전환 가능하므로, 반환 필드를 raw로 덤프하지 말고 **큐레이션한 구조적 요약**으로 옮기며 시크릿·`/Users/…` 등 개인 경로·account/tool 식별자·env 값·raw 명령 출력/로그가 없는지 확인한다(opensource-maintainer와 같은 기준). **안전하게 못 쓰겠으면 게시하지 말고**(`회고 증거 없음(민감)` 한 줄만) §4 사용자 리포트에서 그 사실을 알린다 — 회고는 그때 오케스트레이션 수준으로 한정된다.
 
 ```bash
+# $FRICTION/$JUDGMENT/$CODEX 는 위 게이트를 통과한 public-safe 요약이어야 한다.
 gh pr comment <PR> --repo "$SLUG" --body "$(printf '## 회고 증거 (retro evidence)\n- 마찰: %s\n- 판단/모호: %s\n- codex 대응: %s\n' "$FRICTION" "$JUDGMENT" "$CODEX")"
 ```
 

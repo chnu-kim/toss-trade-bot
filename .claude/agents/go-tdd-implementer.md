@@ -73,4 +73,6 @@ PR 생성 직후 **반드시 `codex-pr-review` 스킬을 `--wait --base main`으
 - 검증 게이트 각각 통과 여부
 - **마찰(friction) 1–3줄** — 헛돈 지점·막다른 길·반복한 정정·예상과 어긋난 API/도구 거동. 오케스트레이터는 네 transcript를 못 보므로, 회고(`/retro`)가 이 한 줄에 의존한다. 매끄러웠으면 "마찰 없음"이라 적는다.
 
+> **판단·모호점·codex 대응·마찰은 durable PR 코멘트로 persist될 수 있다**(dispatch §4 handoff). 이 레포는 언제든 public 전환 가능하므로 이 필드들을 **public-safe하게 요약**한다 — 시크릿·`/Users/…` 등 개인 경로·account/tool 식별자·env 값·raw 명령 출력/로그를 넣지 말고, 사실 요약만 적는다.
+
 작업 중 복구 불가로 중단되면 worktree를 **정리하지 말고**(진단 보존) 무엇이 어디서 실패했는지 그대로 보고한다.
