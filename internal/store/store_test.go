@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -92,6 +93,31 @@ func TestMigrationVersion(t *testing.T) {
 	}
 	if v2 != schemaVersionV1 {
 		t.Fatalf("schema version after reopen = %d, want %d", v2, schemaVersionV1)
+	}
+}
+
+// TestOpenRejectsFutureSchema guards against schema skew: a V1 binary must
+// refuse to open (and write to) a store already migrated to a newer version
+// (e.g. #14's V2), otherwise it would silently write with obsolete assumptions
+// and corrupt/bypass newer invariants (audit-ack / prune gating).
+func TestOpenRejectsFutureSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.db")
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	// Simulate a future migration having run against this file.
+	if _, err := db.writeDB.ExecContext(context.Background(), "PRAGMA user_version = 99"); err != nil {
+		t.Fatalf("bump user_version: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	_, err = Open(path)
+	if !errors.Is(err, ErrSchemaTooNew) {
+		t.Fatalf("Open on future schema err = %v, want ErrSchemaTooNew", err)
 	}
 }
 

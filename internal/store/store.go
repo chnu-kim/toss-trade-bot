@@ -177,8 +177,19 @@ func (d *DB) SetCounter(ctx context.Context, c Counter) error {
 // LoadUnresolvedIntents returns every intent still open (ResolvedAt == nil),
 // each with its markers loaded, ordered by creation. This is the restart-scan
 // the reconciler depends on (ADR-0003); it must never lose an unresolved intent.
+//
+// The load runs in one read transaction so the intent list and every
+// per-intent marker query share a single SQLite snapshot. Without it, a
+// concurrent writer resolving an intent or appending markers between queries
+// could yield a mixed state (an intent already resolved, or markers from a
+// later snapshot) the reconciler would then act on.
 func (d *DB) LoadUnresolvedIntents(ctx context.Context) ([]Intent, error) {
-	return loadUnresolvedIntents(ctx, d.readDB)
+	tx, err := d.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("store: begin read tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // read-only; Rollback just releases the snapshot
+	return loadUnresolvedIntents(ctx, tx)
 }
 
 // Halt reads the persisted global halt state.

@@ -3,8 +3,15 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 )
+
+// ErrSchemaTooNew is returned by Open when the database was already migrated to
+// a version newer than this binary knows. Opening it anyway would let old code
+// write with obsolete assumptions and silently violate newer invariants, so the
+// store fails closed instead (a rollback below a migration must not corrupt).
+var ErrSchemaTooNew = errors.New("store: database schema is newer than this binary supports")
 
 // schemaVersionV1 is the migration version this package owns. issue #14 adds V2
 // (the retention ack-flag column), so V1 is the ceiling here — the version
@@ -60,6 +67,9 @@ func migrate(ctx context.Context, db *sql.DB) error {
 	var current int
 	if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&current); err != nil {
 		return fmt.Errorf("store: read schema version: %w", err)
+	}
+	if current > len(migrations) {
+		return fmt.Errorf("%w: on-disk version %d, supported up to %d", ErrSchemaTooNew, current, len(migrations))
 	}
 	for v := current; v < len(migrations); v++ {
 		if err := applyMigration(ctx, db, v, migrations[v]); err != nil {

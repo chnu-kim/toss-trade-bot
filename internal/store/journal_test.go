@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -142,6 +143,71 @@ func TestCrashBetweenMarkersRecovers(t *testing.T) {
 	if !equalKinds(kinds, want) {
 		t.Fatalf("markers after reopen = %v, want %v (submit-attempted durable, acked absent)", kinds, want)
 	}
+}
+
+// TestLoadUnresolvedIntentsSnapshotConsistency runs LoadUnresolvedIntents
+// concurrently with writers. Because the load reads the intent list and then
+// each intent's markers, doing so across different SQLite snapshots could
+// return an intent whose markers were loaded from a later snapshot (or none at
+// all). Wrapping the load in one read transaction pins a single snapshot, so
+// every returned unresolved intent must carry at least its prepared marker.
+func TestLoadUnresolvedIntentsSnapshotConsistency(t *testing.T) {
+	db := openTemp(t)
+	ctx := context.Background()
+
+	// Seed some intents so loads have work to do.
+	for i := 0; i < 10; i++ {
+		id := "seed-" + string(rune('a'+i))
+		if err := db.AppendIntent(ctx, Intent{IntentID: id, ClientOrderID: "c-" + id}); err != nil {
+			t.Fatalf("seed AppendIntent: %v", err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Writer: continuously appends markers and new intents, and resolves some.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		n := 0
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			id := "live-" + string(rune('A'+n%26)) + string(rune('0'+n%10))
+			_ = db.AppendIntent(ctx, Intent{IntentID: id, ClientOrderID: id})
+			_ = db.AppendMarker(ctx, id, MarkerSubmitAttempted, "")
+			_ = db.ResolveIntent(ctx, id, "done")
+			n++
+		}
+	}()
+
+	// Reader: loads repeatedly; every returned intent must have its markers.
+	for r := 0; r < 200; r++ {
+		got, err := db.LoadUnresolvedIntents(ctx)
+		if err != nil {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("LoadUnresolvedIntents: %v", err)
+		}
+		for _, in := range got {
+			if in.ResolvedAt != nil {
+				close(stop)
+				wg.Wait()
+				t.Fatalf("returned intent %q has ResolvedAt set — snapshot skew", in.IntentID)
+			}
+			if len(in.Markers) == 0 {
+				close(stop)
+				wg.Wait()
+				t.Fatalf("returned unresolved intent %q has no markers — snapshot skew", in.IntentID)
+			}
+		}
+	}
+	close(stop)
+	wg.Wait()
 }
 
 func markerKinds(ms []Marker) []MarkerKind {
