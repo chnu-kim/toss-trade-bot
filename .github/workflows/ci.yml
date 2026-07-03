@@ -18,11 +18,14 @@ jobs:
     name: build · vet · gofmt · test-race
     runs-on: ubuntu-latest
     steps:
+      # 공급망 안전: 액션은 mutable 태그가 아니라 full commit SHA로 핀 고정한다.
+      # (CI가 무인 봇의 유일한 자동 안전망이므로 태그 이동/침해로 게이트가 무력화되면 안 됨)
+      # 버전 갱신은 SHA를 의도적으로 교체하는 방식으로만 한다.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           # 단일 진실: go.mod의 Go 버전을 그대로 사용한다.
           go-version-file: go.mod
