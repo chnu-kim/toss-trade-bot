@@ -148,6 +148,14 @@ git -C "$REPO" worktree add "$WT" "$BR"
 
 **메인은 절대 머지하지 않는다.**
 
+**회고 증거를 durable하게 handoff한다(§6 선행).** cleanup·회고는 **다른 세션에서 머지 후** 돌 수 있어 그때 서브에이전트 반환이 컨텍스트에 없다. 그래서 지금(반환이 손에 있을 때) 서브에이전트의 **마찰·판단·codex 대응**을 PR 코멘트로 persist한다 — 세션에 안 묶이고 PR에 붙는 유일한 durable 표면이다:
+
+```bash
+gh pr comment <PR> --repo "$SLUG" --body "$(printf '## 회고 증거 (retro evidence)\n- 마찰: %s\n- 판단/모호: %s\n- codex 대응: %s\n' "$FRICTION" "$JUDGMENT" "$CODEX")"
+```
+
+이 handoff가 없으면 §6 회고가 증거 없이 돌아 학습을 skip하거나 낡은 컨텍스트로 추론한다(codex adversarial 지적, PR #21).
+
 ---
 
 ## 5. 정리 모드: `/dispatch-issue --cleanup N`
@@ -171,4 +179,13 @@ git -C "$REPO" branch -d "$BR"
 
 ## 6. 회고 (정리 직후 — 작업이 진짜 닫히는 지점)
 
-정리가 끝나면 이슈가 완전히 종결된 것이다 — 회고의 이상적 트리거다. `retro` 스킬을 돌려 이번 이슈에서 **재사용 가능한 학습을 실행 가능한 형태로 durable 표면에 남긴다**(없으면 self-skip). 회고의 증거는 서브에이전트가 반환한 **마찰 한 줄·판단·codex 대응**이다 — 너는 그 transcript를 못 봤으므로 회고를 그 반환 + 오케스트레이션 수준으로 한정한다(retro §1의 서브에이전트 맹점 주의). 학습이 memory면 자율 기록, CLAUDE.md·ADR급이면 프리뷰 후 승인받는다.
+정리가 끝나면 이슈가 완전히 종결된 것이다 — 회고의 이상적 트리거다. `retro` 스킬을 돌려 이번 이슈에서 **재사용 가능한 학습을 실행 가능한 형태로 durable 표면에 남긴다**(없으면 self-skip).
+
+**증거는 컨텍스트가 아니라 PR 코멘트에서 fetch한다** — cleanup은 dispatch와 다른 세션일 수 있어 서브에이전트 반환이 컨텍스트에 없다. §4가 남긴 "회고 증거" 코멘트를 읽는다:
+
+```bash
+gh pr view <PR> --repo "$SLUG" --json comments \
+  --jq '.comments[] | select(.body|startswith("## 회고 증거")) | .body'
+```
+
+이 코멘트의 **마찰·판단·codex 대응**이 회고 증거다. 너는 서브에이전트 transcript를 못 봤으므로 회고를 그 증거 + 오케스트레이션 수준으로 한정한다(retro §1의 서브에이전트 맹점). 코멘트가 없으면(구버전 PR 등) 증거 부재를 인정하고 오케스트레이션 수준으로만 회고하거나 skip한다 — 없는 걸 추측하지 않는다. 학습이 memory면 자율 기록, CLAUDE.md·ADR·스킬급이면 프리뷰 후 승인받는다.
