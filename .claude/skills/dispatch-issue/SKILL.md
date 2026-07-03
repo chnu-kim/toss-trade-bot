@@ -99,68 +99,30 @@ git -C "$REPO" worktree add "$WT" "$BR"
 
 ## 3. 구현 위임 (서브에이전트 — 위임은 여기가 전부)
 
-`Agent` 툴로 **단일 서브에이전트**를 띄운다. `isolation` 옵션은 쓰지 않는다(우리가 만든 named worktree에서
-작업해야 하므로). 아래 프롬프트를 채워 전달한다. `{WT}`/`{BR}`/`{SLUG}`/`{N}`/`{title}`/이슈 본문을 실제 값으로 치환.
+`Agent` 툴로 **단일 서브에이전트**를 띄우되 `subagent_type: go-tdd-implementer`로 지정한다
+(`.claude/agents/go-tdd-implementer.md`). 이 에이전트가 **TDD 규칙·검증 게이트·완료 절차·리뷰-수정 루프·반환값
+명세라는 워커 페르소나를 시스템 프롬프트로 이미 갖고 있다** — 메인은 그걸 프롬프트에 다시 쓰지 않고, **per-issue
+변수만** 넘긴다. `isolation` 옵션은 쓰지 않는다(우리가 만든 named worktree에서 작업해야 하므로).
 
-> **[서브에이전트 프롬프트 템플릿]**
->
-> 너는 격리된 git worktree에서 GitHub 이슈 하나를 TDD로 끝까지 구현하는 에이전트다.
-> 모든 작업은 이 디렉토리 안에서만: `{WT}`  / 레포 슬러그: `{SLUG}`
-> 절대 메인 레포 디렉토리나 main 브랜치를 건드리지 마라. 머지하지 마라.
->
-> **이슈 #{N}: {title}**
+> 페르소나를 인라인으로 반복하지 않는 이유: 오케스트레이터 출력 토큰 절감 + 워커 툴 스키마 slim(에이전트가
+> `tools:`로 스코프됨) + 페르소나 drift 방지. 규칙을 고치려면 **여기가 아니라 에이전트 정의 파일을 고친다** —
+> 이 §3과 `go-tdd-implementer.md`가 규칙을 이중으로 들고 있으면 안 된다.
+
+아래 변수 블록만 채워 `prompt`로 전달한다(`{...}`를 실제 값으로 치환):
+
 > ```
+> 작업 디렉토리(WT): {WT}
+> 브랜치(BR): {BR}
+> 레포 슬러그(SLUG): {SLUG}
+> SSH_AUTH_SOCK: {메인이 환경/메모리에서 구한 1Password/SSH agent 소켓 경로}
+> gh 접근 가능 계정: {§0에서 검증한, 이 레포 접근 가능한 계정}
+>
+> 이슈 #{N}: {title}
+> --- 이슈 본문 ---
 > {issue body 전문}
+> --- 지배 ADR (있으면 — 이 결정을 따르라, 위반 금지 / 없으면 "해당 없음") ---
+> {이슈가 링크한 docs/adr/*.md 전문}
 > ```
->
-> **지배 ADR (있으면 — 이 결정을 따르라, 위반 금지):**
-> ```
-> {이슈가 링크한 docs/adr/*.md 전문, 없으면 "해당 없음"}
-> ```
-> ADR은 이 구현이 따라야 하는 *이미 내려진 설계 결정*과 그 근거·버린 대안이다. 구현이 ADR의 Decision과
-> 충돌하면 ADR을 따르고, ADR이 틀렸다고 판단되면 임의로 어기지 말고 최종 보고의 "판단" 항목에 근거를 남긴다.
->
-> **반드시 지킬 규칙 (CLAUDE.md):**
-> 1. **TDD**: 실패 테스트 먼저(Red) → 통과 최소 구현(Green) → 정리(Refactor). 기존 테스트 커버 여부 먼저 확인.
-> 2. **패키지 레이아웃**: golang-standards/project-layout. 로직은 `internal/` 도메인 패키지, `cmd/<binary>/main.go`는
->    얇게, 순환 참조 금지, 패키지명=디렉토리명·단수 도메인명.
-> 3. **Toss API 추측 금지**: 새 엔드포인트/파라미터는 OpenAPI 스펙
->    (https://openapi.tossinvest.com/openapi-docs/latest/openapi.json) 먼저 확인. Toss API 직접 호출 테스트 금지 —
->    `httptest`/mock으로 검증.
-> 4. **무인 운영 제약**: panic 방지 recover 경계, 재시작 안전, 조회만 백오프 재시도(주문은 금지), 토큰은 한 곳에서만 발급·캐시.
-> 5. **검증 게이트(전부 통과 필수)**:
->    ```bash
->    cd "{WT}"
->    gofmt -l -w . && go vet ./... && go test -race ./...
->    ```
->    `-race`는 동시성/single-flight 검증을 위해 필수.
-> 6. **커밋 직전 필수**: `opensource-maintainer` 스킬로 시크릿·개인정보·환경 의존 내용 점검. 통과 후에만 커밋.
-> 7. **커밋**: repo-local git 설정 그대로 사용. 메시지는 명확히, 이슈 컨텍스트 반영.
->
-> **완료 절차:**
-> ```bash
-> export SSH_AUTH_SOCK="{메인이 전달한 1Password/SSH agent 소켓 경로}"   # 미설정 시 서명·푸시 실패
-> git -C "{WT}" push -u origin "{BR}"
-> gh pr create --repo "{SLUG}" --base main --head "{BR}" \
->   --title "<요약>" --body "<무엇을·왜, Acceptance Criteria 충족 근거, risk:high면 위험 요지>. Closes #{N}"
-> ```
-> (gh 호출 전 active 계정이 `{SLUG}`에 접근 가능한지 `gh repo view "{SLUG}"`로 확인, 실패 시 접근 가능한 계정으로 전환.)
-> PR 생성 직후 **반드시 `codex-pr-review` 스킬을 `--wait --base main`으로 실행**(글로벌 지침: codex 리뷰+적대적
-> 리뷰 병렬, 결과 verbatim 회수). Skill 툴로 `codex-pr-review` 호출, args `--wait --base main`.
->
-> **리뷰 결과 처리 (review→fix 루프):**
-> - 리뷰가 **진짜 결함**(CLAUDE.md 위반·버그·무인 안전 구멍 등)을 보고하면 → **TDD로 고친다**(실패 테스트
->   추가 → 수정 → 게이트 `gofmt`/`go vet`/`go test -race` 재통과) → 추가 커밋 → 같은 브랜치로 재푸시.
-> - false positive·범위 밖·의도적 trade-off는 고치지 말고 **최종 보고의 "판단" 항목에 근거와 함께 남긴다**
->   (사용자 검수가 판단). 모호하면 보수적으로 고치되 그 이유를 보고.
-> - 자동 재시도 금지 원칙은 유지 — 주문/쓰기 경로 자동 재시도를 리뷰가 권해도 도입하지 않는다.
->
-> **최종 반환값(메인에게 보고할 raw 데이터):**
-> - PR URL
-> - `go test -race ./...` 결과 요약(통과/실패, 커버 케이스)
-> - **codex 리뷰가 보고한 항목 + 각각 대응(고침/근거 남기고 보류)**
-> - 구현 중 내린 판단·이슈 명세에서 모호했던 점(있으면) — 사용자 검수용
-> - 검증 게이트 각각 통과 여부
 
 서브에이전트가 `null` 반환/사망 시, 메인은 worktree를 **정리하지 말고**(진단 보존) 실패를 그대로 보고한다.
 
