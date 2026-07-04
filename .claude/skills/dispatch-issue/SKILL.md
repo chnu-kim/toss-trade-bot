@@ -196,10 +196,11 @@ git -C "$REPO" branch -d "$BR"
 **증거는 컨텍스트가 아니라 PR 코멘트에서 fetch한다** — cleanup은 dispatch와 다른 세션일 수 있어 서브에이전트 반환이 컨텍스트에 없다. §4가 남긴 "회고 증거" 코멘트를 읽는다:
 
 ```bash
-# §0 규칙대로 검증 계정 핀 후 같은 셸에서 fetch. 이 PR 마커 + 검증 계정 author로 좁히고 최신 하나만.
+# §0 규칙대로 검증 계정 핀 후 같은 셸에서 fetch. gh pr view <PR>가 이미 이 PR로 스코프하지만,
+# PR 마커는 경계까지 매칭한다("PR #2"는 substring이라 "PR #21"에도 걸림 — 실증 확인. "PR #<PR> ·"로 경계).
 gh auth switch --user <§0 검증 계정> >/dev/null && \
   gh pr view <PR> --repo "$SLUG" --json comments --jq \
-    '[.comments[] | select(.author.login=="<§0 검증 계정>" and (.body|startswith("## 회고 증거")) and (.body|contains("PR #<PR>")))] | sort_by(.createdAt) | last | .body // "NONE"'
+    '[.comments[] | select(.author.login=="<§0 검증 계정>" and (.body|startswith("## 회고 증거")) and (.body|contains("PR #<PR> ·")))] | sort_by(.createdAt) | last | .body // "NONE"'
 ```
 
 `NONE`이면 증거 부재 — 오케스트레이션 수준으로만 회고하거나 skip한다(없는 걸 추측하지 않는다). 후보가 모순되게 여럿이면(예: 서로 다른 재실행 흔적) 최신을 쓰되 사용자에게 그 사실을 알려 확인받는다.
