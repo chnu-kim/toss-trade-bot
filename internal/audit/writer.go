@@ -118,6 +118,11 @@ type Writer struct {
 	activeSize int64
 	seq        int64 // global count of committed records == next sequence
 	closed     bool
+	// poison latches a commit-path durability failure (failed rotation or durable
+	// frame write). Once set it is sticky: every later Emit returns it instead of
+	// touching the possibly-nil active segment. Recovery is a process restart via
+	// New, never in-process self-heal (ADR-0006 point 6).
+	poison error
 }
 
 var _ Sink = (*Writer)(nil)
@@ -257,6 +262,12 @@ func (w *Writer) EmitError(ctx context.Context, ev ErrorEvent) (Ack, error) {
 func (w *Writer) commit(rec record, keyForSeq func(seq int64) string) (Ack, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	// A latched durability failure is checked before closed: once the medium has
+	// failed, that fail-closed signal must not be masked even if the writer is
+	// later Close()d, and it must short-circuit before any use of w.active.
+	if w.poison != nil {
+		return Ack{}, w.poison
+	}
 	if w.closed {
 		return Ack{}, &FailClosedError{Op: "emit", Err: ErrClosed}
 	}
@@ -277,13 +288,13 @@ func (w *Writer) commit(rec record, keyForSeq func(seq int64) string) (Ack, erro
 	// accepts at least one record even if it is oversized.
 	if w.activeSize > int64(len(segmentHeader)) && w.activeSize+int64(len(frame)) > w.cfg.maxSegmentSize {
 		if err := w.rotate(); err != nil {
-			return Ack{}, err
+			return Ack{}, w.latch(err)
 		}
 	}
 
 	offsetBefore := w.activeSize
 	if err := w.writeFrameDurably(frame, offsetBefore); err != nil {
-		return Ack{}, err
+		return Ack{}, w.latch(err)
 	}
 
 	w.activeSize = offsetBefore + int64(len(frame))
@@ -298,6 +309,22 @@ func (w *Writer) commit(rec record, keyForSeq func(seq int64) string) (Ack, erro
 		)
 	}
 	return ack, nil
+}
+
+// latch marks the writer permanently fail-closed after a commit-path durability
+// failure (a failed rotation or durable frame write) and returns the sticky
+// signal. It is set once — the first failing op wins, preserving that op's
+// diagnostic tag ("fsync-dir"/"rename"/"write"/"fsync") rather than the
+// misleading "invalid argument" a later nil-active WriteAt would surface. Only
+// medium/durability failures reach here; ctx cancellation and json.Marshal
+// errors are per-record and never poison the writer. Recovery is a process
+// restart via New, which re-derives durable state from disk (ADR-0006 point 6).
+// Callers hold w.mu.
+func (w *Writer) latch(err error) error {
+	if w.poison == nil {
+		w.poison = failClosed("emit", err)
+	}
+	return w.poison
 }
 
 // writeFrameDurably writes the frame at offset and fsyncs the file. On any

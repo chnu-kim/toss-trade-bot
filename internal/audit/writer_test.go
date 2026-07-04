@@ -21,6 +21,7 @@ type spyFS struct {
 	mu       sync.Mutex
 	events   []string
 	failSync bool
+	failDir  bool
 }
 
 func (s *spyFS) ops() fsOps {
@@ -43,7 +44,11 @@ func (s *spyFS) ops() fsOps {
 		syncDir: func(dir string) error {
 			s.mu.Lock()
 			s.events = append(s.events, "syncDir")
+			fail := s.failDir
 			s.mu.Unlock()
+			if fail {
+				return errInjected
+			}
 			return real.syncDir(dir)
 		},
 		rename: func(oldp, newp string) error {
@@ -141,9 +146,12 @@ func TestRotationFollowsDurabilityProtocol(t *testing.T) {
 
 // TestEmitErrorFailClosedOnDurableWriteFailure is the most important safety AC:
 // when the durable write cannot complete (fsync fails), EmitError returns a
-// FailClosedError, returns no Ack, leaves nothing committed, and does not advance
-// the sequence (ADR-0006 point 3/6). This is untestable without an injectable
-// fsync; a healthy temp dir never fails fsync on its own.
+// FailClosedError, returns no Ack, and leaves nothing committed (ADR-0006 point
+// 3/6). The failure then LATCHES sticky — clearing the injected fault does not
+// let the writer silently self-heal; every later Emit still fails closed, and
+// recovery is a process restart via New that re-derives the sequence from the
+// durable record count (never advanced by the failed emit). This is untestable
+// without an injectable fsync; a healthy temp dir never fails fsync on its own.
 func TestEmitErrorFailClosedOnDurableWriteFailure(t *testing.T) {
 	spy := &spyFS{}
 	dir := t.TempDir()
@@ -170,24 +178,149 @@ func TestEmitErrorFailClosedOnDurableWriteFailure(t *testing.T) {
 		t.Errorf("Ack must be zero on failure, got %+v", ack)
 	}
 
-	// Recover the fsync and verify: exactly one committed record, next seq is 1.
+	// Clear the injected fault: the durability latch must be sticky, so the next
+	// emit still fails closed rather than self-healing (and must not panic on the
+	// now-consistent-but-latched writer).
 	spy.mu.Lock()
 	spy.failSync = false
 	spy.mu.Unlock()
 
+	if _, err := w.EmitError(ctx, ErrorEvent{Operation: "op", ErrorClass: "class", Message: "after"}); !IsFailClosed(err) {
+		t.Fatalf("emit after a latched fsync failure = %v; latch must be sticky (no self-heal)", err)
+	}
+
+	// Exactly one record was ever committed; neither the doomed nor the post-latch
+	// emit persisted.
 	recs, err := readAll(dir)
 	if err != nil {
 		t.Fatalf("readAll: %v", err)
 	}
 	if len(recs) != 1 {
-		t.Fatalf("committed records = %d, want 1 (doomed must not persist): %+v", len(recs), recs)
+		t.Fatalf("committed records = %d, want 1 (doomed/after must not persist): %+v", len(recs), recs)
 	}
-	ack2, err := w.EmitError(ctx, ErrorEvent{Operation: "op", ErrorClass: "class", Message: "after"})
+
+	// Recovery is a process restart: reopen and confirm the sequence resumes at 1
+	// — the failed emits never advanced the durable append position.
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	w2 := newTestWriter(t, dir, realFS())
+	ack2, err := w2.EmitError(ctx, ErrorEvent{Operation: "op", ErrorClass: "class", Message: "after-restart"})
 	if err != nil {
-		t.Fatalf("EmitError after recovery: %v", err)
+		t.Fatalf("EmitError after restart: %v", err)
 	}
 	if ack2.Sequence != 1 {
-		t.Errorf("sequence after failed emit = %d, want 1 (failed emit must not advance seq)", ack2.Sequence)
+		t.Errorf("resumed sequence = %d, want 1 (failed emit must not advance seq)", ack2.Sequence)
+	}
+}
+
+// TestCommitLatchesFailClosedOnFaultedRotation covers the commit-path rotation
+// durability failure the existing fsync test could not reach: when createSegment
+// fails mid-rotation (here the parent-dir fsync of step iii), the active segment
+// has already been closed to nil, so without a latch the writer would carry a
+// stale activeSize and a later rotation-triggering record would silently retry
+// createSegment and self-heal. The fix latches the failure sticky: (1) the
+// faulted emit fails closed; (2) after the fault is cleared, a further emit STILL
+// fails closed (no self-heal) and does not panic on the nil active segment.
+func TestCommitLatchesFailClosedOnFaultedRotation(t *testing.T) {
+	spy := &spyFS{}
+	dir := t.TempDir()
+	// 64 bytes is smaller than a single error frame, so after the first record the
+	// active size already exceeds the threshold and the NEXT emit must rotate.
+	w := newTestWriter(t, dir, spy.ops(), WithMaxSegmentSize(64))
+	ctx := context.Background()
+
+	// First record lands in the initial segment without rotating.
+	if _, err := w.EmitError(ctx, ErrorEvent{Operation: "op", ErrorClass: "class", Message: "first"}); err != nil {
+		t.Fatalf("baseline EmitError: %v", err)
+	}
+	// Self-diagnosing precondition: the next emit must be the one that rotates. If
+	// rotation had already happened, syncDir would fire early and the test would
+	// fault the wrong call.
+	if segs, _ := filepath.Glob(filepath.Join(dir, "segment-*.log")); len(segs) != 1 {
+		t.Fatalf("precondition: want 1 segment before the faulted rotation, got %d", len(segs))
+	}
+
+	// Arm a parent-dir fsync fault: the next emit rotates and createSegment's step
+	// (iii) fails → a commit-path durability failure.
+	spy.mu.Lock()
+	spy.failDir = true
+	spy.mu.Unlock()
+
+	ack, err := w.EmitError(ctx, ErrorEvent{Operation: "op", ErrorClass: "class", Message: "rotate-fault"})
+	if err == nil {
+		t.Fatal("emit that triggers a faulted rotation returned nil; must fail-closed")
+	}
+	if !IsFailClosed(err) {
+		t.Errorf("faulted rotation is not a fail-closed signal: %v", err)
+	}
+	if errors.Is(err, ErrClosed) {
+		t.Errorf("durability latch must be distinguishable from a voluntary Close: %v", err)
+	}
+	if ack != (Ack{}) {
+		t.Errorf("Ack must be zero on a faulted rotation, got %+v", ack)
+	}
+
+	// Clear the fault; the latch must stay sticky (no self-heal) and must not panic
+	// dereferencing the nil active segment left by the failed rotation.
+	spy.mu.Lock()
+	spy.failDir = false
+	spy.mu.Unlock()
+
+	if _, err := w.EmitError(ctx, ErrorEvent{Operation: "op", ErrorClass: "class", Message: "after"}); !IsFailClosed(err) {
+		t.Fatalf("emit after a latched rotation failure = %v; latch must be sticky", err)
+	}
+}
+
+// TestFaultedRotationLatchPreservesPriorDurableRecords is the integrity half:
+// latching on a faulted rotation must not corrupt records committed before it.
+// After several rotations' worth of durable records, a faulted rotation latches
+// the writer; on restart the pre-failure records are all recovered with a dense
+// contiguous sequence, and the resumed sequence continues from the durable count.
+func TestFaultedRotationLatchPreservesPriorDurableRecords(t *testing.T) {
+	spy := &spyFS{}
+	dir := t.TempDir()
+	w := newTestWriter(t, dir, spy.ops(), WithMaxSegmentSize(64))
+	ctx := context.Background()
+
+	const good = 3
+	for i := 0; i < good; i++ {
+		if _, err := w.EmitError(ctx, ErrorEvent{Operation: "op", ErrorClass: "class", Message: fmt.Sprintf("g-%d", i)}); err != nil {
+			t.Fatalf("EmitError %d: %v", i, err)
+		}
+	}
+
+	// Fault the next rotation → latch.
+	spy.mu.Lock()
+	spy.failDir = true
+	spy.mu.Unlock()
+	if _, err := w.EmitError(ctx, ErrorEvent{Operation: "op", ErrorClass: "class", Message: "doomed"}); !IsFailClosed(err) {
+		t.Fatalf("expected fail-closed on the faulted rotation, got %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Restart with a healthy fs: the pre-failure records survive intact.
+	w2 := newTestWriter(t, dir, realFS(), WithMaxSegmentSize(64))
+	recs, err := readAll(dir)
+	if err != nil {
+		t.Fatalf("readAll after restart: %v", err)
+	}
+	if len(recs) != good {
+		t.Fatalf("recovered records = %d, want %d (latch must not corrupt prior durable data): %+v", len(recs), good, recs)
+	}
+	for i, r := range recs {
+		if r.Seq != int64(i) {
+			t.Errorf("record[%d].Seq = %d, want %d (sequence must stay dense across the latch)", i, r.Seq, i)
+		}
+	}
+	ack, err := w2.EmitError(ctx, ErrorEvent{Operation: "op", ErrorClass: "class", Message: "resumed"})
+	if err != nil {
+		t.Fatalf("EmitError after restart: %v", err)
+	}
+	if ack.Sequence != int64(good) {
+		t.Errorf("resumed sequence = %d, want %d (must derive from the durable count, not the failed emit)", ack.Sequence, good)
 	}
 }
 
