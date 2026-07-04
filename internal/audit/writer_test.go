@@ -465,6 +465,116 @@ func TestRestartResumesSequence(t *testing.T) {
 	}
 }
 
+// TestRecoveryDerivesSequenceFromDurableCountAcrossSegments realizes the ADR-0006
+// claim that the sequence "derives from the committed durable append position, not
+// a separate counter". After rotation into several segments and a restart,
+// openWriter must recompute the sequence by summing committed records across ALL
+// segments (the total += count recovery path) — so the resumed sequence equals the
+// durable record count, not a reset and not a surviving in-memory counter. Every
+// other reopen test uses a single 8 MiB segment; only this one walks the sum.
+func TestRecoveryDerivesSequenceFromDurableCountAcrossSegments(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	const n = 20
+	w := newTestWriter(t, dir, realFS(), WithMaxSegmentSize(200))
+	for i := 0; i < n; i++ {
+		if _, err := w.EmitError(ctx, ErrorEvent{Operation: "op", ErrorClass: "class", Message: fmt.Sprintf("m-%d", i)}); err != nil {
+			t.Fatalf("EmitError %d: %v", i, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	segs, _ := filepath.Glob(filepath.Join(dir, "segment-*.log"))
+	if len(segs) < 2 {
+		t.Fatalf("test needs multiple segments to exercise the recovery sum, got %d", len(segs))
+	}
+	recs, err := readAll(dir)
+	if err != nil {
+		t.Fatalf("readAll: %v", err)
+	}
+	if len(recs) != n {
+		t.Fatalf("durable records = %d, want %d", len(recs), n)
+	}
+
+	// Reopen: recovery must walk every segment and sum committed records.
+	w2 := newTestWriter(t, dir, realFS(), WithMaxSegmentSize(200))
+	ack, err := w2.EmitError(ctx, ErrorEvent{Operation: "op", ErrorClass: "class", Message: "resumed"})
+	if err != nil {
+		t.Fatalf("EmitError after reopen: %v", err)
+	}
+	if ack.Sequence != int64(n) {
+		t.Errorf("resumed sequence = %d, want %d (must derive from durable count across all segments)", ack.Sequence, n)
+	}
+	// The resumed error key embeds seq n; it must not collide with any prior.
+	recs2, err := readAll(dir)
+	if err != nil {
+		t.Fatalf("readAll after resume: %v", err)
+	}
+	if len(recs2) != n+1 {
+		t.Fatalf("records after resume = %d, want %d", len(recs2), n+1)
+	}
+	seen := map[string]bool{}
+	for _, r := range recs2 {
+		if seen[r.IdempotencyKey] {
+			t.Errorf("duplicate error key after multi-segment recovery: %q", r.IdempotencyKey)
+		}
+		seen[r.IdempotencyKey] = true
+	}
+}
+
+// TestTornTailAfterRotationRecovery is the realistic crash-mid-append-after-
+// rotation case: sealed segments precede a torn tail on the active segment.
+// Recovery must sum the sealed priors AND discard the torn tail together, leaving
+// exactly the committed records and a contiguous resumed sequence.
+func TestTornTailAfterRotationRecovery(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	const n = 15
+	w := newTestWriter(t, dir, realFS(), WithMaxSegmentSize(200))
+	for i := 0; i < n; i++ {
+		if _, err := w.EmitError(ctx, ErrorEvent{Operation: "op", ErrorClass: "class", Message: fmt.Sprintf("m-%d", i)}); err != nil {
+			t.Fatalf("EmitError %d: %v", i, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	segs, _ := filepath.Glob(filepath.Join(dir, "segment-*.log")) // sorted
+	if len(segs) < 2 {
+		t.Fatalf("test needs multiple segments, got %d", len(segs))
+	}
+
+	// Corrupt only the LAST (active) segment's tail with a torn partial frame.
+	last := segs[len(segs)-1]
+	f, err := os.OpenFile(last, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatalf("open last for corruption: %v", err)
+	}
+	if _, err := f.Write([]byte{0x00, 0x00, 0x20, 0x00, 0xba, 0xad}); err != nil {
+		t.Fatalf("write torn tail: %v", err)
+	}
+	f.Close()
+
+	w2 := newTestWriter(t, dir, realFS(), WithMaxSegmentSize(200))
+	recs, err := readAll(dir)
+	if err != nil {
+		t.Fatalf("readAll after recovery: %v", err)
+	}
+	if len(recs) != n {
+		t.Fatalf("records after torn-tail-after-rotation recovery = %d, want %d (sealed priors + surviving tail)", len(recs), n)
+	}
+	ack, err := w2.EmitError(ctx, ErrorEvent{Operation: "op", ErrorClass: "class", Message: "resumed"})
+	if err != nil {
+		t.Fatalf("EmitError after recovery: %v", err)
+	}
+	if ack.Sequence != int64(n) {
+		t.Errorf("resumed sequence = %d, want %d", ack.Sequence, n)
+	}
+}
+
 // TestEmitAfterClose fails closed rather than silently dropping.
 func TestEmitAfterClose(t *testing.T) {
 	dir := t.TempDir()
