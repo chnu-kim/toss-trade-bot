@@ -87,6 +87,67 @@ func syncDir(dir string) error {
 	return cerr
 }
 
+// ensureDirDurable creates dir (via MkdirAll) if it does not already exist,
+// and fsyncs the parent of every directory MkdirAll had to freshly create —
+// the same create-then-parent-fsync discipline ADR-0006 point 4 requires for
+// segment files, extended to the audit directory's own first-boot creation
+// (issue #23). Without this, a crash between MkdirAll and a new directory's
+// entry becoming durable could lose that directory (and anything Ack'd inside
+// it) on some filesystems (the same POSIX directory-entry trap point 4 already
+// guards for segments).
+//
+// A multi-level MkdirAll (e.g. dir = root/a/b/audit where only root
+// pre-exists) creates several ancestors at once; each of their own
+// directory-entry lists changed, so each one's parent must be fsynced too —
+// not just dir's own immediate parent (a codex adversarial-review finding on
+// this issue).
+//
+// If dir already existed, this is a no-op. If any fsync in the chain fails,
+// everything this call created is removed (best-effort) before returning
+// fail-closed, so a later retry sees the paths as absent again and
+// re-attempts the whole chain — a failed fsync must not be silently
+// downgraded to "already durable" by a later dirExists() check treating
+// "exists on disk" as "confirmed durable" (a codex review finding on this
+// issue: without this, a transient failure would be permanently un-retried).
+func ensureDirDurable(dir string, fs fsOps) error {
+	missing := missingAncestors(dir)
+	if err := os.MkdirAll(dir, dirPerm); err != nil {
+		return failClosed("mkdir", err)
+	}
+	for _, d := range missing {
+		if err := fs.syncDir(filepath.Dir(d)); err != nil {
+			_ = os.RemoveAll(missing[len(missing)-1]) // best-effort: let a retry redo it all
+			return failClosed("fsync-parent-dir", err)
+		}
+	}
+	return nil
+}
+
+// missingAncestors walks up from dir (inclusive) collecting every path that
+// does not yet exist, stopping at the first ancestor that already does. The
+// result is ordered deepest-first (dir first, its parent next, ...). Each
+// entry's parent is exactly the directory whose entry-list MkdirAll would
+// change by creating that entry.
+func missingAncestors(dir string) []string {
+	var missing []string
+	d := dir
+	for !dirExists(d) {
+		missing = append(missing, d)
+		parent := filepath.Dir(d)
+		if parent == d {
+			break // reached the filesystem root without finding an existing dir
+		}
+		d = parent
+	}
+	return missing
+}
+
+// dirExists reports whether dir already exists as a directory.
+func dirExists(dir string) bool {
+	info, err := os.Stat(dir)
+	return err == nil && info.IsDir()
+}
+
 // warnIfDirPermissive best-effort logs when a pre-existing audit directory
 // grants group/other any access — the audit trail is the sole durable copy of
 // account activity (issue #25 M-3) and should be owner-only. It never fails
@@ -205,8 +266,8 @@ func openWriter(dir string, fs fsOps, cfg config) (*Writer, error) {
 		cfg.maxSegmentSize = defaultMaxSegmentSize
 	}
 	preExisting, statErr := os.Stat(dir)
-	if err := os.MkdirAll(dir, dirPerm); err != nil {
-		return nil, failClosed("mkdir", err)
+	if err := ensureDirDurable(dir, fs); err != nil {
+		return nil, err
 	}
 	if statErr == nil && preExisting.IsDir() {
 		// The directory predates this New() call: MkdirAll is a no-op on an

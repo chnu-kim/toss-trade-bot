@@ -134,3 +134,59 @@ func mut(s FillSnapshot, f func(*FillSnapshot)) FillSnapshot {
 	f(&s)
 	return s
 }
+
+// TestOrderLifecycleKeyColonInIdentifiersDoesNotCollide is the issue #23 outer-
+// key hardening AC: before length-prefixing, "order:" + orderID + ":" + marker
+// raw-joined its fields, so a colon inside orderID/intentID could make two
+// distinct (id, marker) pairs concatenate to the identical string. This is
+// exactly that adversarial pair — the marker/id boundary shifts by one colon —
+// which must now produce distinct keys.
+func TestOrderLifecycleKeyColonInIdentifiersDoesNotCollide(t *testing.T) {
+	// Post-acquisition (orderId-scoped) branch: ("order:9","acked") vs
+	// ("order","9:acked") raw-joined to the same "order:order:9:acked" string.
+	a := orderLifecycleKey("", "order:9", "acked")
+	b := orderLifecycleKey("", "order", "9:acked")
+	if a == b {
+		t.Fatalf("colon-embedded orderID collided with a differently-split (orderID, marker) pair: %q", a)
+	}
+
+	// Same shape of attack against the pre-acquisition (intentId-scoped) branch.
+	c := orderLifecycleKey("intent:1", "", "prepared")
+	d := orderLifecycleKey("intent", "", "1:prepared")
+	if c == d {
+		t.Fatalf("colon-embedded intentID collided with a differently-split (intentID, marker) pair: %q", c)
+	}
+}
+
+// TestFillKeyColonInOrderIDStaysDistinct hardens fillKey's outer join to the
+// same length-prefix discipline as orderLifecycleKey, for consistency (issue
+// #23 "통일"). Note: fillDigest is always a fixed 64-char hex string containing
+// no ':', so the pre-hardening raw join ("fill:"+orderID+":"+digest) could not
+// actually be forced to collide via orderID content alone — this test pins
+// uniform treatment, not a fixed prior vulnerability.
+func TestFillKeyColonInOrderIDStaysDistinct(t *testing.T) {
+	snap := FillSnapshot{FilledQuantity: "1", AverageFilledPrice: "2", FilledAmount: "3", Commission: "4", Tax: "5", SettlementDate: "6"}
+	a := fillKey("order:9", snap)
+	b := fillKey("order", snap)
+	if a == b {
+		t.Fatalf("different orderIDs (one colon-embedded) collided: %q", a)
+	}
+}
+
+// TestLPFieldIsInjective is the general property behind the two tests above: no
+// two distinct (a, b) string pairs may lpField-concatenate to the same output,
+// regardless of ':' or digits embedded in either field's content.
+func TestLPFieldIsInjective(t *testing.T) {
+	cases := []struct{ a1, b1, a2, b2 string }{
+		{"order:9", "acked", "order", "9:acked"},
+		{"", "x", "0:", "x"},
+		{"5:abc", "d", "5", "abc:d"},
+	}
+	for _, c := range cases {
+		left := lpField(c.a1) + lpField(c.b1)
+		right := lpField(c.a2) + lpField(c.b2)
+		if (c.a1 != c.a2 || c.b1 != c.b2) && left == right {
+			t.Errorf("lpField concatenation collided for distinct pairs (%q,%q) vs (%q,%q): %q", c.a1, c.b1, c.a2, c.b2, left)
+		}
+	}
+}
