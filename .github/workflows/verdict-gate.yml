@@ -204,8 +204,8 @@ jobs:
         run: |
           set -euo pipefail
           gh pr view "$PR_NUMBER" \
-            --json headRepositoryOwner,headRepository,baseRepository,author,headRefOid \
-            --jq '{head_repo: (.headRepositoryOwner.login + "/" + .headRepository.name), base_repo: .baseRepository.nameWithOwner, author: .author.login, head_sha: .headRefOid}' \
+            --json headRepositoryOwner,headRepository,baseRepository,author,headRefOid,title,body,commits \
+            --jq '{head_repo: (.headRepositoryOwner.login + "/" + .headRepository.name), base_repo: .baseRepository.nameWithOwner, author: .author.login, head_sha: .headRefOid, title: .title, body: (.body // ""), commit_messages: [.commits[].messageHeadline]}' \
             > pr-meta.json
           cat pr-meta.json
           head_sha=$(jq -r '.head_sha' pr-meta.json)
@@ -298,6 +298,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      pull-requests: read # gh pr view (metadata, reviews, commits)
+      checks: read        # gh api .../check-runs (SHA-sticky / PR streak lookups)
+      actions: read        # gh api .../actions/workflows/verdict-gate.yml/runs (global count lookup)
     outputs:
       outcome: ${{ steps.outcome.outputs.outcome }}
     steps:
@@ -390,11 +393,20 @@ jobs:
           # run. A run's own conclusion is failure for a non-approve verdict
           # (the finalize step below exits non-zero in that case) and success
           # for approve — see "finalize" job.
-          clear_boundary=$(gh api "repos/${{ github.repository }}/actions/workflows/verdict-gate.yml/runs" --paginate --jq \
-            '[.workflow_runs[] | select((.display_title | contains("clear-global-escalation")) and .conclusion=="success")] | sort_by(.created_at) | last | .created_at // ""')
-          global_count=$(gh api "repos/${{ github.repository }}/actions/workflows/verdict-gate.yml/runs" --paginate --jq \
+          #
+          # `gh api --jq` takes a single query string — it has no `--arg`
+          # passthrough to jq (that is a jq flag, not a gh flag; codex:review
+          # caught an earlier version of this step passing `--arg` straight
+          # to `gh api`, which is a hard argument-parsing error). Fetch the
+          # paginated run list once as a flat, slurped JSON array, then run
+          # two ordinary `jq` passes (which do support `--arg`) over that
+          # cached value instead of hitting the API twice.
+          runs_json=$(gh api "repos/${{ github.repository }}/actions/workflows/verdict-gate.yml/runs" --paginate --slurp | jq -c '[.[].workflow_runs[]]')
+          clear_boundary=$(echo "$runs_json" | jq -r \
+            '[.[] | select((.display_title | contains("clear-global-escalation")) and .conclusion=="success")] | sort_by(.created_at) | last | .created_at // ""')
+          global_count=$(echo "$runs_json" | jq \
             --arg boundary "$clear_boundary" \
-            '[.workflow_runs[] | select((.display_title | startswith("verdict-gate request-verdict")) and .conclusion=="failure" and ($boundary == "" or .created_at > $boundary))] | length')
+            '[.[] | select((.display_title | startswith("verdict-gate request-verdict")) and .conclusion=="failure" and ($boundary == "" or .created_at > $boundary))] | length')
 
           global_intervention=false
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.action }}" = "request-verdict" ] && [ "${{ github.actor }}" = "chnu-kim" ]; then
@@ -439,7 +451,7 @@ jobs:
           workdir="$RUNNER_TEMP/codex-review"
           mkdir -p "$workdir"
           cp pr.diff "$workdir/diff.patch"
-          jq '{title, body}' pr-meta.json > "$workdir/pr-metadata.json" 2>/dev/null || echo '{}' > "$workdir/pr-metadata.json"
+          jq '{title, body, commit_messages}' pr-meta.json > "$workdir/pr-metadata.json" 2>/dev/null || echo '{}' > "$workdir/pr-metadata.json"
           echo "workdir=$workdir" >> "$GITHUB_OUTPUT"
 
       - name: Write verdict schema + prompt (inline instructions; PR content only as delimited data — ADR-0011 point 4(e)(i)/(ii))
@@ -550,7 +562,13 @@ jobs:
           set -euo pipefail
           verdict_raw=$(cat "$WORKDIR/verdict.json")
           diff_files=$(jq '.diff_files' diff-files.json)
-          pr_text=$(jq -n --slurpfile meta pr-meta.json '[$meta[0].title // "", $meta[0].body // ""]')
+          # Include the full diff text (the highest-risk untrusted
+          # input — it is what the model actually reviews) and commit
+          # messages in the injection scan, not just title/body
+          # (codex:review + codex:adversarial-review convergent finding:
+          # an earlier version of this step scanned only title/body and
+          # silently skipped the diff content itself).
+          pr_text=$(jq -n --rawfile diff pr.diff --slurpfile meta pr-meta.json '[$meta[0].title // "", $meta[0].body // "", $diff] + ($meta[0].commit_messages // [])')
           jq -n --argjson verdict "$verdict_raw" --argjson diff_files "$diff_files" --argjson pr_text "$pr_text" \
             '{verdict: $verdict, diff_files: $diff_files, pr_text: $pr_text}' > sanity-in.json
           set +e
@@ -608,6 +626,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      pull-requests: read # gh pr view (metadata, reviews, commits)
+      checks: read        # gh api .../check-runs (SHA-sticky / PR streak lookups)
+      actions: read        # gh api .../actions/workflows/verdict-gate.yml/runs (global count lookup)
     outputs:
       outcome: ${{ steps.outcome.outputs.outcome }}
     steps:
@@ -683,11 +704,16 @@ jobs:
             esac
           done
 
-          clear_boundary=$(gh api "repos/${{ github.repository }}/actions/workflows/verdict-gate.yml/runs" --paginate --jq \
-            '[.workflow_runs[] | select((.display_title | contains("clear-global-escalation")) and .conclusion=="success")] | sort_by(.created_at) | last | .created_at // ""')
-          global_count=$(gh api "repos/${{ github.repository }}/actions/workflows/verdict-gate.yml/runs" --paginate --jq \
+          # See the codex leg's identical "Global count" step for why this
+          # goes through a slurped `gh api ... | jq` pipe rather than
+          # `gh api --jq --arg` (codex:review finding — `--arg` is not a
+          # `gh api` flag).
+          runs_json=$(gh api "repos/${{ github.repository }}/actions/workflows/verdict-gate.yml/runs" --paginate --slurp | jq -c '[.[].workflow_runs[]]')
+          clear_boundary=$(echo "$runs_json" | jq -r \
+            '[.[] | select((.display_title | contains("clear-global-escalation")) and .conclusion=="success")] | sort_by(.created_at) | last | .created_at // ""')
+          global_count=$(echo "$runs_json" | jq \
             --arg boundary "$clear_boundary" \
-            '[.workflow_runs[] | select((.display_title | startswith("verdict-gate request-verdict")) and .conclusion=="failure" and ($boundary == "" or .created_at > $boundary))] | length')
+            '[.[] | select((.display_title | startswith("verdict-gate request-verdict")) and .conclusion=="failure" and ($boundary == "" or .created_at > $boundary))] | length')
 
           jq -n \
             --argjson sha_recorded "$sha_recorded" \
@@ -725,7 +751,7 @@ jobs:
           workdir="$RUNNER_TEMP/claude-review"
           mkdir -p "$workdir"
           cp pr.diff "$workdir/diff.patch"
-          jq '{title, body}' pr-meta.json > "$workdir/pr-metadata.json" 2>/dev/null || echo '{}' > "$workdir/pr-metadata.json"
+          jq '{title, body, commit_messages}' pr-meta.json > "$workdir/pr-metadata.json" 2>/dev/null || echo '{}' > "$workdir/pr-metadata.json"
           echo "workdir=$workdir" >> "$GITHUB_OUTPUT"
 
       - name: Write prompt + JSON schema (inline instructions; PR content only as delimited data)
@@ -837,7 +863,13 @@ jobs:
           set -euo pipefail
           verdict_raw=$(cat "$WORKDIR/verdict.json")
           diff_files=$(jq '.diff_files' diff-files.json)
-          pr_text=$(jq -n --slurpfile meta pr-meta.json '[$meta[0].title // "", $meta[0].body // ""]')
+          # Include the full diff text (the highest-risk untrusted
+          # input — it is what the model actually reviews) and commit
+          # messages in the injection scan, not just title/body
+          # (codex:review + codex:adversarial-review convergent finding:
+          # an earlier version of this step scanned only title/body and
+          # silently skipped the diff content itself).
+          pr_text=$(jq -n --rawfile diff pr.diff --slurpfile meta pr-meta.json '[$meta[0].title // "", $meta[0].body // "", $diff] + ($meta[0].commit_messages // [])')
           jq -n --argjson verdict "$verdict_raw" --argjson diff_files "$diff_files" --argjson pr_text "$pr_text" \
             '{verdict: $verdict, diff_files: $diff_files, pr_text: $pr_text}' > sanity-in.json
           set +e

@@ -238,6 +238,20 @@ func TestRunCombine_AllApprove_ExitsZero(t *testing.T) {
 	}
 }
 
+func TestRunCombine_EmptyOutcomeStringErrorsRatherThanApproving(t *testing.T) {
+	// codex:review finding: a leg job that fails before setting its
+	// `outcome` output would feed an empty string into this command's
+	// outcomes array. parseOutcome must not silently map "" to approve —
+	// that would let an infra/auth/model failure publish a green
+	// verdict-gate check. This must be a hard error (malformed input), not
+	// a "combine says approve" result.
+	stdin := strings.NewReader(`{"outcomes": ["approve", ""]}`)
+	var stdout bytes.Buffer
+	if _, err := runCombine(stdin, &stdout); err == nil {
+		t.Fatal("runCombine() with an empty-string outcome: want error, got nil — this must never resolve to approve")
+	}
+}
+
 // TestRunClassify_RealMappingFile exercises the actual on-disk
 // configs/gate/risk-classification.json (not a synthetic fixture) — a
 // regression guard tying this CLI's behavior to the real, CODEOWNERS-

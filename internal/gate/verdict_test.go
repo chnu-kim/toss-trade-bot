@@ -73,3 +73,22 @@ func TestParseVerdict_ApproveWithoutEvidenceRejected(t *testing.T) {
 		t.Errorf("ParseVerdict() error = %q, want it to mention missing evidence", err.Error())
 	}
 }
+
+func TestParseVerdict_ApproveWithBlankHunkRejected(t *testing.T) {
+	// codex:adversarial-review finding: strings.Contains(h, "") is always
+	// true, so an evidence entry with an empty (or whitespace-only) Hunk
+	// would trivially "match" any hunk in SanityCheck without citing any
+	// real diff text. Reject this at the schema layer, not just hope
+	// SanityCheck's substring check happens to catch it.
+	raw := []byte(`{"leg": "codex", "decision": "approve", "rationale": "x", "evidence": [{"file": "a.go", "hunk": "   "}]}`)
+	if _, err := ParseVerdict(raw); err == nil {
+		t.Fatal("ParseVerdict() approve with blank-hunk evidence: want error, got nil")
+	}
+}
+
+func TestParseVerdict_ApproveWithBlankFileRejected(t *testing.T) {
+	raw := []byte(`{"leg": "codex", "decision": "approve", "rationale": "x", "evidence": [{"file": "  ", "hunk": "+real change"}]}`)
+	if _, err := ParseVerdict(raw); err == nil {
+		t.Fatal("ParseVerdict() approve with blank-file evidence: want error, got nil")
+	}
+}

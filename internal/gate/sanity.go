@@ -109,7 +109,17 @@ func SanityCheck(v Verdict, diffFiles []DiffFile, prDerivedText []string) (ok bo
 // actually appears as a substring of one of the file's recorded diff hunks.
 // This is deliberately a loose, mechanical containment check — it is meant
 // to catch fabricated citations, not to fully re-derive the diff semantics.
+//
+// A blank (or whitespace-only) ev never matches, regardless of hunks —
+// strings.Contains(h, "") is true for every h, which would otherwise let an
+// evidence entry cite real diff text without actually quoting any of it
+// (codex:adversarial-review finding). ParseVerdict already rejects a blank
+// Hunk at the schema layer; this is defense in depth for any caller that
+// constructs a Verdict without going through ParseVerdict.
 func hunkReferenced(hunks []string, ev string) bool {
+	if strings.TrimSpace(ev) == "" {
+		return false
+	}
 	for _, h := range hunks {
 		if strings.Contains(h, ev) {
 			return true

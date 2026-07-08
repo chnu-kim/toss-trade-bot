@@ -226,9 +226,13 @@ type retryDecisionOutput struct {
 	Reason  string `json:"reason"`
 }
 
+// parseOutcome is intentionally strict: it never treats an empty or
+// unrecognized string as approve (codex:review finding — a leg job that
+// fails before setting its `outcome` output must not have that turn into a
+// silent approve when combine reads it back).
 func parseOutcome(s string) (gate.Outcome, error) {
 	switch s {
-	case "", "approve":
+	case "approve":
 		return gate.OutcomeApprove, nil
 	case "reject":
 		return gate.OutcomeReject, nil
@@ -244,9 +248,17 @@ func runRetryDecision(stdin io.Reader, stdout io.Writer) (int, error) {
 	if err := json.NewDecoder(stdin).Decode(&in); err != nil {
 		return 0, fmt.Errorf("retry-decision: malformed stdin: %w", err)
 	}
-	existing, err := parseOutcome(in.ExistingSHAOutcome)
-	if err != nil {
-		return 0, fmt.Errorf("retry-decision: %w", err)
+	// ExistingSHAOutcome is only meaningful (and only ever read by
+	// gate.ShouldProduceVerdict) when SHAOutcomeRecorded is true; when
+	// false it legitimately defaults to the JSON zero value "" and must
+	// not be run through parseOutcome's now-strict validation.
+	var existing gate.Outcome
+	if in.SHAOutcomeRecorded {
+		var err error
+		existing, err = parseOutcome(in.ExistingSHAOutcome)
+		if err != nil {
+			return 0, fmt.Errorf("retry-decision: %w", err)
+		}
 	}
 
 	h := gate.VerdictHistory{

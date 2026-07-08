@@ -80,8 +80,23 @@ func (v Verdict) validate() error {
 	if strings.TrimSpace(v.Rationale) == "" {
 		return fmt.Errorf("gate: verdict rationale is empty")
 	}
-	if v.Decision == DecisionApprove && len(v.Evidence) == 0 {
-		return fmt.Errorf("gate: approve verdict cites no evidence")
+	if v.Decision == DecisionApprove {
+		if len(v.Evidence) == 0 {
+			return fmt.Errorf("gate: approve verdict cites no evidence")
+		}
+		// codex:adversarial-review finding: strings.Contains(h, "") is
+		// always true, so a blank Hunk (or File) would trivially "match"
+		// any diff hunk in SanityCheck's grounding check without actually
+		// citing real diff text. Reject that here, at the schema layer,
+		// rather than relying only on SanityCheck's substring check.
+		for i, ev := range v.Evidence {
+			if strings.TrimSpace(ev.File) == "" {
+				return fmt.Errorf("gate: approve verdict evidence[%d] has a blank file", i)
+			}
+			if strings.TrimSpace(ev.Hunk) == "" {
+				return fmt.Errorf("gate: approve verdict evidence[%d] has a blank hunk", i)
+			}
+		}
 	}
 	return nil
 }

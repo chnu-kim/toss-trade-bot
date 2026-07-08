@@ -55,6 +55,24 @@ func TestSanityCheck_ApproveCitingHunkNotInFile_FailsClosed(t *testing.T) {
 	}
 }
 
+func TestSanityCheck_EmptyHunkNeverMatches(t *testing.T) {
+	// Defense in depth for the codex:adversarial-review finding: even if an
+	// empty-Hunk evidence entry somehow reaches SanityCheck (ParseVerdict
+	// should already reject it at the schema layer — see verdict_test.go),
+	// strings.Contains(h, "") is true for every hunk, so this must be
+	// special-cased to never match rather than relying solely on that
+	// upstream rejection.
+	v := approveVerdict(EvidenceRef{File: "a.go", Hunk: ""})
+	diff := []DiffFile{{Path: "a.go", Hunks: []string{"+ anything at all"}}}
+	ok, failure := SanityCheck(v, diff, nil)
+	if ok {
+		t.Fatal("SanityCheck() ok = true, want false for an empty-Hunk evidence entry")
+	}
+	if failure.Reason == "" {
+		t.Error("SanityCheck() failure.Reason is empty, want an explanation")
+	}
+}
+
 func TestSanityCheck_RejectDoesNotRequireEvidenceGrounding(t *testing.T) {
 	v := rejectVerdict()
 	ok, failure := SanityCheck(v, nil, nil)
