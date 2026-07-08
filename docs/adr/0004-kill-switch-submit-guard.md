@@ -1,3 +1,15 @@
+---
+id: "0004"
+status: Accepted
+date: 2026-07-02
+deciders: [chnu-kim]
+domain: [killswitch, order]
+protects: [live-execution-human-gate]
+supersedes: []
+superseded_by: null
+verification: []
+---
+
 # ADR-0004: 킬 스위치는 신규 노출 제출 엣지 하나에 걸리는 fail-closed 가드이고, 전역 halt만 영속한다
 
 - **Status**: Accepted

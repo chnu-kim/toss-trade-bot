@@ -1,3 +1,15 @@
+---
+id: "0003"
+status: Accepted
+date: 2026-06-30
+deciders: [chnu-kim]
+domain: [order]
+protects: []
+supersedes: []
+superseded_by: null
+verification: []
+---
+
 # ADR-0003: 주문 검증·복구는 orderId 상세조회로 하고, orderId 없는 ambiguous submit은 fail-closed한다
 
 - **Status**: Accepted

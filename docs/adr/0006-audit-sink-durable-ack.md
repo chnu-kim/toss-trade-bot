@@ -1,3 +1,15 @@
+---
+id: "0006"
+status: Accepted
+date: 2026-07-03
+deciders: [chnu-kim]
+domain: [audit, persistence]
+protects: []
+supersedes: []
+superseded_by: null
+verification: []
+---
+
 # ADR-0006: 감사 sink는 발생 시점에 fsync-durable하게 기록하는 자체 내구 경로를 소유하고, 전달은 at-least-once + 멱등, prune은 "로컬 durable ack"에 게이팅한다
 
 - **Status**: Accepted
