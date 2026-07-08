@@ -1,0 +1,215 @@
+package enforcement
+
+import (
+	"os"
+	"testing"
+)
+
+// validCodeowners mirrors the real .github/CODEOWNERS content (ADR-0009 point
+// 3-4): every sacred path explicitly listed with @chnu-kim as owner, including
+// the file's self-reference.
+const validCodeowners = `# enforcement-integrity sacred invariant (ADR-0009) 의 정적 보호 경로 목록.
+#
+# brace expansion은 지원되지 않는다 — 각 경로를 개별로 나열한다.
+
+/.github/workflows/ @chnu-kim
+
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+
+# risk:critical 매핑 파일은 아직 없음 — 위치 미확정.
+
+/.github/CODEOWNERS @chnu-kim
+`
+
+func TestCheckCodeowners_AllSacredPathsOwned(t *testing.T) {
+	got := CheckCodeowners(validCodeowners)
+	if !got.Satisfied {
+		t.Fatalf("CheckCodeowners() = %+v, want Satisfied=true", got)
+	}
+	if got.Name != CheckNameCodeowners {
+		t.Fatalf("Name = %q, want %q", got.Name, CheckNameCodeowners)
+	}
+}
+
+func TestCheckCodeowners_Empty(t *testing.T) {
+	got := CheckCodeowners("")
+	if got.Satisfied {
+		t.Fatal("empty CODEOWNERS must not satisfy the check")
+	}
+	if got.Reason == "" {
+		t.Fatal("unmet result must carry a reason")
+	}
+}
+
+func TestCheckCodeowners_MissingSacredPath(t *testing.T) {
+	// docs/adr/0009-*.md line removed entirely.
+	content := `/.github/workflows/ @chnu-kim
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+/.github/CODEOWNERS @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if got.Satisfied {
+		t.Fatal("missing sacred path (0009) must not satisfy the check")
+	}
+}
+
+func TestCheckCodeowners_PathPresentButOwnerStripped(t *testing.T) {
+	// A path pattern with no owner listed does NOT enforce review in GitHub's
+	// CODEOWNERS semantics — it is functionally equivalent to no protection at
+	// all for that path. A naive substring-only check would wrongly pass this.
+	content := `/.github/workflows/ @chnu-kim
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md
+/docs/adr/0010-*.md @chnu-kim
+/.github/CODEOWNERS @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if got.Satisfied {
+		t.Fatal("sacred path with owner stripped must not satisfy the check")
+	}
+}
+
+func TestCheckCodeowners_SelfReferenceMissing(t *testing.T) {
+	// If CODEOWNERS doesn't own itself, loop could edit it to drop chnu-kim
+	// without review (ADR-0009 point 4 explicitly calls this out).
+	content := `/.github/workflows/ @chnu-kim
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if got.Satisfied {
+		t.Fatal("CODEOWNERS missing its own self-reference must not satisfy the check")
+	}
+}
+
+func TestCheckCodeowners_CommentsAndBlankLinesIgnored(t *testing.T) {
+	content := `
+# comment mentioning docs/adr/0009-*.md but not a real entry
+
+/.github/workflows/ @chnu-kim
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+/.github/CODEOWNERS @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if !got.Satisfied {
+		t.Fatalf("comment-only mention must not satisfy the requirement on its own: %+v", got)
+	}
+}
+
+// TestCheckCodeowners_RealFileSatisfies guards against drift between the
+// actual .github/CODEOWNERS and the sacred paths ADR-0009 requires it to
+// cover — if someone edits the real file and drops a sacred path, this test
+// (not just the synthetic fixtures above) fails.
+func TestCheckCodeowners_RealFileSatisfies(t *testing.T) {
+	content, err := os.ReadFile("../../.github/CODEOWNERS")
+	if err != nil {
+		t.Fatalf("read real CODEOWNERS: %v", err)
+	}
+	got := CheckCodeowners(string(content))
+	if !got.Satisfied {
+		t.Fatalf("real .github/CODEOWNERS failed the presence-check: %+v", got)
+	}
+}
+
+// --- Regression tests for codex review + adversarial-review findings on the
+// initial version of this check: GitHub CODEOWNERS resolves ownership by
+// "last matching pattern wins" (entirely, not merged with earlier matches) —
+// see https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners.
+// A check that merely asks "does ANY entry cover this path with the right
+// owner" can be fooled by a later entry that also matches the same path but
+// has a different (or no) owner — GitHub would use that later entry, not the
+// earlier "protective-looking" one.
+
+func TestCheckCodeowners_LaterOwnerlessEntryOverridesEarlierProtection(t *testing.T) {
+	// codex:adversarial-review's exact example: a later, more specific
+	// ownerless pattern for a file *inside* an already-"protected" directory
+	// silently strips protection for that one file. GitHub uses the LAST
+	// matching pattern, so /.github/workflows/release.yml is unowned in
+	// reality even though an earlier line looks like it protects the whole
+	// directory.
+	content := `/.github/workflows/ @chnu-kim
+/.github/workflows/ci.yml
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+/.github/CODEOWNERS @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if got.Satisfied {
+		t.Fatal("a later ownerless entry overriding the representative workflows file must not satisfy the check")
+	}
+}
+
+func TestCheckCodeowners_LaterDifferentOwnerEntryOverridesSelfReference(t *testing.T) {
+	// codex:review's exact example: CODEOWNERS "protects" itself on one line,
+	// but a later broader pattern re-assigns a different owner to the same
+	// file. GitHub's last-match-wins rule means @other-team, not @chnu-kim,
+	// actually governs review of CODEOWNERS edits.
+	content := `/.github/workflows/ @chnu-kim
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+/.github/CODEOWNERS @chnu-kim
+/.github/* @other-team
+`
+	got := CheckCodeowners(content)
+	if got.Satisfied {
+		t.Fatal("a later broader pattern reassigning the owner must not satisfy the check")
+	}
+}
+
+func TestCheckCodeowners_LaterEntryWithSameOwnerStillSatisfies(t *testing.T) {
+	// The precedence check must not become a blunt "must be the LAST line in
+	// the file" rule — a later entry that still lists the required owner (for
+	// the same or an overlapping pattern) is fine.
+	content := `/.github/workflows/ @chnu-kim
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+/.github/CODEOWNERS @chnu-kim
+/.github/workflows/ci.yml @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if !got.Satisfied {
+		t.Fatalf("a later entry that still lists the required owner must satisfy the check: %+v", got)
+	}
+}
+
+func TestCheckCodeowners_ADRWorkflowsDoubleStarNotationAlsoMatches(t *testing.T) {
+	// The ADR text itself writes ".github/workflows/**" while the real file
+	// uses "/.github/workflows/" — the check must tolerate either notation.
+	content := `.github/workflows/** @chnu-kim
+docs/adr/0004-*.md @chnu-kim
+docs/adr/0007-*.md @chnu-kim
+docs/adr/0008-*.md @chnu-kim
+docs/adr/0009-*.md @chnu-kim
+docs/adr/0010-*.md @chnu-kim
+.github/CODEOWNERS @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if !got.Satisfied {
+		t.Fatalf("CheckCodeowners() = %+v, want Satisfied=true for ** notation", got)
+	}
+}
