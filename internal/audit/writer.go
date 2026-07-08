@@ -21,8 +21,16 @@ const (
 	segmentPrefix         = "segment-"
 	segmentSuffix         = ".log"
 	tempPrefix            = ".tmp-"
-	segmentPerm           = 0o644
-	dirPerm               = 0o755
+	// segmentPerm/dirPerm are owner-only: the audit trail durably holds order
+	// lifecycle detail, execution financial fields, and free-form error
+	// messages (which may carry response-body fragments — see doc.go's
+	// caller contract) and is the sole durable copy of account activity, so
+	// it must not be group/world-readable (issue #25 M-3). New() enforces
+	// these with an explicit Chmod after creation so the result is
+	// independent of the process umask, which can only ever strip bits from
+	// a requested mode, never add them back.
+	segmentPerm = 0o600
+	dirPerm     = 0o700
 )
 
 // segmentHeader marks a file as an audit segment and versions its format, so a
@@ -77,6 +85,60 @@ func syncDir(dir string) error {
 		return serr
 	}
 	return cerr
+}
+
+// warnIfDirPermissive best-effort logs when a pre-existing audit directory
+// grants group/other any access — the audit trail is the sole durable copy of
+// account activity (issue #25 M-3) and should be owner-only. It never fails
+// New() and never touches the filesystem; it is purely diagnostic, mirroring
+// the "durability never depends on slog" discipline (ADR-0006 point 2).
+func warnIfDirPermissive(dir string, info os.FileInfo, logger *slog.Logger) {
+	if logger == nil {
+		return
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		logger.Warn("audit directory is readable/writable beyond its owner; tighten to 0700",
+			slog.String("dir", dir),
+			slog.String("mode", info.Mode().Perm().String()),
+		)
+	}
+}
+
+// tightenSegmentPerm brings a pre-existing segment file — one created by a
+// version of this package predating segmentPerm's tightening to 0600 (issue
+// #25 review) — to the current owner-only mode. Unlike warnIfDirPermissive,
+// this auto-corrects rather than only warning: a segment file is entirely
+// internal (created and consumed only by this writer, never operator-facing
+// like the containing directory might be), so there is no plausible reason
+// something else legitimately depends on it being group/world-readable, and
+// leaving historical order/fill/error data exposed indefinitely defeats M-3
+// for exactly the data most likely to already exist in production. It never
+// fails the caller: chmod on a file this process owns should not realistically
+// fail, but if it does, bricking boot over a permission-hardening side effect
+// would reintroduce the very boot-brick class issue #25 closes — so failures
+// are best-effort logged, not fail-closed.
+func tightenSegmentPerm(path string, logger *slog.Logger) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	if info.Mode().Perm()&0o077 == 0 {
+		return // already owner-only
+	}
+	if err := os.Chmod(path, segmentPerm); err != nil {
+		if logger != nil {
+			logger.Warn("failed to tighten pre-existing audit segment permissions",
+				slog.String("path", path),
+				slog.String("error", err.Error()),
+			)
+		}
+		return
+	}
+	if logger != nil {
+		logger.Info("tightened pre-existing audit segment permissions to owner-only",
+			slog.String("path", path),
+		)
+	}
 }
 
 type config struct {
@@ -142,8 +204,25 @@ func openWriter(dir string, fs fsOps, cfg config) (*Writer, error) {
 	if cfg.maxSegmentSize <= 0 {
 		cfg.maxSegmentSize = defaultMaxSegmentSize
 	}
+	preExisting, statErr := os.Stat(dir)
 	if err := os.MkdirAll(dir, dirPerm); err != nil {
 		return nil, failClosed("mkdir", err)
+	}
+	if statErr == nil && preExisting.IsDir() {
+		// The directory predates this New() call: MkdirAll is a no-op on an
+		// existing directory and does not touch its mode. Do not silently
+		// tighten a pre-existing directory's permissions (that could be a
+		// surprising side effect on an operator-managed path) — validate and
+		// warn instead (issue #25 task 3).
+		warnIfDirPermissive(dir, preExisting, cfg.logger)
+	} else {
+		// Freshly created: force the exact owner-only mode regardless of the
+		// process umask. MkdirAll's requested mode is masked by umask (which
+		// can only strip bits), so an explicit Chmod is the only way to make
+		// the result deterministic rather than umask-dependent.
+		if err := os.Chmod(dir, dirPerm); err != nil {
+			return nil, failClosed("chmod-dir", err)
+		}
 	}
 	w := &Writer{dir: dir, fs: fs, cfg: cfg}
 
@@ -173,6 +252,7 @@ func openWriter(dir string, fs fsOps, cfg config) (*Writer, error) {
 	for i, name := range segs {
 		path := filepath.Join(dir, name)
 		isLast := i == len(segs)-1
+		tightenSegmentPerm(path, cfg.logger)
 		count, goodOffset, torn, serr := scanSegment(path)
 		if serr != nil {
 			return nil, failClosed("scan-segment", serr)
@@ -197,7 +277,10 @@ func openWriter(dir string, fs fsOps, cfg config) (*Writer, error) {
 	return w, nil
 }
 
-// EmitOrderLifecycle durably records one order-intent lifecycle transition.
+// EmitOrderLifecycle durably records one order-intent lifecycle transition. Any
+// of the three Emit* methods can also return a *RecordTooLargeError if the
+// marshaled record exceeds maxRecordSize — a per-record write-time rejection,
+// not a durability failure (see RecordTooLargeError).
 func (w *Writer) EmitOrderLifecycle(ctx context.Context, ev OrderLifecycleEvent) (Ack, error) {
 	if err := ctx.Err(); err != nil {
 		return Ack{}, err
@@ -235,7 +318,9 @@ func (w *Writer) EmitFill(ctx context.Context, ev FillEvent) (Ack, error) {
 // EmitError synchronously durably records one error occurrence. Because errors
 // are reconstruction-resistant (ADR-0006 point 3), it returns a nil error only
 // after the record is fully committed; any durability failure returns a
-// FailClosedError.
+// FailClosedError. A *RecordTooLargeError means the record was never durably
+// recorded and, being reconstruction-resistant, is permanently lost from the
+// audit trail unless the caller truncates ev.Message and re-emits.
 func (w *Writer) EmitError(ctx context.Context, ev ErrorEvent) (Ack, error) {
 	if err := ctx.Err(); err != nil {
 		return Ack{}, err
@@ -281,6 +366,16 @@ func (w *Writer) commit(rec record, keyForSeq func(seq int64) string) (Ack, erro
 	payload, err := json.Marshal(&rec)
 	if err != nil {
 		return Ack{}, &FailClosedError{Op: "marshal", Err: err}
+	}
+	// Enforce the write-time bound BEFORE framing/committing anything: nothing
+	// durable has changed yet, so this is a per-record rejection, not a
+	// durability failure — the writer is not poisoned (w.latch is never
+	// called) and w.seq is not advanced. maxRecordSize is the exact bound
+	// readFrame enforces on recovery (frame.go), so a record that passes here
+	// is guaranteed to be readable later — the invariant issue #25 closes
+	// (ADR-0006 point 4).
+	if len(payload) > maxRecordSize {
+		return Ack{}, &RecordTooLargeError{Size: len(payload), Max: maxRecordSize}
 	}
 	frame := encodeFrame(payload)
 
@@ -383,6 +478,15 @@ func (w *Writer) createSegment(startSeq int64) error {
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, segmentPerm)
 	if err != nil {
 		return failClosed("create-temp", err)
+	}
+	// Force the exact owner-only mode via the open fd, independent of the
+	// process umask (which only ever strips bits from the OpenFile request —
+	// see the dirPerm comment above). Rename preserves this mode through to
+	// the final segment name.
+	if err := f.Chmod(segmentPerm); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return failClosed("chmod-temp", err)
 	}
 	if _, err := f.Write(segmentHeader); err != nil {
 		_ = f.Close()

@@ -2,13 +2,17 @@ package audit
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
+	"time"
 )
 
 var errInjected = errors.New("injected fault")
@@ -717,5 +721,306 @@ func TestEmitAfterClose(t *testing.T) {
 	}
 	if _, err := w.EmitError(context.Background(), ErrorEvent{Operation: "op", ErrorClass: "class"}); err == nil {
 		t.Error("EmitError on closed sink returned nil error")
+	}
+}
+
+// --- issue #25: write-time oversize rejection + file permissions ---
+
+// mustMarshalRecordSize marshals rec exactly as commit() does and returns the
+// resulting byte length — the same quantity commit()'s write-time bound check
+// and readFrame's recovery-time bound check both compare against.
+func mustMarshalRecordSize(t *testing.T, rec record) int {
+	t.Helper()
+	b, err := json.Marshal(&rec)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return len(b)
+}
+
+// TestOversizeRecordBoundaryWriteTimeRejection is the issue #25 boundary AC: at
+// the maxRecordSize edge, a record that fits is accepted and durably
+// recoverable, while one byte over is rejected at write time (no ack, nothing
+// committed) without poisoning the writer — a normal-size record right after
+// still commits, and survives restart alongside the boundary record.
+func TestOversizeRecordBoundaryWriteTimeRejection(t *testing.T) {
+	dir := t.TempDir()
+	w := newTestWriter(t, dir, realFS())
+	ctx := context.Background()
+	fixedTime := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+
+	// buildMessage computes, by direct construction + measurement (not
+	// trial-and-error), the Message length that makes the exact record commit()
+	// will marshal land at precisely `target` bytes. It self-verifies the
+	// computed length actually hits the target, so a future drift in the record
+	// struct's shape fails loudly here instead of silently mis-measuring the
+	// boundary.
+	buildMessage := func(seq int64, target int) string {
+		t.Helper()
+		key := errorKey("", "", "op", "class", seq)
+		// Anchor with a 1-byte message (not 0: Message has `omitempty`, so an
+		// empty string would drop the whole "message" key and misrepresent the
+		// overhead of the field actually being present).
+		anchor := record{Kind: KindError, OccurredAt: fixedTime, Operation: "op", ErrorClass: "class", Message: "a", Seq: seq, IdempotencyKey: key}
+		size1 := mustMarshalRecordSize(t, anchor)
+		msgLen := 1 + (target - size1)
+		if msgLen < 1 {
+			t.Fatalf("target %d is smaller than the record's fixed overhead (%d bytes with a 1-byte message)", target, size1)
+		}
+		msg := strings.Repeat("a", msgLen)
+		got := mustMarshalRecordSize(t, record{Kind: KindError, OccurredAt: fixedTime, Operation: "op", ErrorClass: "class", Message: msg, Seq: seq, IdempotencyKey: key})
+		if got != target {
+			t.Fatalf("computed message length %d yields marshaled size %d, want %d", msgLen, got, target)
+		}
+		return msg
+	}
+
+	// Exactly at maxRecordSize: must be accepted and durably committed.
+	atMax := buildMessage(w.seq, maxRecordSize)
+	ack, err := w.EmitError(ctx, ErrorEvent{Operation: "op", ErrorClass: "class", Message: atMax, OccurredAt: fixedTime})
+	if err != nil {
+		t.Fatalf("EmitError at maxRecordSize boundary: %v", err)
+	}
+	if ack == (Ack{}) {
+		t.Fatal("expected a non-zero Ack for a record exactly at maxRecordSize")
+	}
+
+	// One byte over maxRecordSize: must be rejected at write time.
+	over := buildMessage(w.seq, maxRecordSize+1)
+	ack2, err := w.EmitError(ctx, ErrorEvent{Operation: "op", ErrorClass: "class", Message: over, OccurredAt: fixedTime})
+	if err == nil {
+		t.Fatal("EmitError one byte over maxRecordSize returned nil error; must reject at write time")
+	}
+	if !IsRecordTooLarge(err) {
+		t.Errorf("oversize rejection is not IsRecordTooLarge: %v", err)
+	}
+	if IsFailClosed(err) {
+		t.Errorf("oversize rejection must NOT satisfy IsFailClosed (must not read as a killswitch-trip signal): %v", err)
+	}
+	if ack2 != (Ack{}) {
+		t.Errorf("Ack must be zero on oversize rejection, got %+v", ack2)
+	}
+
+	// The writer must not be poisoned: a normal-size record right after the
+	// rejection still commits.
+	ack3, err := w.EmitError(ctx, ErrorEvent{Operation: "op", ErrorClass: "class", Message: "normal-after-rejection"})
+	if err != nil {
+		t.Fatalf("EmitError after oversize rejection: %v", err)
+	}
+	if ack3 == (Ack{}) {
+		t.Fatal("expected a non-zero Ack for a normal record following an oversize rejection")
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Self-diagnosing precondition: the boundary record's frame alone already
+	// exceeds the default segment threshold, so the post-rejection record must
+	// have rotated into a second segment — sealing the first (the boundary
+	// record) rather than leaving it active. If this ever stops holding, the
+	// restart below would only exercise the active-segment path, not the
+	// sealed-segment boot-brick path the AC cares about.
+	if segs, _ := filepath.Glob(filepath.Join(dir, "segment-*.log")); len(segs) != 2 {
+		t.Fatalf("precondition: want 2 segments (boundary record sealed, post-rejection record active), got %d", len(segs))
+	}
+
+	// Restart THROUGH openWriter, not just readAll: this is what actually
+	// exercises H-2's two destruction paths — a sealed segment's
+	// sealed-segment-corrupt fail-closed boot-brick, and an active segment's
+	// truncateActiveTail silently discarding an ack'd record. The boundary
+	// (maxRecordSize) record landed alone in the first (now sealed, since the
+	// post-rejection record rotated into a second segment) segment, so a
+	// successful reopen here is itself the boot-brick-absence proof the AC
+	// requires — readAll alone never touches openWriter and would not catch a
+	// regression here.
+	w2 := newTestWriter(t, dir, realFS())
+
+	// The rejected oversize record must not have consumed a sequence: the
+	// resumed sequence is 2 (seq 0 = boundary, seq 1 = post-rejection normal).
+	resumedAck, err := w2.EmitError(ctx, ErrorEvent{Operation: "op", ErrorClass: "class", Message: "resumed"})
+	if err != nil {
+		t.Fatalf("EmitError after restart: %v", err)
+	}
+	if resumedAck.Sequence != 2 {
+		t.Errorf("resumed sequence = %d, want 2 (rejected record must not have consumed a sequence)", resumedAck.Sequence)
+	}
+
+	// Exactly the two accepted records plus the post-restart one survive — the
+	// boundary record intact (not truncated) and the post-rejection normal
+	// record. The rejected oversize record was never committed and must not
+	// appear.
+	recs, err := readAll(dir)
+	if err != nil {
+		t.Fatalf("readAll: %v", err)
+	}
+	if len(recs) != 3 {
+		t.Fatalf("recovered records = %d, want 3 (boundary + post-rejection normal + post-restart): seqs=%v", len(recs), seqsOf(recs))
+	}
+	if len(recs[0].Message) != len(atMax) {
+		t.Errorf("recovered boundary record message length = %d, want %d (must not be truncated)", len(recs[0].Message), len(atMax))
+	}
+	if recs[1].Message != "normal-after-rejection" {
+		t.Errorf("recovered second record message = %q, want %q", recs[1].Message, "normal-after-rejection")
+	}
+	if recs[2].Message != "resumed" {
+		t.Errorf("recovered third record message = %q, want %q", recs[2].Message, "resumed")
+	}
+}
+
+func seqsOf(recs []record) []int64 {
+	out := make([]int64, len(recs))
+	for i, r := range recs {
+		out[i] = r.Seq
+	}
+	return out
+}
+
+// TestSegmentAndDirPermissionsAreOwnerOnly is the issue #25 permissions AC: a
+// freshly created audit directory and segment file are exactly 0700/0600, even
+// under a maximally permissive process umask — proving the writer enforces the
+// mode explicitly (via Chmod) rather than relying on the umask-masked
+// MkdirAll/OpenFile request, which would NOT be independent of umask.
+func TestSegmentAndDirPermissionsAreOwnerOnly(t *testing.T) {
+	// A not-yet-existing leaf directory under an existing parent, so New()
+	// takes the fresh-creation path (t.TempDir() itself already exists at
+	// 0700, which would take the pre-existing warn-only path instead of
+	// exercising the Chmod). The parent is resolved BEFORE the umask is
+	// tightened below, so only the leaf mkdir is subject to it — MkdirAll's
+	// own intermediate-parent creation under a maximally hostile umask is a
+	// separate (out-of-scope) concern from this issue's dirPerm/segmentPerm
+	// bound.
+	dir := filepath.Join(t.TempDir(), "audit")
+
+	old := syscall.Umask(0o777) // strip every bit MkdirAll/OpenFile would request
+	t.Cleanup(func() { syscall.Umask(old) })
+
+	w := newTestWriter(t, dir, realFS())
+
+	dirInfo, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat dir: %v", err)
+	}
+	if got := dirInfo.Mode().Perm(); got != 0o700 {
+		t.Errorf("audit dir mode = %o, want 0700 (regardless of umask)", got)
+	}
+
+	if _, err := w.EmitError(context.Background(), ErrorEvent{Operation: "op", ErrorClass: "class", Message: "m"}); err != nil {
+		t.Fatalf("EmitError: %v", err)
+	}
+
+	segs, err := filepath.Glob(filepath.Join(dir, "segment-*.log"))
+	if err != nil || len(segs) != 1 {
+		t.Fatalf("glob segments: %v, %v", segs, err)
+	}
+	segInfo, err := os.Stat(segs[0])
+	if err != nil {
+		t.Fatalf("stat segment: %v", err)
+	}
+	if got := segInfo.Mode().Perm(); got != 0o600 {
+		t.Errorf("segment mode = %o, want 0600 (regardless of umask)", got)
+	}
+}
+
+// TestExistingPermissiveDirWarnsButIsNotAutoTightened covers task 3's "validate
+// + warn" requirement for a directory that predates this New() call: New()
+// must not silently chmod an operator-managed existing directory, but must
+// surface a warning through the injected logger so the wider-than-owner mode
+// is visible in the unattended bot's diagnostics.
+func TestExistingPermissiveDirWarnsButIsNotAutoTightened(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("chmod dir permissive: %v", err)
+	}
+
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	w, err := New(dir, WithLogger(logger))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat dir: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Errorf("pre-existing directory mode changed to %o; New() must not silently tighten it, only warn", got)
+	}
+	if !strings.Contains(buf.String(), "audit directory") {
+		t.Errorf("expected a permission warning logged for the pre-existing permissive directory, got: %s", buf.String())
+	}
+}
+
+// TestReopenTightensPreExistingSegmentPermissions covers the upgrade gap a
+// GitHub-native codex review flagged on PR #31: segments written by a version
+// of this package predating the 0600 segmentPerm tightening (issue #25)
+// otherwise stay group/world-readable forever after upgrade, because
+// recovery's OpenFile calls have no O_CREATE (so their mode argument is
+// ignored) and nothing else ever revisits an existing segment's mode. New()
+// must actively tighten every pre-existing segment — sealed AND active — to
+// segmentPerm on open, not just the containing directory.
+func TestReopenTightensPreExistingSegmentPermissions(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	// Small segment size forces rotation, so recovery on reopen must handle
+	// BOTH a sealed segment and the active one.
+	w := newTestWriter(t, dir, realFS(), WithMaxSegmentSize(64))
+	for i := 0; i < 5; i++ {
+		if _, err := w.EmitError(ctx, ErrorEvent{Operation: "op", ErrorClass: "class", Message: fmt.Sprintf("m-%d", i)}); err != nil {
+			t.Fatalf("EmitError %d: %v", i, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	segs, err := filepath.Glob(filepath.Join(dir, "segment-*.log"))
+	if err != nil || len(segs) < 2 {
+		t.Fatalf("glob segments: %v, %v (need >=2 to cover sealed+active)", segs, err)
+	}
+
+	// Simulate legacy data: every segment written under the pre-fix 0644 mode.
+	for _, s := range segs {
+		if err := os.Chmod(s, 0o644); err != nil {
+			t.Fatalf("chmod legacy segment %s: %v", s, err)
+		}
+	}
+
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	w2, err := New(dir, WithMaxSegmentSize(64), WithLogger(logger))
+	if err != nil {
+		t.Fatalf("New (reopen over legacy 0644 segments): %v", err)
+	}
+	t.Cleanup(func() { _ = w2.Close() })
+
+	for _, s := range segs {
+		info, err := os.Stat(s)
+		if err != nil {
+			t.Fatalf("stat %s: %v", s, err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Errorf("segment %s mode after reopen = %o, want 0600 (pre-existing segments must be tightened, not left at their legacy mode)", s, got)
+		}
+	}
+	if !strings.Contains(buf.String(), "tightened") {
+		t.Errorf("expected a log line about tightening pre-existing segment permissions, got: %s", buf.String())
+	}
+
+	// The writer must still be fully functional after the tightening — a
+	// further emit commits normally and recovers.
+	if _, err := w2.EmitError(ctx, ErrorEvent{Operation: "op", ErrorClass: "class", Message: "after-tighten"}); err != nil {
+		t.Fatalf("EmitError after permission tightening: %v", err)
+	}
+	recs, err := readAll(dir)
+	if err != nil {
+		t.Fatalf("readAll: %v", err)
+	}
+	if len(recs) != 6 {
+		t.Fatalf("records = %d, want 6 (5 legacy + 1 after tightening)", len(recs))
 	}
 }

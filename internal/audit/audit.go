@@ -130,3 +130,37 @@ func failClosed(op string, err error) error {
 	}
 	return &FailClosedError{Op: op, Err: err}
 }
+
+// RecordTooLargeError is returned when a record's marshaled JSON payload
+// exceeds the shared write/read size bound (writer.go commit, frame.go
+// maxRecordSize) — enforced BEFORE the record is framed or committed, so
+// nothing durable has changed and the writer is not poisoned: normal-size
+// records emitted right after still commit (issue #25 / ADR-0006 point 4's
+// "a record accepted at write time is always readable on recovery"
+// invariant).
+//
+// This is deliberately a distinct type from FailClosedError and does NOT
+// satisfy IsFailClosed: FailClosedError signals a durability-medium failure
+// that a future killswitch wiring matches on to halt new orders (ADR-0006
+// point 6), and a single oversize record must not trip a bot-wide halt — it
+// is a per-record rejection the caller must handle explicitly (e.g. truncate
+// and re-emit, or drop and audit that decision itself). Callers detect it
+// with IsRecordTooLarge.
+type RecordTooLargeError struct {
+	Size int // marshaled payload size in bytes
+	Max  int // the bound it exceeded (maxRecordSize)
+}
+
+func (e *RecordTooLargeError) Error() string {
+	return fmt.Sprintf("audit: record size %d bytes exceeds max %d bytes", e.Size, e.Max)
+}
+
+// IsRecordTooLarge reports whether err is a write-time record-size rejection.
+// Because errors are reconstruction-resistant (ADR-0006 point 3), a rejected
+// ErrorEvent is permanently lost from the audit trail unless the caller
+// truncates and re-emits it — this predicate lets a caller detect and react to
+// that instead of silently losing the record.
+func IsRecordTooLarge(err error) bool {
+	var e *RecordTooLargeError
+	return errors.As(err, &e)
+}

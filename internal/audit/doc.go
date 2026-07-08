@@ -34,6 +34,26 @@
 //     fail-closed signal. Residual risk (ADR-0006, explicitly accepted): a crash
 //     mid durable-write loses that one record. Errors are not recovered by
 //     re-emit.
+//   - Write-time size bound. A record whose marshaled JSON payload exceeds
+//     maxRecordSize (frame.go, shared with the read-time bound readFrame
+//     enforces on recovery) is rejected at commit time, before it is framed or
+//     written, with a *RecordTooLargeError — a per-record rejection, not a
+//     durability failure. It does not poison the writer (IsFailClosed reports
+//     false for it; normal-size records emitted right after still commit),
+//     and it must never trip a future killswitch by itself (ADR-0006 point 6
+//     — that predicate is IsFailClosed). Because errors are
+//     reconstruction-resistant (see below), a rejected ErrorEvent is
+//     permanently lost from the audit trail unless the caller truncates and
+//     re-emits it (issue #25).
+//   - Caller contract on free-form fields. ErrorEvent.Message and
+//     OrderLifecycleEvent.Detail are opaque strings the sink stores verbatim
+//     and never redacts. Callers MUST NOT put secrets, tokens, or raw
+//     request/response bodies into them — the audit trail is a durable local
+//     file (and eventually ships to a remote sink, ADR-0006 point 5), so
+//     anything written there should be treated as retained, not ephemeral.
+//     Callers should also keep these fields well under maxRecordSize (e.g. by
+//     truncating an upstream API error body) so a single oversize occurrence
+//     does not silently drop from the audit trail (issue #25).
 //   - Idempotency keys are synthesized per class (see key.go): order lifecycle
 //     reuses intentId/orderId (ADR-0002), fills version by a financial-field
 //     digest, errors carry the durable append sequence. The sink is append-only
