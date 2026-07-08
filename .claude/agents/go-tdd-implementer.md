@@ -55,6 +55,11 @@ self-approval 차단 때문에 사람 본인이 그 PR을 승인하지 못한다
 - **App 자격증명(App ID·installation ID·private key)이 오케스트레이터로부터 이 세션에 실제로 공급된
   경우에만** 아래 경로를 쓴다. `internal/enforcement.InstallationTokenMinter`(`internal/enforcement/installtoken.go`,
   `signAppJWT` 재사용)로 installation access token을 발급한다.
+  > ⚠️ **이 hand-off 자체가 아직 배선되지 않았다(codex GitHub-native review 지적, PR #44)**:
+  > `.claude/skills/dispatch-issue/SKILL.md` §3의 서브에이전트 변수 블록엔 App 자격증명/토큰 항목이
+  > 없다 — 즉 아래 `GIT_APP_TOKEN`을 누가 언제 export하는지는 이 시점 기준 **정의돼 있지 않다**.
+  > 이 절은 그 hand-off가 나중에 채워졌을 때를 대비한 "받은 다음에 어떻게 쓰는지"만 규정한다.
+  > `GIT_APP_TOKEN`이 실제로 없다면 아래가 아니라 다음 항목(사람 계정 경로)을 쓴다.
   > ⚠️ **원문 토큰 값을 명령 텍스트에 직접 타이핑하지 마라**(codex GitHub-native review 지적, #44).
   > URL 리터럴이든 `export FOO="<실제 값>"`이든, 토큰 원문이 에이전트가 구성하는 명령의 리터럴
   > 텍스트로 등장하면 툴 트랜스크립트·셸 히스토리·프로세스 목록에 그대로 남는다. `SSH_AUTH_SOCK`을
@@ -74,9 +79,9 @@ self-approval 차단 때문에 사람 본인이 그 PR을 승인하지 못한다
       -c 'credential.https://github.com.helper=!f() { echo username=x-access-token; echo "password=$GIT_APP_TOKEN"; }; f' \
       push "https://github.com/{SLUG}.git" "{BR}"
     ```
-    (`GIT_APP_TOKEN`은 오케스트레이터가 `InstallationTokenMinter.Mint()` 결과로 이미 export해둔 것을
-    전제한다 — 이 명령 텍스트 자체엔 토큰 값이 없다. `origin` alias가 아니라 `https://github.com/{SLUG}.git`
-    URL을 직접 push 대상으로 써야 credential helper가 실제로 개입한다.)
+    (이 절이 적용되는 세션이라면 `GIT_APP_TOKEN`엔 `InstallationTokenMinter.Mint()` 결과가 이미
+    export돼 있어야 한다 — 이 명령 텍스트 자체엔 토큰 값이 없다. `origin` alias가 아니라
+    `https://github.com/{SLUG}.git` URL을 직접 push 대상으로 써야 credential helper가 실제로 개입한다.)
   - **`gh pr create` 인증**: `gh` CLI는 `GH_TOKEN`/`GITHUB_TOKEN` env var를 인증에 우선 사용하므로,
     같은 토큰이 이미 `GIT_APP_TOKEN`(또는 오케스트레이터가 지정한 동등한 변수)에 export돼 있다면
     `gh` 전용 이름으로 다시 참조만 하면 된다 — **여기서도 토큰 원문을 타이핑하지 않는다**:

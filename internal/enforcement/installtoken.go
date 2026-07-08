@@ -35,6 +35,19 @@ func (tok InstallationToken) NeedsRefresh(now time.Time, leeway time.Duration) b
 	return !now.Before(tok.ExpiresAt.Add(-leeway))
 }
 
+// installationTokenPermissions is the minimal permission set Mint requests:
+// exactly what this loop's git-push + PR-create workflow needs, nothing more.
+// An installation may be granted broader permissions at install time (up to
+// Contents/Pull requests/Issues R/W per ADR-0009 point 6) — narrowing the
+// per-mint request keeps a leaked/misrouted token's blast radius to what this
+// specific workflow actually uses (codex adversarial-review finding, PR #44:
+// an unnarrowed {} body would request everything the installation was ever
+// granted, across every repo it's installed on).
+var installationTokenPermissions = map[string]string{
+	"contents":      "write", // git push
+	"pull_requests": "write", // gh pr create
+}
+
 // InstallationTokenMinter mints fresh installation access tokens for one
 // GitHub App installation, authenticating with the App's own JWT (signAppJWT
 // — the same signing logic AppActorResolver uses, per ADR-0009 point 5/#43:
@@ -45,6 +58,7 @@ type InstallationTokenMinter struct {
 	baseURL        string
 	appID          string
 	installationID string
+	repo           string
 	key            *rsa.PrivateKey
 	http           httpDoer
 	now            func() time.Time
@@ -52,9 +66,13 @@ type InstallationTokenMinter struct {
 
 // NewInstallationTokenMinter builds a minter for the App identified by appID,
 // signing with key, targeting installationID (the numeric ID GitHub assigns
-// when the App is installed on an org/repo). It fails closed at construction
-// time on any missing argument, mirroring NewAppActorResolver.
-func NewInstallationTokenMinter(appID, installationID string, key *rsa.PrivateKey) (*InstallationTokenMinter, error) {
+// when the App is installed on an org/repo). repo is the bare repository name
+// (no owner prefix, e.g. "toss-trade-bot" — GitHub's access-token request body
+// takes bare names) that every minted token is narrowed to; NewInstallationTokenMinter
+// fails closed at construction time on any missing argument (including an
+// empty repo — an unset target would silently mint an unnarrowed token),
+// mirroring NewAppActorResolver.
+func NewInstallationTokenMinter(appID, installationID, repo string, key *rsa.PrivateKey) (*InstallationTokenMinter, error) {
 	if key == nil {
 		return nil, errors.New("enforcement: NewInstallationTokenMinter: private key is nil")
 	}
@@ -64,10 +82,14 @@ func NewInstallationTokenMinter(appID, installationID string, key *rsa.PrivateKe
 	if installationID == "" {
 		return nil, errors.New("enforcement: NewInstallationTokenMinter: installationID is empty")
 	}
+	if repo == "" {
+		return nil, errors.New("enforcement: NewInstallationTokenMinter: repo is empty")
+	}
 	return &InstallationTokenMinter{
 		baseURL:        defaultGitHubAPIBaseURL,
 		appID:          appID,
 		installationID: installationID,
+		repo:           repo,
 		key:            key,
 		http:           &http.Client{Timeout: 10 * time.Second},
 		now:            time.Now,
@@ -78,20 +100,19 @@ func NewInstallationTokenMinter(appID, installationID string, key *rsa.PrivateKe
 // (accepting both the PKCS#1 and PKCS#8 forms GitHub is known to hand out)
 // and builds an InstallationTokenMinter from it, so callers never need to
 // touch crypto/rsa directly.
-func NewInstallationTokenMinterFromPEM(appID, installationID string, pemBytes []byte) (*InstallationTokenMinter, error) {
+func NewInstallationTokenMinterFromPEM(appID, installationID, repo string, pemBytes []byte) (*InstallationTokenMinter, error) {
 	key, err := parseRSAPrivateKeyPEM(pemBytes)
 	if err != nil {
 		return nil, err
 	}
-	return NewInstallationTokenMinter(appID, installationID, key)
+	return NewInstallationTokenMinter(appID, installationID, repo, key)
 }
 
 // Mint signs a fresh App JWT and exchanges it for an installation access
 // token via POST /app/installations/{installation_id}/access_tokens (GitHub
-// REST API "Create an installation access token for an app"). An empty JSON
-// object body requests a token scoped to everything the installation was
-// granted at install time (no narrowing) — this loop only has one
-// installation to mint for, so there is nothing to narrow.
+// REST API "Create an installation access token for an app"), narrowed via
+// the request body to this minter's target repo and
+// installationTokenPermissions.
 //
 // Mint does not retry. Minting is what a caller then uses to authenticate a
 // write (commit/PR creation); masking a transient failure behind a retry here
@@ -104,8 +125,19 @@ func (m *InstallationTokenMinter) Mint(ctx context.Context) (InstallationToken, 
 		return InstallationToken{}, err
 	}
 
+	body, err := json.Marshal(struct {
+		Repositories []string          `json:"repositories"`
+		Permissions  map[string]string `json:"permissions"`
+	}{
+		Repositories: []string{m.repo},
+		Permissions:  installationTokenPermissions,
+	})
+	if err != nil {
+		return InstallationToken{}, fmt.Errorf("enforcement: marshal access-token request body: %w", err)
+	}
+
 	path := fmt.Sprintf("/app/installations/%s/access_tokens", m.installationID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.baseURL+path, bytes.NewReader([]byte("{}")))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.baseURL+path, bytes.NewReader(body))
 	if err != nil {
 		return InstallationToken{}, fmt.Errorf("enforcement: build request POST %s: %w", path, err)
 	}

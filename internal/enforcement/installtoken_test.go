@@ -15,7 +15,7 @@ import (
 func newTestInstallationTokenMinter(t *testing.T, baseURL string) *InstallationTokenMinter {
 	t.Helper()
 	key := generateTestRSAKey(t)
-	m, err := NewInstallationTokenMinter("4244791", "145160347", key)
+	m, err := NewInstallationTokenMinter("4244791", "145160347", "toss-trade-bot", key)
 	if err != nil {
 		t.Fatalf("NewInstallationTokenMinter: %v", err)
 	}
@@ -25,12 +25,14 @@ func newTestInstallationTokenMinter(t *testing.T, baseURL string) *InstallationT
 
 func TestInstallationTokenMinter_Mint_Success(t *testing.T) {
 	var gotMethod, gotPath, gotAuth, gotAccept, gotContentType string
+	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
 		gotPath = r.URL.Path
 		gotAuth = r.Header.Get("Authorization")
 		gotAccept = r.Header.Get("Accept")
 		gotContentType = r.Header.Get("Content-Type")
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -76,6 +78,25 @@ func TestInstallationTokenMinter_Mint_Success(t *testing.T) {
 	}
 	if gotContentType != "application/json" {
 		t.Fatalf("Content-Type = %q, want application/json", gotContentType)
+	}
+
+	// The token must be narrowed to exactly the target repo and the minimal
+	// permissions this loop's git-push + PR-create workflow needs — an
+	// unnarrowed ({}) body would request every repo/permission the
+	// installation was ever granted (codex adversarial-review finding, PR #44).
+	wantRepos := []any{"toss-trade-bot"}
+	if gotRepos, _ := gotBody["repositories"].([]any); len(gotRepos) != 1 || gotRepos[0] != wantRepos[0] {
+		t.Fatalf("request body repositories = %v, want %v", gotBody["repositories"], wantRepos)
+	}
+	gotPerms, _ := gotBody["permissions"].(map[string]any)
+	if gotPerms["contents"] != "write" {
+		t.Fatalf("request body permissions.contents = %v, want write", gotPerms["contents"])
+	}
+	if gotPerms["pull_requests"] != "write" {
+		t.Fatalf("request body permissions.pull_requests = %v, want write", gotPerms["pull_requests"])
+	}
+	if len(gotPerms) != 2 {
+		t.Fatalf("request body permissions = %v, want exactly {contents, pull_requests}", gotPerms)
 	}
 }
 
@@ -167,22 +188,29 @@ func TestInstallationTokenMinter_Mint_MalformedJSON(t *testing.T) {
 }
 
 func TestNewInstallationTokenMinter_NilKeyFailsClosed(t *testing.T) {
-	if _, err := NewInstallationTokenMinter("4244791", "145160347", nil); err == nil {
+	if _, err := NewInstallationTokenMinter("4244791", "145160347", "toss-trade-bot", nil); err == nil {
 		t.Fatal("NewInstallationTokenMinter with nil key must return an error")
 	}
 }
 
 func TestNewInstallationTokenMinter_EmptyAppIDFailsClosed(t *testing.T) {
 	key := generateTestRSAKey(t)
-	if _, err := NewInstallationTokenMinter("", "145160347", key); err == nil {
+	if _, err := NewInstallationTokenMinter("", "145160347", "toss-trade-bot", key); err == nil {
 		t.Fatal("NewInstallationTokenMinter with empty appID must return an error")
 	}
 }
 
 func TestNewInstallationTokenMinter_EmptyInstallationIDFailsClosed(t *testing.T) {
 	key := generateTestRSAKey(t)
-	if _, err := NewInstallationTokenMinter("4244791", "", key); err == nil {
+	if _, err := NewInstallationTokenMinter("4244791", "", "toss-trade-bot", key); err == nil {
 		t.Fatal("NewInstallationTokenMinter with empty installationID must return an error")
+	}
+}
+
+func TestNewInstallationTokenMinter_EmptyRepoFailsClosed(t *testing.T) {
+	key := generateTestRSAKey(t)
+	if _, err := NewInstallationTokenMinter("4244791", "145160347", "", key); err == nil {
+		t.Fatal("NewInstallationTokenMinter with empty repo must return an error — an unset repo would silently request an unnarrowed token")
 	}
 }
 
@@ -192,13 +220,13 @@ func TestNewInstallationTokenMinterFromPEM_Valid(t *testing.T) {
 		Type:  "RSA PRIVATE KEY",
 		Bytes: x509.MarshalPKCS1PrivateKey(key),
 	})
-	if _, err := NewInstallationTokenMinterFromPEM("4244791", "145160347", pemBytes); err != nil {
+	if _, err := NewInstallationTokenMinterFromPEM("4244791", "145160347", "toss-trade-bot", pemBytes); err != nil {
 		t.Fatalf("NewInstallationTokenMinterFromPEM: %v", err)
 	}
 }
 
 func TestNewInstallationTokenMinterFromPEM_InvalidPEMFailsClosed(t *testing.T) {
-	if _, err := NewInstallationTokenMinterFromPEM("4244791", "145160347", []byte("not a pem file")); err == nil {
+	if _, err := NewInstallationTokenMinterFromPEM("4244791", "145160347", "toss-trade-bot", []byte("not a pem file")); err == nil {
 		t.Fatal("invalid PEM must return an error")
 	}
 }
