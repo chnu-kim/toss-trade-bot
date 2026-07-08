@@ -1,5 +1,5 @@
 ---
-id: 0007
+id: "0007"
 status: Proposed
 date: 2026-07-08
 deciders: [chnu-kim]
