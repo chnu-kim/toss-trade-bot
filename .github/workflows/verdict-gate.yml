@@ -490,6 +490,15 @@ jobs:
           code=$?
           set -e
           cat retry-out.json
+          # Surfaced for "Determine leg outcome" below: a sticky SHA that
+          # already has a recorded verdict must re-affirm that verdict
+          # (not report a bare "skipped") when produce=false, so that an
+          # already-approved SHA whose merge attempt failed for an
+          # unrelated reason (transient App-token/environment issue) can
+          # still retry the merge on a re-dispatch, instead of being stuck
+          # until a brand-new commit is pushed (codex:review [P2] finding).
+          echo "sha_recorded=$sha_recorded" >> "$GITHUB_OUTPUT"
+          echo "existing_outcome=$existing_outcome" >> "$GITHUB_OUTPUT"
           case "$code" in
             0) echo "produce=true" >> "$GITHUB_OUTPUT" ;;
             1)
@@ -648,13 +657,26 @@ jobs:
         id: outcome
         env:
           PRODUCE: ${{ steps.retry.outputs.produce }}
+          SHA_RECORDED: ${{ steps.retry.outputs.sha_recorded }}
+          EXISTING_OUTCOME: ${{ steps.retry.outputs.existing_outcome }}
           SANITY_OK: ${{ steps.sanity.outputs.ok }}
         run: |
           set -euo pipefail
           if [ "$PRODUCE" != "true" ]; then
-            # Sticky/escalated — this leg contributes no new outcome this
-            # run. finalize treats a missing leg outcome for an
-            # already-sticky SHA as "do not touch the existing check".
+            if [ "$SHA_RECORDED" = "true" ]; then
+              # codex:review [P2] finding: this exact SHA already has a
+              # recorded verdict (sticky) — re-affirm it rather than
+              # reporting a bare "skipped", so an already-approved SHA
+              # whose merge attempt failed for an unrelated reason (e.g. a
+              # transient App-token issue) can still retry the merge on a
+              # re-dispatch instead of being stuck until a new commit is
+              # pushed.
+              echo "outcome=$EXISTING_OUTCOME" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # Fresh SHA blocked by PR-level (N) or global (M) escalation —
+            # genuinely no verdict exists yet for this SHA to re-affirm.
+            # finalize treats this as "do not touch the existing check".
             echo "outcome=skipped" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -980,10 +1002,19 @@ jobs:
         id: outcome
         env:
           PRODUCE: ${{ steps.retry.outputs.produce }}
+          SHA_RECORDED: ${{ steps.retry.outputs.sha_recorded }}
+          EXISTING_OUTCOME: ${{ steps.retry.outputs.existing_outcome }}
           SANITY_OK: ${{ steps.sanity.outputs.ok }}
         run: |
           set -euo pipefail
           if [ "$PRODUCE" != "true" ]; then
+            if [ "$SHA_RECORDED" = "true" ]; then
+              # See the codex leg's identical branch — re-affirm a sticky
+              # SHA's already-recorded verdict rather than "skipped", so a
+              # failed merge retry doesn't get stuck (codex:review [P2]).
+              echo "outcome=$EXISTING_OUTCOME" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             echo "outcome=skipped" >> "$GITHUB_OUTPUT"
             exit 0
           fi
