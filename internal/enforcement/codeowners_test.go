@@ -21,7 +21,10 @@ const validCodeowners = `# enforcement-integrity sacred invariant (ADR-0009) 의
 /docs/adr/0010-*.md @chnu-kim
 /docs/adr/0011-*.md @chnu-kim
 
-# risk:critical 매핑 파일은 아직 없음 — 위치 미확정.
+/.github/workflows/verdict-gate.yml @chnu-kim
+/internal/gate/ @chnu-kim
+/cmd/verdict-gate/ @chnu-kim
+/configs/gate/ @chnu-kim
 
 /.github/CODEOWNERS @chnu-kim
 `
@@ -126,6 +129,9 @@ func TestCheckCodeowners_CommentsAndBlankLinesIgnored(t *testing.T) {
 /docs/adr/0009-*.md @chnu-kim
 /docs/adr/0010-*.md @chnu-kim
 /docs/adr/0011-*.md @chnu-kim
+/internal/gate/ @chnu-kim
+/cmd/verdict-gate/ @chnu-kim
+/configs/gate/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
@@ -211,12 +217,64 @@ func TestCheckCodeowners_LaterEntryWithSameOwnerStillSatisfies(t *testing.T) {
 /docs/adr/0009-*.md @chnu-kim
 /docs/adr/0010-*.md @chnu-kim
 /docs/adr/0011-*.md @chnu-kim
+/internal/gate/ @chnu-kim
+/cmd/verdict-gate/ @chnu-kim
+/configs/gate/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 /.github/workflows/ci.yml @chnu-kim
+/.github/workflows/verdict-gate.yml @chnu-kim
 `
 	got := CheckCodeowners(content)
 	if !got.Satisfied {
 		t.Fatalf("a later entry that still lists the required owner must satisfy the check: %+v", got)
+	}
+}
+
+// --- Regression tests for ADR-0011 point 11 / point 4(b): the verdict-gate
+// (#48) artifacts that live outside .github/workflows/** (the judgement logic
+// in internal/gate, the CLI in cmd/verdict-gate, and the risk-classification
+// mapping in configs/gate/) are gate-defining script and data, not ordinary
+// application code — "main에 있음 ≠ 보호됨" applies to them exactly as it
+// does to the workflow YAML itself, so they must be covered by
+// sacredRequiredPaths just like every other enforcement-integrity artifact.
+
+func TestCheckCodeowners_MissingGateLogicPackage(t *testing.T) {
+	// Otherwise-complete CODEOWNERS content that predates #48: no entries for
+	// internal/gate/, cmd/verdict-gate/, or configs/gate/ at all.
+	content := `/.github/workflows/ @chnu-kim
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+/docs/adr/0011-*.md @chnu-kim
+/.github/CODEOWNERS @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if got.Satisfied {
+		t.Fatal("CODEOWNERS missing the verdict-gate logic package/binary/mapping entries must not satisfy the check")
+	}
+}
+
+func TestCheckCodeowners_GateArtifactOwnerStripped(t *testing.T) {
+	// internal/gate/ listed but with no owner — functionally unprotected,
+	// exactly the "path present but owner stripped" failure mode the earlier
+	// ADR-0009 sacred paths are already tested against.
+	content := `/.github/workflows/ @chnu-kim
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+/docs/adr/0011-*.md @chnu-kim
+/internal/gate/
+/cmd/verdict-gate/ @chnu-kim
+/configs/gate/ @chnu-kim
+/.github/CODEOWNERS @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if got.Satisfied {
+		t.Fatal("internal/gate/ with owner stripped must not satisfy the check")
 	}
 }
 
@@ -230,6 +288,9 @@ docs/adr/0008-*.md @chnu-kim
 docs/adr/0009-*.md @chnu-kim
 docs/adr/0010-*.md @chnu-kim
 docs/adr/0011-*.md @chnu-kim
+internal/gate/** @chnu-kim
+cmd/verdict-gate/** @chnu-kim
+configs/gate/** @chnu-kim
 .github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)

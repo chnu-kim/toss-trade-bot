@@ -1,0 +1,50 @@
+{
+  "_comment": [
+    "ADR-0008 point 5 risk-classification mapping: verdict-gate.yml classifies",
+    "a PR's changed paths against these ordered rules (internal/gate.ClassifyChangedPaths,",
+    "internal/gate.PathRule) to decide codex-only (non-critical) vs codex+independent-Claude",
+    "N-of-2 (critical). Rules are evaluated in array order with last-match-wins",
+    "(same semantics as .github/CODEOWNERS resolution) — a later, narrower rule",
+    "overrides an earlier, broader one for a specific path.",
+    "",
+    "This file is enforcement-integrity-protected (ADR-0011 point 11, point 4(b)):",
+    "it is loop-authored-PR-changeable content that defines the *sole* automated",
+    "merge gate's scrutiny level, so it must not be movable/editable outside the",
+    "same CODEOWNERS + internal/enforcement.sacredRequiredPaths protection this",
+    "PR wires up for it — see .github/CODEOWNERS and",
+    "internal/enforcement/codeowners.go.",
+    "",
+    "ADR-0008 point 5: 'risk:critical 분류는 ... enforcement 계층의 경로 기반",
+    "매핑이 기계적으로 계산하며, 매핑에 없는 경로의 기본값은 critical'. The",
+    "leading '**': critical' rule below encodes that default explicitly — every",
+    "other rule either narrows it (non-critical carve-outs) or re-asserts it for",
+    "a subtree nested under a carve-out (e.g. docs/adr/** staying critical even",
+    "though docs/** is non-critical).",
+    "",
+    "Refining this mapping (adding narrower carve-outs, moving a package from",
+    "one class to the other) is expected as the codebase grows — it does not",
+    "require an ADR amend, only the same CODEOWNERS-protected PR review every",
+    "change to this file already gets."
+  ],
+  "rules": [
+    { "pattern": "**", "class": "critical" },
+
+    { "pattern": "docs/**", "class": "non-critical" },
+    { "pattern": "docs/adr/**", "class": "critical" },
+
+    { "pattern": "internal/market/**", "class": "non-critical" },
+    { "pattern": "internal/account/**", "class": "non-critical" },
+    { "pattern": "internal/strategy/**", "class": "non-critical" },
+
+    { "pattern": ".claude/**", "class": "non-critical" },
+
+    { "pattern": "internal/order/**", "class": "critical" },
+    { "pattern": "internal/toss/**", "class": "critical" },
+    { "pattern": "internal/config/**", "class": "critical" },
+    { "pattern": "internal/enforcement/**", "class": "critical" },
+    { "pattern": "internal/gate/**", "class": "critical" },
+    { "pattern": "cmd/verdict-gate/**", "class": "critical" },
+    { "pattern": "configs/gate/**", "class": "critical" },
+    { "pattern": ".github/**", "class": "critical" }
+  ]
+}

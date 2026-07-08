@@ -27,8 +27,23 @@
 # 메커니즘의 구성을 정의하므로 enforcement-integrity 보호 대상(ADR-0011 point 11).
 /docs/adr/0011-*.md @chnu-kim
 
-# risk:critical 경로 분류 매핑 파일 — 위치·형식은 아직 미확정(ADR-0008 후속 이슈).
-# 그 파일이 생기면 이 자리에 명시적 경로를 추가한다.
+# ADR-0008 verdict 게이트 workflow(이슈 #48) — 특권 verdict-생성 잡의 트리거·
+# 인젝션 하드닝·적격 가드·머지 스텝 정의. /.github/workflows/ 디렉터리 규칙에
+# 이미 포함되지만, sacredRequiredPaths의 대표 파일로 명시 등재한다.
+/.github/workflows/verdict-gate.yml @chnu-kim
+
+# verdict 게이트 판정 로직(리스크 분류·sanity 교차검증·SHA-sticky/N/M 재시도
+# 정책·적격 가드)과 그 로직을 호출하는 워크플로 스크립트 바이너리. 둘 다
+# .github/workflows/** 밖에 있지만 특권 잡이 실행하는 게이트-정의 코드이므로
+# CODEOWNERS 보호 대상이다 — "main에 있음 ≠ 보호됨"(ADR-0011 point 4(b) 라운드
+# 9·point 11). 이 파일들을 고칠 수 있으면 loop가 자기 검증 로직을 스스로
+# 약화시킬 수 있다.
+/internal/gate/ @chnu-kim
+/cmd/verdict-gate/ @chnu-kim
+
+# risk:critical 경로 분류 매핑 파일(ADR-0008 point 5) — 위치는 이슈 #48에서
+# 확정(configs/gate/risk-classification.json). 위 이유와 동일하게 보호 대상.
+/configs/gate/ @chnu-kim
 
 # 이 파일 자신 (self-owned — 반드시 마지막 줄에 유지)
 /.github/CODEOWNERS @chnu-kim
