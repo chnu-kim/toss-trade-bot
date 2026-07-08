@@ -278,6 +278,34 @@ func TestCheckCodeowners_GateArtifactOwnerStripped(t *testing.T) {
 	}
 }
 
+func TestCheckCodeowners_NarrowerCarveOutOnOneGateFileNotCaught(t *testing.T) {
+	// codex:review [P2] finding: sacredRequiredPaths previously sampled only
+	// internal/gate/riskclassification.go as the directory's representative
+	// file. The privileged workflow compiles and executes every non-test
+	// file in internal/gate (cmd/verdict-gate imports the whole package),
+	// so a later, narrower CODEOWNERS entry stripping ownership from a
+	// DIFFERENT gate file (e.g. sanity.go, which implements the sanity
+	// cross-check the whole gate depends on) must also be caught — not just
+	// a strip on the one sampled file.
+	content := `/.github/workflows/ @chnu-kim
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+/docs/adr/0011-*.md @chnu-kim
+/internal/gate/ @chnu-kim
+/internal/gate/sanity.go
+/cmd/verdict-gate/ @chnu-kim
+/configs/gate/ @chnu-kim
+/.github/CODEOWNERS @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if got.Satisfied {
+		t.Fatal("a narrower ownerless entry stripping protection from internal/gate/sanity.go specifically must not satisfy the check, even though riskclassification.go (and the directory pattern) still look protected")
+	}
+}
+
 func TestCheckCodeowners_ADRWorkflowsDoubleStarNotationAlsoMatches(t *testing.T) {
 	// The ADR text itself writes ".github/workflows/**" while the real file
 	// uses "/.github/workflows/" — the check must tolerate either notation.

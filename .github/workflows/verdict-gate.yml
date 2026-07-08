@@ -246,7 +246,16 @@ jobs:
         run: |
           set -euo pipefail
           gh pr diff "$PR_NUMBER" --patch > pr.diff
-          gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' > changed-paths.txt
+          # codex:review [P1] finding: a renamed file's "files" entry
+          # carries the NEW path in `filename` and the OLD path in
+          # `previous_filename` (only present for renames). Recording only
+          # `filename` would let a rename that moves a critical path (e.g.
+          # internal/order/x.go) into a non-critical-looking one skip the
+          # N-of-2 regime entirely, even though ADR-0008 point 5's
+          # unmapped-defaults-critical rule was designed to catch exactly
+          # this kind of path-based evasion. Include both paths so the
+          # classifier sees the file was ever at a critical location.
+          gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)' > changed-paths.txt
           if [ ! -s changed-paths.txt ]; then
             echo "::error::PR #$PR_NUMBER reports zero changed files — failing closed (gate.ClassifyChangedPaths treats an empty path list as critical, but an empty *file list* for a real PR most likely means the files API call failed silently)."
             exit 1
@@ -310,6 +319,17 @@ jobs:
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
+      - name: Set up Node.js (for the codex CLI)
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+      - name: Install codex CLI
+        # codex:review finding — ubuntu-latest does not ship the codex CLI;
+        # without this, every real dispatch would fail at "codex login"
+        # with "command not found" instead of the intended fail-closed
+        # secret-missing message. Official install method (openai/codex
+        # README): npm install -g @openai/codex.
+        run: npm install -g @openai/codex
       - name: Download PR data
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -640,6 +660,15 @@ jobs:
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
+      - name: Set up Node.js (for the claude CLI)
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+      - name: Install claude CLI
+        # codex:review finding — ubuntu-latest does not ship the claude
+        # CLI. Official install method (code.claude.com/docs/en/setup, npm
+        # section): npm install -g @anthropic-ai/claude-code.
+        run: npm install -g @anthropic-ai/claude-code
       - name: Download PR data
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:

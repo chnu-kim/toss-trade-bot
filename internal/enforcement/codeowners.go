@@ -40,7 +40,22 @@ var sacredRequiredPaths = []string{
 	"docs/adr/0009-adr-autonomy-sacred-invariant.md",
 	"docs/adr/0010-adr-ssot-frontmatter-hybrid.md",
 	"docs/adr/0011-loop-pr-credential-flow.md",
+	// Every non-test .go source file in internal/gate, individually — not
+	// just one representative file (codex:review [P2] finding on #48's PR:
+	// the privileged workflow compiles and executes the whole package via
+	// cmd/verdict-gate, so a later, narrower CODEOWNERS entry stripping
+	// protection from any ONE of these files — not only
+	// riskclassification.go — must be caught).
+	"internal/gate/diffparse.go",
+	"internal/gate/doc.go",
+	"internal/gate/eligibility.go",
+	"internal/gate/gateconfig.go",
+	"internal/gate/outcome.go",
+	"internal/gate/pattern.go",
+	"internal/gate/retry.go",
 	"internal/gate/riskclassification.go",
+	"internal/gate/sanity.go",
+	"internal/gate/verdict.go",
 	"cmd/verdict-gate/main.go",
 	"configs/gate/risk-classification.json",
 }
