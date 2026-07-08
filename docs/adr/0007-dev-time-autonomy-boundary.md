@@ -24,7 +24,7 @@ verification:
 - **Status**: Accepted
 - **Date**: 2026-07-08
 - **Deciders**: chnu-kim
-- **관련 이슈/PR**: (TBD)
+- **관련 이슈/PR**: #39
 
 ## Context
 
