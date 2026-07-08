@@ -1,21 +1,33 @@
 ---
 id: "0011"
-status: Proposed
+status: Accepted
 date: 2026-07-08
 deciders: [chnu-kim]
 domain: [loop-governance, ci, auth]
 protects: [enforcement-integrity]
 supersedes: []
 superseded_by: null
-verification: []
+verification:
+  - reviewer: adversarial-panel (enforcement-attack / platform-reality / consistency)
+    date: 2026-07-08
+    verdict: 9 rounds — blocking 결함 28건 발견·수정(정정 경위 본문 기록). 코어 결정은 5라운드부터 무결함, 7~9라운드는 Phase B 게이트·운영 절차 완결성 — hard precondition·실측 목록으로 booking 후 오케스트레이터 판단으로 종결
+  - reviewer: codex:review
+    date: 2026-07-09
+    verdict: fixed (P2 — CODEOWNERS 등재와 presence-check 기대 집합(sacredRequiredPaths)이 함께 움직이지 않음 → 같은 PR에서 TDD로 반영)
+  - reviewer: codex:adversarial-review
+    date: 2026-07-09
+    verdict: 1차 needs-attention (Accepted ADR이 Proposed ADR에 운영 요구를 위임하는 split-brain → 본 Accepted flip으로 해소) — 재리뷰 결과는 PR #45에서 갱신
+  - reviewer: chnu-kim
+    date: 2026-07-09
+    verdict: approved (결정 자율 위임 — ADR-0009 point 1 경로; 최종 확정은 PR #45 code-owner 검수·머지)
 ---
 
 # ADR-0011: App 자격증명은 CI 안에서만 존재한다 — 커밋·push는 chnu-kim, PR 생성은 main-고정 workflow의 mechanu[bot], 자율 머지는 required check가 게이팅한다
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-07-08
 - **Deciders**: chnu-kim
-- **관련 이슈/PR**: #40, #41, #42, #44 (실측 근거), PR은 검토 수렴 후 연결
+- **관련 이슈/PR**: #43 (이 ADR이 지배 근거), #40, #41, #42, #44 (실측 근거), PR #45
 
 ## Context
 

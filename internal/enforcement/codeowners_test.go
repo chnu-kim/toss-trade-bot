@@ -19,6 +19,7 @@ const validCodeowners = `# enforcement-integrity sacred invariant (ADR-0009) 의
 /docs/adr/0008-*.md @chnu-kim
 /docs/adr/0009-*.md @chnu-kim
 /docs/adr/0010-*.md @chnu-kim
+/docs/adr/0011-*.md @chnu-kim
 
 # risk:critical 매핑 파일은 아직 없음 — 위치 미확정.
 
@@ -42,6 +43,26 @@ func TestCheckCodeowners_Empty(t *testing.T) {
 	}
 	if got.Reason == "" {
 		t.Fatal("unmet result must carry a reason")
+	}
+}
+
+func TestCheckCodeowners_Missing0011FailsClosed(t *testing.T) {
+	// ADR-0011 registered itself under the enforcement-integrity umbrella
+	// (ADR-0011 point 11) — a CODEOWNERS that drops its line must fail check
+	// (a), otherwise the registration exists only on paper (codex review
+	// finding on PR #45: the mechanical check and the CODEOWNERS entry must
+	// move together).
+	content := `/.github/workflows/ @chnu-kim
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+/.github/CODEOWNERS @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if got.Satisfied {
+		t.Fatal("missing sacred path (0011) must not satisfy the check")
 	}
 }
 
@@ -104,6 +125,7 @@ func TestCheckCodeowners_CommentsAndBlankLinesIgnored(t *testing.T) {
 /docs/adr/0008-*.md @chnu-kim
 /docs/adr/0009-*.md @chnu-kim
 /docs/adr/0010-*.md @chnu-kim
+/docs/adr/0011-*.md @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
@@ -188,6 +210,7 @@ func TestCheckCodeowners_LaterEntryWithSameOwnerStillSatisfies(t *testing.T) {
 /docs/adr/0008-*.md @chnu-kim
 /docs/adr/0009-*.md @chnu-kim
 /docs/adr/0010-*.md @chnu-kim
+/docs/adr/0011-*.md @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 /.github/workflows/ci.yml @chnu-kim
 `
@@ -206,6 +229,7 @@ docs/adr/0007-*.md @chnu-kim
 docs/adr/0008-*.md @chnu-kim
 docs/adr/0009-*.md @chnu-kim
 docs/adr/0010-*.md @chnu-kim
+docs/adr/0011-*.md @chnu-kim
 .github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
