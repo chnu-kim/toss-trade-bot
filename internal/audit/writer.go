@@ -79,6 +79,38 @@ func syncDir(dir string) error {
 	return cerr
 }
 
+// ensureDirDurable creates dir (via MkdirAll) if it does not already exist, and
+// if it had to be freshly created, fsyncs dir's parent so the new directory
+// entry itself is durable — the same create-then-parent-fsync discipline
+// ADR-0006 point 4 requires for segment files, extended to the audit
+// directory's own first-boot creation (issue #23). Without this, a crash
+// between MkdirAll and the parent directory entry becoming durable could lose
+// the whole audit directory (and anything Ack'd inside it) on some filesystems
+// (the same POSIX directory-entry trap point 4 already guards for segments).
+// If dir already existed, this is a no-op: only the create step needs the
+// fsync, not a directory that was already durable from a prior run. Scope is
+// deliberately the audit directory's own immediate parent only — a multi-level
+// MkdirAll's further ancestors are not walked (out of scope for this issue).
+func ensureDirDurable(dir string, fs fsOps) error {
+	existed := dirExists(dir)
+	if err := os.MkdirAll(dir, dirPerm); err != nil {
+		return failClosed("mkdir", err)
+	}
+	if existed {
+		return nil
+	}
+	if err := fs.syncDir(filepath.Dir(dir)); err != nil {
+		return failClosed("fsync-parent-dir", err)
+	}
+	return nil
+}
+
+// dirExists reports whether dir already exists as a directory.
+func dirExists(dir string) bool {
+	info, err := os.Stat(dir)
+	return err == nil && info.IsDir()
+}
+
 type config struct {
 	maxSegmentSize int64
 	logger         *slog.Logger
@@ -142,8 +174,8 @@ func openWriter(dir string, fs fsOps, cfg config) (*Writer, error) {
 	if cfg.maxSegmentSize <= 0 {
 		cfg.maxSegmentSize = defaultMaxSegmentSize
 	}
-	if err := os.MkdirAll(dir, dirPerm); err != nil {
-		return nil, failClosed("mkdir", err)
+	if err := ensureDirDurable(dir, fs); err != nil {
+		return nil, err
 	}
 	w := &Writer{dir: dir, fs: fs, cfg: cfg}
 

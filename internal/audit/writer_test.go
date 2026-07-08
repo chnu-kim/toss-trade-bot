@@ -20,6 +20,7 @@ var errInjected = errors.New("injected fault")
 type spyFS struct {
 	mu       sync.Mutex
 	events   []string
+	dirArgs  []string // parallel to the "syncDir" events, the dir argument of each call
 	failSync bool
 	failDir  bool
 }
@@ -44,6 +45,7 @@ func (s *spyFS) ops() fsOps {
 		syncDir: func(dir string) error {
 			s.mu.Lock()
 			s.events = append(s.events, "syncDir")
+			s.dirArgs = append(s.dirArgs, dir)
 			fail := s.failDir
 			s.mu.Unlock()
 			if fail {
@@ -66,9 +68,17 @@ func (s *spyFS) snapshot() []string {
 	return append([]string(nil), s.events...)
 }
 
+// dirArgsSnapshot returns the dir argument of each syncDir call, in order.
+func (s *spyFS) dirArgsSnapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.dirArgs...)
+}
+
 func (s *spyFS) reset() {
 	s.mu.Lock()
 	s.events = nil
+	s.dirArgs = nil
 	s.mu.Unlock()
 }
 
@@ -705,6 +715,113 @@ func TestTornTailAfterRotationRecovery(t *testing.T) {
 	}
 	if ack.Sequence != int64(n) {
 		t.Errorf("resumed sequence = %d, want %d", ack.Sequence, n)
+	}
+}
+
+// TestBootDirectoryCreationFsyncsParentDirectory is the issue #23 boot-durability
+// AC: when openWriter creates the audit directory for the first time, ADR-0006
+// point 4's create-then-parent-fsync discipline must extend to that first
+// MkdirAll too — otherwise a crash before the new directory's entry is durable
+// could lose the directory (and everything Ack'd inside it) whole. The very
+// first durability call must be a syncDir on dir's PARENT (not dir itself —
+// that fsync belongs to the first segment's own create protocol, which follows
+// it), and the segment-creation protocol must still hold afterward.
+func TestBootDirectoryCreationFsyncsParentDirectory(t *testing.T) {
+	spy := &spyFS{}
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "audit")
+	_ = newTestWriter(t, dir, spy.ops())
+
+	events := spy.snapshot()
+	if len(events) == 0 || events[0] != "syncDir" {
+		t.Fatalf("first durability event must be the boot parent-dir fsync, got %v", events)
+	}
+	dirArgs := spy.dirArgsSnapshot()
+	if len(dirArgs) == 0 || dirArgs[0] != parent {
+		t.Fatalf("boot fsync must target dir's parent %q, got %v", parent, dirArgs)
+	}
+
+	// The segment-creation protocol (content fsync -> rename -> dir fsync) still
+	// holds after the boot fsync.
+	assertProtocolOrder(t, events)
+	// The segment protocol's own dir fsync targets dir itself, not the parent.
+	if len(dirArgs) < 2 || dirArgs[1] != dir {
+		t.Fatalf("segment-creation dir fsync must target dir %q, got %v", dir, dirArgs)
+	}
+}
+
+// TestBootExistingDirectorySkipsParentFsync is the "no-op if already existing"
+// half of the boot-fsync AC: when dir already exists (e.g. t.TempDir(), or a
+// prior run), openWriter must not perform an extra parent-dir fsync — only the
+// first segment's own create protocol fsyncs a directory.
+func TestBootExistingDirectorySkipsParentFsync(t *testing.T) {
+	spy := &spyFS{}
+	dir := t.TempDir() // already exists
+	_ = newTestWriter(t, dir, spy.ops())
+
+	events := spy.snapshot()
+	wantSyncDirCalls := 1 // only the segment-creation protocol's dir fsync
+	got := 0
+	for _, e := range events {
+		if e == "syncDir" {
+			got++
+		}
+	}
+	if got != wantSyncDirCalls {
+		t.Fatalf("syncDir calls = %d, want %d (no boot fsync for a pre-existing dir): %v", got, wantSyncDirCalls, events)
+	}
+	dirArgs := spy.dirArgsSnapshot()
+	if len(dirArgs) != 1 || dirArgs[0] != dir {
+		t.Fatalf("the one syncDir call must target dir itself (segment protocol), got %v", dirArgs)
+	}
+}
+
+// TestBootDirectoryCreationMultiLevelFsyncsImmediateParent covers MkdirAll
+// creating multiple missing ancestors at once. The issue scopes the fix to "at
+// least the audit directory's own parent" — this pins that floor: the boot
+// fsync targets dir's direct parent, even when that parent (and further
+// ancestors) were themselves freshly created by the same MkdirAll call.
+func TestBootDirectoryCreationMultiLevelFsyncsImmediateParent(t *testing.T) {
+	spy := &spyFS{}
+	root := t.TempDir()
+	immediateParent := filepath.Join(root, "a", "b")
+	dir := filepath.Join(immediateParent, "audit")
+	_ = newTestWriter(t, dir, spy.ops())
+
+	dirArgs := spy.dirArgsSnapshot()
+	if len(dirArgs) == 0 || dirArgs[0] != immediateParent {
+		t.Fatalf("boot fsync must target dir's immediate parent %q, got %v", immediateParent, dirArgs)
+	}
+}
+
+// TestBootParentFsyncFailureFailsClosed guards the failure path: if the boot
+// parent-dir fsync itself fails (disk trouble), openWriter must fail closed
+// rather than silently proceeding with a directory whose entry may not survive
+// a crash. The fault is scoped to ONLY the parent-dir syncDir call (not the
+// segment-creation protocol's own dir fsync of dir itself), so this isolates a
+// failure specifically in the boot fsync from the already-covered segment-
+// creation fsync failure path.
+func TestBootParentFsyncFailureFailsClosed(t *testing.T) {
+	real := realFS()
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "audit")
+	fs := fsOps{
+		syncFile: real.syncFile,
+		rename:   real.rename,
+		syncDir: func(d string) error {
+			if d == parent {
+				return errInjected
+			}
+			return real.syncDir(d)
+		},
+	}
+
+	_, err := openWriter(dir, fs, config{maxSegmentSize: defaultMaxSegmentSize})
+	if err == nil {
+		t.Fatal("openWriter with a failing boot parent-dir fsync returned nil error; must fail-closed")
+	}
+	if !IsFailClosed(err) {
+		t.Errorf("error is not a fail-closed signal: %v", err)
 	}
 }
 
