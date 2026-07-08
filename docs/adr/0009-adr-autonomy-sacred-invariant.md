@@ -26,6 +26,8 @@ verification:
 - **Deciders**: chnu-kim
 - **관련 이슈/PR**: #39
 
+> **현재 상태(2026-07-08, 이 PR 머지 시점 기준)**: enforcement 계층은 아직 서 있지 않다. `.github/CODEOWNERS`는 이 PR에서 처음 만들어지는 정적 파일이고, branch protection은 아직 적용되지 않았으며, GitHub App은 아직 생성·설치되지 않았다(모두 사람 액션 대기). **즉 point 8의 presence-check는 아직 "미충족"을 반환해야 정상이고, 자율 동작은 아직 시작되지 않았다.** 이 ADR이 `Accepted`인 것은 *결정이 확정됐다*는 뜻이지 *이미 강제되고 있다*는 뜻이 아니다 — 그 사이 CLAUDE.md의 기존 사람 게이트 파이프라인(사람이 PR 검수·머지)이 계속 유효하다(codex adversarial-review 지적: 현재형 서술은 미래 독자가 가드가 이미 있다고 오인하게 만든다).
+
 ## Context
 
 - 기존 `/architect` 스킬은 "사람과의 grilling"을 전제로 ADR을 만든다(스킬 §1). loop engineering은 이 마지막 사람 자리도 없애길 요구한다.
@@ -46,8 +48,8 @@ verification:
    
    이 둘을 **약화·제거·우회하는 내용을 담은 ADR·PR은 절대 자동 `Accepted`/자동 merge될 수 없다.** 항상 사람이 직접 검토·승인해야 한다.
 4. **`enforcement-integrity`는 CI가 아니라 GitHub branch protection + CODEOWNERS로 강제한다.** CI 잡은 loop가 고칠 수 있는 코드이므로 자기 자신을 지키는 근거가 될 수 없다 — branch protection 설정은 레포 관리자 권한으로만 바꿀 수 있는 GitHub 플랫폼 기능이라 loop가 못 건드리는 유일한 층이다. **CODEOWNERS는 gitignore 스타일 경로 매칭만 하고 brace expansion을 지원하지 않으며, frontmatter 값(`protects` 등)을 읽지 못한다**(codex adversarial-review 3차 지적, GitHub 공식 문서로 확인) — 그래서 보호는 "`protects`가 채워진 파일을 동적으로 찾아 보호"가 아니라 **정적으로 나열된 파일 경로 집합 + "수정하지 말고 대체한다" 컨벤션**으로 성립한다. 구체적으로:
-   - `CODEOWNERS`에 현재 sacred 경로를 **각각 명시적으로(brace 없이) 나열**한다: `.github/workflows/**`, **`.github/CODEOWNERS` 자기 자신**, `docs/adr/0004-*.md`, `docs/adr/0007-*.md`, `docs/adr/0008-*.md`, `docs/adr/0009-*.md`, `docs/adr/0010-*.md`, risk-classification 매핑 파일. 소유자는 `chnu-kim`. **`CODEOWNERS` 파일 자신의 항목이 빠지면 이 전체 메커니즘이 자기 자신을 보호하지 못한다** — 반드시 자기 경로를 포함해 등록한다.
-   - branch protection이 이 경로를 건드리는 PR에 **CODEOWNERS 리뷰(사람 approve)** 를 required로 요구한다.
+   - `CODEOWNERS`에 현재 sacred 경로를 **각각 명시적으로(brace 없이) 나열**한다: `.github/workflows/**`, **`.github/CODEOWNERS` 자기 자신**, `docs/adr/0004-*.md`, `docs/adr/0007-*.md`, `docs/adr/0008-*.md`, `docs/adr/0009-*.md`, `docs/adr/0010-*.md`, risk-classification 매핑 파일(위치 미확정 — 구현 이슈). 소유자는 `chnu-kim`. **`CODEOWNERS` 파일 자신의 항목이 빠지면 이 전체 메커니즘이 자기 자신을 보호하지 못한다** — 반드시 자기 경로를 포함해 등록한다. **이 `CODEOWNERS` 파일은 이 PR에서 이미 만들어졌다**(`.github/CODEOWNERS`) — 단, 아래 branch protection이 켜지기 전까지는 GitHub이 이 파일을 읽고 리뷰를 요구하지 않는다. 파일 존재와 강제 발효는 별개다.
+   - branch protection이 이 경로를 건드리는 PR에 **CODEOWNERS 리뷰(사람 approve)** 를 required로 요구하도록 설정해야 한다 — **이 설정 자체는 아직 사람 손으로 적용되지 않았다**(사람 액션, 이 ADR의 범위 밖).
    - `docs/adr/0004-*.md`를 포함하는 이유: ADR-0007이 흡수한 "전역 halt = 사람 수동 해제만" 절차의 원 출처가 ADR-0004이므로, ADR-0007을 안 건드리고 ADR-0004만 조용히 개정해도(예: point 6을 자동 재개 허용으로 수정) 같은 불변식이 깨진다. frontmatter 소급 마이그레이션에서 ADR-0004에 `protects: [live-execution-human-gate]`를 부여했다.
    - **미래에 새 ADR이 sacred invariant를 다루게 되는 경우, "수정하지 말고 대체한다"(`docs/adr/README.md`) 컨벤션이 안전망이다.** 기존 sacred 결정을 바꾸려면 반드시 원본 ADR을 `Superseded`로 표시해야 하는데, 그 표시 자체가 이미 CODEOWNERS로 보호된 파일(`docs/adr/000{4,7,8,9,10}-*.md`)의 `status`/`superseded_by` frontmatter를 건드리는 편집이라 자동으로 사람 리뷰가 걸린다. **완전히 새로운 sacred invariant를 도입하는 경우**(예: 향후 ADR-0009 자체를 개정해 새 invariant를 목록에 추가)는 point 7에 따라 ADR-0009 편집이 필요하고, ADR-0009 자체가 CODEOWNERS 보호 대상이므로 역시 사람 리뷰가 걸린다. 즉 "새 sacred 경로가 정적 목록에 없어서 빠져나가는" 경우는, 그 새 결정이 기존 sacred ADR을 대체하거나 sacred invariant 목록 자체를 건드리는 한 발생하지 않는다 — **기존 sacred 결정과 무관하게 완전히 새로운 파일에서 조용히 모순되는 내용을 선언하는 것**만 이 모델의 사각지대이며, 이는 CODEOWNERS의 구조적 한계(경로 기반)이지 이 설계의 결함이 아니다(ADR README의 "수정하지 말고 대체" 컨벤션을 우회하는 것 자체가 이미 이 레포의 다른 규범 위반이다).
 5. **loop가 만드는 PR의 작성자 identity는 사람 검토자(`chnu-kim`)와 분리된 별도 identity여야 한다** — 구체적으로 **GitHub App**을 만들어 그 앱의 bot identity(`<app-name>[bot]`)로 커밋·PR을 생성한다. 이렇게 하면 GitHub의 self-approval 차단이 "사람이 자기 자신을 승인 못 함"이 아니라 "**사람이 loop의 산출물을 실제로 승인할 수 있음**"으로 정확히 작동한다.
@@ -79,9 +81,8 @@ verification:
 - (알려진 잔여 위험) CODEOWNERS 보호는 **정적 파일 경로 목록**이지 `protects` 필드를 동적으로 읽는 게 아니다(codex adversarial-review 3차 지적, point 4). 기존 sacred ADR을 "수정하지 말고 대체"하는 정상 경로는 항상 걸리지만, 이론적으로는 **기존 sacred 파일을 전혀 건드리지 않는 완전히 새로운 ADR이 조용히 모순되는 내용을 선언**하는 경우까지는 이 메커니즘이 못 막는다. CODEOWNERS의 구조적 한계이며, `docs/adr/README.md`의 "수정하지 말고 대체" 컨벤션 준수에 의존한다 — 완벽한 보증이 아니라 실용적 완화다.
 - (비용) GitHub App을 실제로 만들고 설치해야 한다 — 이건 사람의 GitHub 웹 UI 작업이 필요하고 이 세션에서 대신 완료할 수 없다(구현 이슈, 사람 액션 필요).
 - (비용) 기존 CLAUDE.md의 "`gh auth switch --user chnu-kim` 후 `gh pr create`" 관행을 이 GitHub App 기반 flow로 갱신해야 한다 — 사람이 직접 만드는 PR(예외적 수동 개입)과 loop가 만드는 PR을 구분해야 하므로 워크플로 문서 갱신이 필요하다(구현 이슈).
-- (비용) `CODEOWNERS`·branch protection 설정 자체를 실제로 구성해야 한다 — 공유 인프라 변경이라 사람이 직접 확인하며 적용한다.
-- (후속) GitHub App 생성·설치 (사람 액션, 구체 권한 스펙은 이 ADR point 6).
-- (후속) `CODEOWNERS` 파일 작성 + branch protection 규칙 실제 적용 — 이때 **`enforce_admins`(관리자도 우회 못 하게 할지) 여부는 이 ADR이 결정하지 않는다.** 이건 "사람의 정당한 긴급 override 능력"과 "루프도 admin 우회를 못 쓰게 하는 엄격함" 사이의 실질적 트레이드오프라, branch protection을 실제로 켜는 시점에 사람이 직접 정한다(조용한 기본값 금지).
+- (비용) `.github/CODEOWNERS` 파일 자체는 이 PR에서 만들었지만(정적 목록, 즉시 검토 가능), **branch protection 설정은 이 PR 범위 밖이고 사람이 직접 구성해야 발효된다** — 공유 인프라 변경이므로.
+- (후속) **GitHub App 생성·설치 + branch protection 실제 적용 + presence-check 구현은 #40으로 추적한다** — GitHub App 권한 스펙은 이 ADR point 6, branch protection의 `enforce_admins` 여부(이 ADR이 결정하지 않음, 사람이 그 시점에 직접 정함)와 presence-check 최초 검증까지 포함한 완료 기준은 이슈 본문 참조.
 - (후속) risk-classification 매핑 파일의 구체 위치·형식 확정(ADR-0008과 연계).
 - (후속) sacred invariant 목록이 늘어날 가능성에 대비해, 이 목록 자체의 관리 절차(현재는 이 ADR 본문이 SSOT)를 명확히 유지한다.
 - (후속) point 8의 presence-check 구현(구현 이슈) — 점검 로직 자체도 최초 1회는 사람이 직접 확인해 "점검 로직이 항상 통과를 리턴하도록 조작되지 않았는지" 검증한다.

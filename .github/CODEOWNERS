@@ -1,0 +1,31 @@
+# enforcement-integrity sacred invariant (ADR-0009) 의 정적 보호 경로 목록.
+#
+# 주의: 이 파일이 존재하는 것만으로는 아무것도 강제되지 않는다. GitHub은 branch
+# protection에서 "require review from code owners"가 켜져 있어야만 이 파일을 읽고
+# 리뷰를 요구한다. 그 branch protection 설정은 아직 사람 손으로 적용되지 않았다
+# (ADR-0009 point 8의 presence-check가 이걸 확인하는 이유이기도 하다) — 이 파일은
+# 그 설정이 켜지는 순간 바로 의미를 갖도록 미리 준비해두는 정적 목록이다.
+#
+# brace expansion(예: docs/adr/000{7,8,9,10}-*.md)은 CODEOWNERS 문법에서 지원되지
+# 않는다(gitignore 스타일 매칭) — 각 경로를 반드시 개별로 나열한다.
+#
+# 이 파일 자신도 보호 대상이다 — 아래 마지막 줄이 빠지면 loop가 이 파일을 고쳐
+# 소유자를 제거하는 PR이 리뷰 없이 통과해 전체 메커니즘이 스스로 열린다.
+
+# CI/워크플로 — 이걸 고칠 수 있으면 어떤 게이트도 loop가 스스로 우회할 수 있다.
+/.github/workflows/ @chnu-kim
+
+# sacred invariant를 정의·보호하는 ADR 본문. 원본 킬스위치 절차(0004)와
+# 그걸 흡수한 실거래 게이트(0007), enforcement-integrity를 신설한 0009,
+# 그 강제 메커니즘(CODEOWNERS/frontmatter)을 정의하는 0010.
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+
+# risk:critical 경로 분류 매핑 파일 — 위치·형식은 아직 미확정(ADR-0008 후속 이슈).
+# 그 파일이 생기면 이 자리에 명시적 경로를 추가한다.
+
+# 이 파일 자신 (self-owned — 반드시 마지막 줄에 유지)
+/.github/CODEOWNERS @chnu-kim

@@ -3,7 +3,7 @@ id: "NNNN"
 status: Proposed
 date: YYYY-MM-DD
 deciders: [<결정에 참여한 사람>]
-domain: [<이슈 라벨 area: 축과 어휘 통일 — killswitch/order/auth/persistence/loop-governance 등>]
+domain: ["<이슈 라벨 area 축과 어휘 통일 — killswitch/order/auth/persistence/loop-governance 등>"]
 protects: []
 supersedes: []
 superseded_by: null
