@@ -74,13 +74,27 @@ type RetryDecision struct {
 }
 
 // ShouldProduceVerdict implements ADR-0011 point 4(e)(iv)'s full retry
-// policy for one (PR, head SHA) evaluation: SHA-sticky first, then the
-// repo-wide cap M, then the PR-level streak cap N — each fail-closed (skip
+// policy for one (PR, head SHA) evaluation: the repo-wide cap M first, then
+// SHA-sticky, then the PR-level streak cap N — each fail-closed (skip
 // producing a new verdict) unless its own specific intervention signal is
-// present. Global escalation is checked before the PR-level streak because
-// it is a repo-wide condition that must hold regardless of this particular
-// PR's own history (ADR-0011 point 4(e)(iv), round 8).
+// present.
+//
+// The global cap is checked FIRST, unconditionally, before SHA-sticky —
+// not merely before the PR-level streak (codex:review finding on an
+// earlier version of this function, which returned Produce=true out of the
+// SHA-sticky indeterminate+PR-intervention branch without ever consulting
+// GlobalNonApproveCount): a repo-wide M-cap escalation is meant to require
+// the separate, chnu-kim-actor global workflow_dispatch clear signal
+// regardless of what happens on any single PR (ADR-0011 point 4(e)(iv):
+// "전역 해제 신호는 PR-단위 신호... 와 별개"). Letting a PR-level review
+// reprocess an indeterminate SHA while the global escalation is still
+// active would let one PR's human-intervention signal quietly lift a
+// repo-wide halt it has no authority over.
 func ShouldProduceVerdict(h VerdictHistory, limits Limits) RetryDecision {
+	if h.GlobalNonApproveCount > limits.GlobalNonApprove && !h.GlobalIntervention.Present() {
+		return RetryDecision{Produce: false, Reason: "전역 비-approve 누적이 상한 M을 초과 — 레포-전역 sticky 에스컬레이션"}
+	}
+
 	if h.SHAOutcomeRecorded {
 		switch h.ExistingSHAOutcome {
 		case OutcomeIndeterminate:
@@ -91,10 +105,6 @@ func ShouldProduceVerdict(h VerdictHistory, limits Limits) RetryDecision {
 		default: // Approve, Reject
 			return RetryDecision{Produce: false, Reason: "동일 head SHA에 verdict가 이미 기록됨 — sticky"}
 		}
-	}
-
-	if h.GlobalNonApproveCount > limits.GlobalNonApprove && !h.GlobalIntervention.Present() {
-		return RetryDecision{Produce: false, Reason: "전역 비-approve 누적이 상한 M을 초과 — 레포-전역 sticky 에스컬레이션"}
 	}
 
 	if h.PRNonApproveStreak >= limits.PRNonApprove && !h.PRIntervention.Present() {

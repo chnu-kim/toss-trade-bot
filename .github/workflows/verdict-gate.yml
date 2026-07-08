@@ -355,8 +355,10 @@ jobs:
           # finalize job for why indeterminate is deliberately NOT
           # published under the required "verdict-gate" context) on this
           # exact head SHA, if any.
-          existing_conclusion=$(gh api "repos/${{ github.repository }}/commits/$HEAD_SHA/check-runs" --jq \
-            "[.check_runs[] | select(.name==\"verdict-gate\" or .name==\"verdict-gate-record\")] | sort_by(.started_at) | last | .conclusion // \"\"")
+          head_sha_runs=$(gh api "repos/${{ github.repository }}/commits/$HEAD_SHA/check-runs" --jq \
+            "[.check_runs[] | select(.name==\"verdict-gate\" or .name==\"verdict-gate-record\")] | sort_by(.started_at) | last")
+          existing_conclusion=$(echo "$head_sha_runs" | jq -r '.conclusion // ""')
+          existing_started_at=$(echo "$head_sha_runs" | jq -r '.started_at // ""')
           sha_recorded=false
           existing_outcome="approve"
           if [ -n "$existing_conclusion" ]; then
@@ -372,33 +374,28 @@ jobs:
             esac
           fi
 
-          # PR-level intervention signal: a chnu-kim review submitted on this
-          # PR strictly after the most recent verdict-gate check-run's
-          # started_at (so a stale old review does not perpetually unstick).
-          last_verdict_at=$(gh api "repos/${{ github.repository }}/commits/$HEAD_SHA/check-runs" --jq \
-            "[.check_runs[] | select(.name==\"verdict-gate\" or .name==\"verdict-gate-record\")] | sort_by(.started_at) | last | .started_at // \"\"")
-          pr_intervention=false
-          owner_review_at=$(gh pr view "$PR_NUMBER" --json reviews --jq \
-            '[.reviews[] | select(.author.login=="chnu-kim")] | sort_by(.submittedAt) | last | .submittedAt // ""')
-          if [ -n "$owner_review_at" ]; then
-            if [ -z "$last_verdict_at" ] || [[ "$owner_review_at" > "$last_verdict_at" ]]; then
-              pr_intervention=true
-            fi
-          fi
-
           # PR streak (N): walk this PR's commits, most-recent-first
           # (excluding the current head), counting trailing non-approve
           # verdict-gate conclusions; stop at the first approve. Commits with
           # no recorded verdict-gate check-run are skipped (never judged),
-          # not counted as non-approve.
+          # not counted as non-approve. While walking, also record
+          # latest_prior_verdict_at — the started_at of the FIRST (i.e.
+          # most recent) prior commit this loop finds with any recorded
+          # conclusion — for the PR-intervention comparison below.
           pr_streak=0
+          latest_prior_verdict_at=""
           commit_shas=$(gh pr view "$PR_NUMBER" --json commits --jq '[.commits[].oid] | reverse | .[]')
           for sha in $commit_shas; do
             if [ "$sha" = "$HEAD_SHA" ]; then
               continue
             fi
-            concl=$(gh api "repos/${{ github.repository }}/commits/$sha/check-runs" --jq \
-              "[.check_runs[] | select(.name==\"verdict-gate\" or .name==\"verdict-gate-record\")] | sort_by(.started_at) | last | .conclusion // \"\"")
+            commit_runs=$(gh api "repos/${{ github.repository }}/commits/$sha/check-runs" --jq \
+              "[.check_runs[] | select(.name==\"verdict-gate\" or .name==\"verdict-gate-record\")] | sort_by(.started_at) | last")
+            concl=$(echo "$commit_runs" | jq -r '.conclusion // ""')
+            started_at=$(echo "$commit_runs" | jq -r '.started_at // ""')
+            if [ -n "$started_at" ] && [ -z "$latest_prior_verdict_at" ]; then
+              latest_prior_verdict_at="$started_at"
+            fi
             case "$concl" in
               "") continue ;;
               success) break ;;
@@ -409,6 +406,33 @@ jobs:
                 ;;
             esac
           done
+
+          # PR-level intervention signal: a chnu-kim review submitted
+          # strictly after the most recent verdict this PR has actually had
+          # evaluated — codex:review [P1] finding: comparing only against
+          # $HEAD_SHA's own timestamp made every review "count" for a fresh
+          # SHA (which by definition has no check-run yet, so that
+          # comparison was always vacuously true), letting a single stale
+          # review perpetually clear the PR-level N-streak escalation for
+          # every subsequent commit. The correct comparison point is: this
+          # exact SHA's own verdict timestamp if it has already been
+          # evaluated (the SHA-sticky indeterminate-reprocess case, where
+          # $HEAD_SHA IS the most recent evaluated commit), otherwise the
+          # most recent PRIOR commit's verdict timestamp found by the
+          # streak walk above (the fresh-SHA / PR-streak-escalation case).
+          if [ "$sha_recorded" = "true" ]; then
+            last_verdict_at="$existing_started_at"
+          else
+            last_verdict_at="$latest_prior_verdict_at"
+          fi
+          pr_intervention=false
+          owner_review_at=$(gh pr view "$PR_NUMBER" --json reviews --jq \
+            '[.reviews[] | select(.author.login=="chnu-kim")] | sort_by(.submittedAt) | last | .submittedAt // ""')
+          if [ -n "$owner_review_at" ]; then
+            if [ -z "$last_verdict_at" ] || [[ "$owner_review_at" > "$last_verdict_at" ]]; then
+              pr_intervention=true
+            fi
+          fi
 
           # Global count (M): this workflow's own run history, counting
           # non-approve-concluding runs since the last clear-global-escalation
@@ -688,8 +712,10 @@ jobs:
           # combination), not per leg (ADR-0011 point 4(g)) — both legs read
           # the same two context names ("verdict-gate" / "verdict-gate-record")
           # and therefore the same existing record.
-          existing_conclusion=$(gh api "repos/${{ github.repository }}/commits/$HEAD_SHA/check-runs" --jq \
-            "[.check_runs[] | select(.name==\"verdict-gate\" or .name==\"verdict-gate-record\")] | sort_by(.started_at) | last | .conclusion // \"\"")
+          head_sha_runs=$(gh api "repos/${{ github.repository }}/commits/$HEAD_SHA/check-runs" --jq \
+            "[.check_runs[] | select(.name==\"verdict-gate\" or .name==\"verdict-gate-record\")] | sort_by(.started_at) | last")
+          existing_conclusion=$(echo "$head_sha_runs" | jq -r '.conclusion // ""')
+          existing_started_at=$(echo "$head_sha_runs" | jq -r '.started_at // ""')
           sha_recorded=false
           existing_outcome="approve"
           if [ -n "$existing_conclusion" ]; then
@@ -705,25 +731,25 @@ jobs:
             esac
           fi
 
-          last_verdict_at=$(gh api "repos/${{ github.repository }}/commits/$HEAD_SHA/check-runs" --jq \
-            "[.check_runs[] | select(.name==\"verdict-gate\" or .name==\"verdict-gate-record\")] | sort_by(.started_at) | last | .started_at // \"\"")
-          pr_intervention=false
-          owner_review_at=$(gh pr view "$PR_NUMBER" --json reviews --jq \
-            '[.reviews[] | select(.author.login=="chnu-kim")] | sort_by(.submittedAt) | last | .submittedAt // ""')
-          if [ -n "$owner_review_at" ]; then
-            if [ -z "$last_verdict_at" ] || [[ "$owner_review_at" > "$last_verdict_at" ]]; then
-              pr_intervention=true
-            fi
-          fi
-
+          # See the codex leg's identical PR-streak/intervention steps for
+          # why latest_prior_verdict_at is captured during this walk and why
+          # the PR-intervention comparison uses it (rather than only
+          # $HEAD_SHA's own timestamp) when this SHA is not yet recorded —
+          # codex:review [P1] finding.
           pr_streak=0
+          latest_prior_verdict_at=""
           commit_shas=$(gh pr view "$PR_NUMBER" --json commits --jq '[.commits[].oid] | reverse | .[]')
           for sha in $commit_shas; do
             if [ "$sha" = "$HEAD_SHA" ]; then
               continue
             fi
-            concl=$(gh api "repos/${{ github.repository }}/commits/$sha/check-runs" --jq \
-              "[.check_runs[] | select(.name==\"verdict-gate\" or .name==\"verdict-gate-record\")] | sort_by(.started_at) | last | .conclusion // \"\"")
+            commit_runs=$(gh api "repos/${{ github.repository }}/commits/$sha/check-runs" --jq \
+              "[.check_runs[] | select(.name==\"verdict-gate\" or .name==\"verdict-gate-record\")] | sort_by(.started_at) | last")
+            concl=$(echo "$commit_runs" | jq -r '.conclusion // ""')
+            started_at=$(echo "$commit_runs" | jq -r '.started_at // ""')
+            if [ -n "$started_at" ] && [ -z "$latest_prior_verdict_at" ]; then
+              latest_prior_verdict_at="$started_at"
+            fi
             case "$concl" in
               "") continue ;;
               success) break ;;
@@ -734,6 +760,20 @@ jobs:
                 ;;
             esac
           done
+
+          if [ "$sha_recorded" = "true" ]; then
+            last_verdict_at="$existing_started_at"
+          else
+            last_verdict_at="$latest_prior_verdict_at"
+          fi
+          pr_intervention=false
+          owner_review_at=$(gh pr view "$PR_NUMBER" --json reviews --jq \
+            '[.reviews[] | select(.author.login=="chnu-kim")] | sort_by(.submittedAt) | last | .submittedAt // ""')
+          if [ -n "$owner_review_at" ]; then
+            if [ -z "$last_verdict_at" ] || [[ "$owner_review_at" > "$last_verdict_at" ]]; then
+              pr_intervention=true
+            fi
+          fi
 
           # See the codex leg's identical "Global count" step for why this
           # goes through a slurped `gh api ... | jq` pipe rather than

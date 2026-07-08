@@ -118,6 +118,26 @@ func TestShouldProduceVerdict_GlobalEscalationCheckedBeforePRStreak(t *testing.T
 	}
 }
 
+func TestShouldProduceVerdict_GlobalEscalationBlocksIndeterminateSHAReprocessEvenWithPRSignal(t *testing.T) {
+	// codex:review [P1] finding: the SHA-sticky indeterminate+PR-signal
+	// reprocess branch previously returned Produce=true before the global
+	// cap was ever checked, so a PR-level chnu-kim review on ONE PR could
+	// bypass a repo-wide M-cap escalation that is supposed to require the
+	// separate, chnu-kim-actor global workflow_dispatch clear signal —
+	// exactly the axis-independence ADR-0011 point 4(e)(iv) requires
+	// ("전역 해제 신호는 PR-단위 신호... 와 별개").
+	h := VerdictHistory{
+		SHAOutcomeRecorded:    true,
+		ExistingSHAOutcome:    OutcomeIndeterminate,
+		PRIntervention:        PRReviewSubmittedByOwner(),
+		GlobalNonApproveCount: 20, // well over the default M=9, no clear signal
+	}
+	d := ShouldProduceVerdict(h, DefaultLimits())
+	if d.Produce {
+		t.Fatal("ShouldProduceVerdict() Produce = true, want false — an active global escalation must block same-SHA reprocessing even with a PR-level intervention signal")
+	}
+}
+
 func TestInterventionSignal_ZeroValueIsAbsent(t *testing.T) {
 	var s InterventionSignal
 	if s.Present() {
