@@ -55,21 +55,33 @@ self-approval 차단 때문에 사람 본인이 그 PR을 승인하지 못한다
 - **App 자격증명(App ID·installation ID·private key)이 오케스트레이터로부터 이 세션에 실제로 공급된
   경우에만** 아래 경로를 쓴다. `internal/enforcement.InstallationTokenMinter`(`internal/enforcement/installtoken.go`,
   `signAppJWT` 재사용)로 installation access token을 발급한다.
+  > ⚠️ **원문 토큰 값을 명령 텍스트에 직접 타이핑하지 마라**(codex GitHub-native review 지적, #44).
+  > URL 리터럴이든 `export FOO="<실제 값>"`이든, 토큰 원문이 에이전트가 구성하는 명령의 리터럴
+  > 텍스트로 등장하면 툴 트랜스크립트·셸 히스토리·프로세스 목록에 그대로 남는다. `SSH_AUTH_SOCK`을
+  > 소켓 값이 아니라 *경로*로 넘기는 이 문서의 기존 패턴과 같은 원칙이다: **아래 두 명령 모두
+  > 이미 export된 env var *이름*만 참조하고, 그 값을 처음 export하는 방법은 이 문서가 규정하지
+  > 않는다**(오케스트레이터/시크릿 provisioning의 몫).
   - **`git push` 인증**: `git`은 `GITHUB_TOKEN`을 읽지 않는다(gh CLI만 읽는다). 이 worktree의 origin은
-    SSH remote(`git@github.com:...`)라 그대로 두면 push가 여전히 사람의 SSH 키로 서명·인증된다 — App
-    토큰으로 push하려면 origin을 GitHub 공식 "Authenticating as a GitHub App installation" 문서의
-    `x-access-token` Basic-Auth 패턴으로 **일시적으로** 바꿔야 한다:
+    SSH remote(`git@github.com:...`)라 그대로 두면 push가 여전히 사람의 SSH 키로 서명·인증된다. App
+    토큰으로 push하려면 GitHub 공식 "Authenticating as a GitHub App installation" 문서의
+    `x-access-token` Basic-Auth 자격증명을, **URL에 박지 말고** 이미 export된 `GIT_APP_TOKEN`을
+    참조하는 일회성 credential helper로 공급한다:
     ```bash
-    git -C "{WT}" push "https://x-access-token:<InstallationTokenMinter.Mint() 가 반환한 token>@github.com/{SLUG}.git" "{BR}"
+    git -C "{WT}" -c credential.helper= \
+      -c 'credential.https://github.com.helper=!f() { echo username=x-access-token; echo "password=$GIT_APP_TOKEN"; }; f' \
+      push origin "{BR}"
     ```
+    (`GIT_APP_TOKEN`은 오케스트레이터가 `InstallationTokenMinter.Mint()` 결과로 이미 export해둔 것을
+    전제한다 — 이 명령 텍스트 자체엔 토큰 값이 없다.)
   - **`gh pr create` 인증**: `gh` CLI는 `GH_TOKEN`/`GITHUB_TOKEN` env var를 인증에 우선 사용하므로,
-    같은 토큰을 넣으면 `gh auth switch` 없이 PR을 만들 수 있다 — **PR 작성자가 App identity로 찍히는
-    지점이 바로 여기(어떤 자격증명으로 `pr create`를 호출했는지)다**:
+    같은 토큰이 이미 `GIT_APP_TOKEN`(또는 오케스트레이터가 지정한 동등한 변수)에 export돼 있다면
+    `gh` 전용 이름으로 다시 참조만 하면 된다 — **여기서도 토큰 원문을 타이핑하지 않는다**:
     ```bash
-    export GH_TOKEN="<InstallationTokenMinter.Mint() 가 반환한 token>"
+    export GH_TOKEN="$GIT_APP_TOKEN"
     gh pr create --repo "{SLUG}" --base main --head "{BR}" \
       --title "<요약>" --body "<무엇을·왜, Acceptance Criteria 충족 근거, risk:high면 위험 요지>. Closes #{N}"
     ```
+    **PR 작성자가 App identity로 찍히는 지점이 바로 여기(어떤 자격증명으로 `pr create`를 호출했는지)다.**
   이 경로로 만든 PR의 작성자는 `<app-slug>[bot]`(예: `mechanu[bot]`)로 표시되는 것이 목표다. (커밋
   author/committer 필드 자체는 별개다 — git config의 email/name 설정에 달려 있고, 이 문서는 그 배선은
   다루지 않는다. self-approval 교착을 푸는 데 필요한 건 PR 작성자 identity다.)
