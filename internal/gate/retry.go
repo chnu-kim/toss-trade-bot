@@ -68,9 +68,20 @@ type VerdictHistory struct {
 // RetryDecision is ShouldProduceVerdict's result. Reason is always populated
 // (whether Produce is true or false) so an unattended run leaves a
 // diagnosable trail of exactly why a verdict was or was not produced.
+//
+// GloballyEscalated is always computed and set, in every return path,
+// independently of which specific check ultimately decided Produce
+// (codex:adversarial-review [high] finding): a caller that wants to
+// re-affirm an existing SHA-sticky verdict (e.g. to let an already-approved
+// PR retry a failed merge attempt) must be able to tell "this SHA has its
+// own definitive record" apart from "the repo-wide M-cap escalation is
+// currently active" — re-affirming a prior approve while global escalation
+// is active would silently bypass the repo-wide halt that only chnu-kim's
+// workflow_dispatch clear signal is supposed to lift.
 type RetryDecision struct {
-	Produce bool
-	Reason  string
+	Produce           bool
+	Reason            string
+	GloballyEscalated bool
 }
 
 // ShouldProduceVerdict implements ADR-0011 point 4(e)(iv)'s full retry
@@ -91,8 +102,10 @@ type RetryDecision struct {
 // active would let one PR's human-intervention signal quietly lift a
 // repo-wide halt it has no authority over.
 func ShouldProduceVerdict(h VerdictHistory, limits Limits) RetryDecision {
-	if h.GlobalNonApproveCount > limits.GlobalNonApprove && !h.GlobalIntervention.Present() {
-		return RetryDecision{Produce: false, Reason: "전역 비-approve 누적이 상한 M을 초과 — 레포-전역 sticky 에스컬레이션"}
+	globallyEscalated := h.GlobalNonApproveCount > limits.GlobalNonApprove && !h.GlobalIntervention.Present()
+
+	if globallyEscalated {
+		return RetryDecision{Produce: false, Reason: "전역 비-approve 누적이 상한 M을 초과 — 레포-전역 sticky 에스컬레이션", GloballyEscalated: true}
 	}
 
 	if h.SHAOutcomeRecorded {

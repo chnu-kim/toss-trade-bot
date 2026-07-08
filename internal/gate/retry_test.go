@@ -118,6 +118,36 @@ func TestShouldProduceVerdict_GlobalEscalationCheckedBeforePRStreak(t *testing.T
 	}
 }
 
+func TestShouldProduceVerdict_ExposesGlobalEscalationStateEvenForStickyApprovedSHA(t *testing.T) {
+	// codex:adversarial-review [high] finding on an earlier fix: a caller
+	// (the workflow's "Determine leg outcome" step) that only checks
+	// SHAOutcomeRecorded to decide whether to re-affirm an existing
+	// approve verdict has no way to tell "SHA-sticky approve" apart from
+	// "blocked by an active global M-cap escalation that happens to also
+	// have a prior approve on this SHA" — re-affirming the old approve in
+	// the latter case would let a repo-wide halt be silently bypassed by
+	// re-dispatching any previously-approved SHA. RetryDecision must expose
+	// the global-escalation state independently of which branch produced
+	// the Produce/Reason result, so callers can gate re-affirmation on it.
+	h := VerdictHistory{
+		SHAOutcomeRecorded:    true,
+		ExistingSHAOutcome:    OutcomeApprove,
+		GlobalNonApproveCount: 20, // over the default M=9, no clear signal
+	}
+	d := ShouldProduceVerdict(h, DefaultLimits())
+	if !d.GloballyEscalated {
+		t.Fatal("ShouldProduceVerdict().GloballyEscalated = false, want true — a caller must be able to tell global escalation is active even when a prior approve exists for this SHA")
+	}
+}
+
+func TestShouldProduceVerdict_GloballyEscalatedFalseWhenUnderLimit(t *testing.T) {
+	h := VerdictHistory{SHAOutcomeRecorded: true, ExistingSHAOutcome: OutcomeApprove, GlobalNonApproveCount: 2}
+	d := ShouldProduceVerdict(h, DefaultLimits())
+	if d.GloballyEscalated {
+		t.Fatal("ShouldProduceVerdict().GloballyEscalated = true, want false when the global count is well under M")
+	}
+}
+
 func TestShouldProduceVerdict_GlobalEscalationBlocksIndeterminateSHAReprocessEvenWithPRSignal(t *testing.T) {
 	// codex:review [P1] finding: the SHA-sticky indeterminate+PR-signal
 	// reprocess branch previously returned Produce=true before the global

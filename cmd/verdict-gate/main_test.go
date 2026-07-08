@@ -199,6 +199,31 @@ func TestRunRetryDecision_GlobalEscalation_NotClearedByPRSignal_ExitsNonZero(t *
 	}
 }
 
+func TestRunRetryDecision_ExposesGlobalEscalationForStickyApprovedSHA(t *testing.T) {
+	// codex:adversarial-review [high] finding: a caller must be able to
+	// tell "this SHA already has its own approve record" apart from
+	// "blocked by an active global M-cap escalation" even when both are
+	// true for the same input — the workflow needs this to decide whether
+	// re-affirming an existing verdict (to let a stuck merge retry) is
+	// safe, or would silently bypass an active repo-wide halt.
+	stdin := strings.NewReader(`{"sha_outcome_recorded": true, "existing_sha_outcome": "approve", "global_non_approve_count": 20}`)
+	var stdout bytes.Buffer
+	code, err := runRetryDecision(stdin, &stdout)
+	if err != nil {
+		t.Fatalf("runRetryDecision() error = %v", err)
+	}
+	if code != 1 {
+		t.Errorf("runRetryDecision() exit code = %d, want 1 (blocked by global escalation)", code)
+	}
+	var out retryDecisionOutput
+	if decErr := json.Unmarshal(stdout.Bytes(), &out); decErr != nil {
+		t.Fatalf("decoding stdout: %v", decErr)
+	}
+	if !out.GloballyEscalated {
+		t.Error("retry-decision output GloballyEscalated = false, want true")
+	}
+}
+
 func TestRunRetryDecision_UnrecognizedOutcome_Errors(t *testing.T) {
 	stdin := strings.NewReader(`{"sha_outcome_recorded": true, "existing_sha_outcome": "maybe"}`)
 	var stdout bytes.Buffer

@@ -497,8 +497,18 @@ jobs:
           # unrelated reason (transient App-token/environment issue) can
           # still retry the merge on a re-dispatch, instead of being stuck
           # until a brand-new commit is pushed (codex:review [P2] finding).
+          # globally_escalated must ALSO be surfaced and checked before
+          # re-affirming: codex:adversarial-review [high] finding — a prior
+          # approve on this exact SHA does not mean re-affirming it is safe
+          # if the repo-wide M-cap escalation is independently active right
+          # now (ShouldProduceVerdict checks the global cap before
+          # SHA-stickiness), since re-affirming in that case would let a
+          # single previously-approved SHA silently bypass a halt that only
+          # chnu-kim's global workflow_dispatch clear is supposed to lift.
           echo "sha_recorded=$sha_recorded" >> "$GITHUB_OUTPUT"
           echo "existing_outcome=$existing_outcome" >> "$GITHUB_OUTPUT"
+          globally_escalated=$(jq -r '.globally_escalated' retry-out.json)
+          echo "globally_escalated=$globally_escalated" >> "$GITHUB_OUTPUT"
           case "$code" in
             0) echo "produce=true" >> "$GITHUB_OUTPUT" ;;
             1)
@@ -659,24 +669,30 @@ jobs:
           PRODUCE: ${{ steps.retry.outputs.produce }}
           SHA_RECORDED: ${{ steps.retry.outputs.sha_recorded }}
           EXISTING_OUTCOME: ${{ steps.retry.outputs.existing_outcome }}
+          GLOBALLY_ESCALATED: ${{ steps.retry.outputs.globally_escalated }}
           SANITY_OK: ${{ steps.sanity.outputs.ok }}
         run: |
           set -euo pipefail
           if [ "$PRODUCE" != "true" ]; then
-            if [ "$SHA_RECORDED" = "true" ]; then
+            if [ "$SHA_RECORDED" = "true" ] && [ "$GLOBALLY_ESCALATED" != "true" ]; then
               # codex:review [P2] finding: this exact SHA already has a
               # recorded verdict (sticky) — re-affirm it rather than
               # reporting a bare "skipped", so an already-approved SHA
               # whose merge attempt failed for an unrelated reason (e.g. a
               # transient App-token issue) can still retry the merge on a
               # re-dispatch instead of being stuck until a new commit is
-              # pushed.
+              # pushed. GLOBALLY_ESCALATED must be false here
+              # (codex:adversarial-review [high] finding): re-affirming a
+              # prior approve while the repo-wide M-cap escalation is
+              # independently active would silently bypass a halt that
+              # only chnu-kim's global workflow_dispatch clear may lift.
               echo "outcome=$EXISTING_OUTCOME" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            # Fresh SHA blocked by PR-level (N) or global (M) escalation —
-            # genuinely no verdict exists yet for this SHA to re-affirm.
-            # finalize treats this as "do not touch the existing check".
+            # Either a fresh SHA blocked by PR-level (N) escalation
+            # (genuinely no verdict to re-affirm), or the repo-wide (M)
+            # escalation is active right now regardless of any prior
+            # per-SHA record — both cases must not surface an approve.
             echo "outcome=skipped" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -843,6 +859,17 @@ jobs:
           code=$?
           set -e
           cat retry-out.json
+          # codex:review [P2 mirror] finding: this leg previously never
+          # wrote sha_recorded/existing_outcome/globally_escalated at all —
+          # see the codex leg's identical step for why "Determine leg
+          # outcome" needs all three. Missing them here made a critical
+          # PR's approved-SHA merge retry combine "approve" (codex) with
+          # "skipped" (claude), which parseOutcome correctly rejects — so
+          # the retry never worked for any risk:critical path.
+          echo "sha_recorded=$sha_recorded" >> "$GITHUB_OUTPUT"
+          echo "existing_outcome=$existing_outcome" >> "$GITHUB_OUTPUT"
+          globally_escalated=$(jq -r '.globally_escalated' retry-out.json)
+          echo "globally_escalated=$globally_escalated" >> "$GITHUB_OUTPUT"
           case "$code" in
             0) echo "produce=true" >> "$GITHUB_OUTPUT" ;;
             1)
@@ -1004,14 +1031,17 @@ jobs:
           PRODUCE: ${{ steps.retry.outputs.produce }}
           SHA_RECORDED: ${{ steps.retry.outputs.sha_recorded }}
           EXISTING_OUTCOME: ${{ steps.retry.outputs.existing_outcome }}
+          GLOBALLY_ESCALATED: ${{ steps.retry.outputs.globally_escalated }}
           SANITY_OK: ${{ steps.sanity.outputs.ok }}
         run: |
           set -euo pipefail
           if [ "$PRODUCE" != "true" ]; then
-            if [ "$SHA_RECORDED" = "true" ]; then
+            if [ "$SHA_RECORDED" = "true" ] && [ "$GLOBALLY_ESCALATED" != "true" ]; then
               # See the codex leg's identical branch — re-affirm a sticky
               # SHA's already-recorded verdict rather than "skipped", so a
-              # failed merge retry doesn't get stuck (codex:review [P2]).
+              # failed merge retry doesn't get stuck (codex:review [P2]),
+              # unless the repo-wide M-cap escalation is independently
+              # active right now (codex:adversarial-review [high]).
               echo "outcome=$EXISTING_OUTCOME" >> "$GITHUB_OUTPUT"
               exit 0
             fi

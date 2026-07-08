@@ -224,6 +224,11 @@ type retryDecisionInput struct {
 type retryDecisionOutput struct {
 	Produce bool   `json:"produce"`
 	Reason  string `json:"reason"`
+	// GloballyEscalated lets a caller distinguish "blocked by the repo-wide
+	// M-cap escalation" from ordinary SHA-sticky/PR-streak blocking, even
+	// when this exact SHA also has its own prior recorded outcome — see
+	// gate.RetryDecision.GloballyEscalated.
+	GloballyEscalated bool `json:"globally_escalated"`
 }
 
 // parseOutcome is intentionally strict: it never treats an empty or
@@ -275,7 +280,8 @@ func runRetryDecision(stdin io.Reader, stdout io.Writer) (int, error) {
 	}
 
 	decision := gate.ShouldProduceVerdict(h, gate.DefaultLimits())
-	if err := json.NewEncoder(stdout).Encode(retryDecisionOutput{Produce: decision.Produce, Reason: decision.Reason}); err != nil {
+	out := retryDecisionOutput{Produce: decision.Produce, Reason: decision.Reason, GloballyEscalated: decision.GloballyEscalated}
+	if err := json.NewEncoder(stdout).Encode(out); err != nil {
 		return 0, err
 	}
 	if !decision.Produce {
