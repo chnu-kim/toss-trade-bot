@@ -1,18 +1,27 @@
 ---
 id: "0009"
-status: Proposed
+status: Accepted
 date: 2026-07-08
 deciders: [chnu-kim]
 domain: [loop-governance, ci]
 protects: [live-execution-human-gate, enforcement-integrity]
 supersedes: []
 superseded_by: null
-verification: []
+verification:
+  - reviewer: advisor
+    date: 2026-07-08
+    verdict: converged (2 rounds — surfaced enforcement-integrity gap and presence-check requirement)
+  - reviewer: codex:adversarial-review
+    date: 2026-07-08
+    verdict: approve (converged after 4 rounds — surfaced CODEOWNERS brace-expansion and dynamic-protection defects)
+  - reviewer: chnu-kim
+    date: 2026-07-08
+    verdict: approved
 ---
 
 # ADR-0009: ADR 저작·승인도 자율화한다 — sacred invariant(실거래 게이트·enforcement 무결성)만 예외
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-07-08
 - **Deciders**: chnu-kim
 - **관련 이슈/PR**: (TBD)

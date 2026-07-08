@@ -1,18 +1,30 @@
 ---
 id: "0010"
-status: Proposed
+status: Accepted
 date: 2026-07-08
 deciders: [chnu-kim]
 domain: [loop-governance, ci]
 protects: [enforcement-integrity]
 supersedes: []
 superseded_by: null
-verification: []
+verification:
+  - reviewer: advisor
+    date: 2026-07-08
+    verdict: converged (2 rounds)
+  - reviewer: codex:review
+    date: 2026-07-08
+    verdict: fixed (unquoted leading-zero id, stale template/README)
+  - reviewer: codex:adversarial-review
+    date: 2026-07-08
+    verdict: approve (converged after 4 rounds)
+  - reviewer: chnu-kim
+    date: 2026-07-08
+    verdict: approved
 ---
 
 # ADR-0010: ADR SSOT는 frontmatter(YAML) + 기존 마크다운 하이브리드로 관리하고, 인덱스는 생성물로 전환한다
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-07-08
 - **Deciders**: chnu-kim
 - **관련 이슈/PR**: (TBD)

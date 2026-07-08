@@ -1,18 +1,30 @@
 ---
 id: "0008"
-status: Proposed
+status: Accepted
 date: 2026-07-08
 deciders: [chnu-kim]
 domain: [loop-governance, ci, runtime]
 protects: [enforcement-integrity]
 supersedes: []
 superseded_by: null
-verification: []
+verification:
+  - reviewer: advisor
+    date: 2026-07-08
+    verdict: converged (2 rounds)
+  - reviewer: codex:review
+    date: 2026-07-08
+    verdict: fixed (fail-open consequence wording contradicted Decision point 5)
+  - reviewer: codex:adversarial-review
+    date: 2026-07-08
+    verdict: approve (converged after 4 rounds)
+  - reviewer: chnu-kim
+    date: 2026-07-08
+    verdict: approved
 ---
 
 # ADR-0008: PR 머지 게이트는 기계적 구조화 verdict다 — self-cert 금지, `risk:critical`은 N-of-2
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-07-08
 - **Deciders**: chnu-kim
 - **관련 이슈/PR**: (TBD)

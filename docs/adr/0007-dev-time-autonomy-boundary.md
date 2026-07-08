@@ -1,18 +1,27 @@
 ---
 id: "0007"
-status: Proposed
+status: Accepted
 date: 2026-07-08
 deciders: [chnu-kim]
 domain: [killswitch, runtime, loop-governance]
 protects: [live-execution-human-gate]
 supersedes: []
 superseded_by: null
-verification: []
+verification:
+  - reviewer: advisor
+    date: 2026-07-08
+    verdict: converged (2 rounds)
+  - reviewer: codex:adversarial-review
+    date: 2026-07-08
+    verdict: approve (converged after 4 rounds)
+  - reviewer: chnu-kim
+    date: 2026-07-08
+    verdict: approved
 ---
 
 # ADR-0007: 개발 자율성 경계는 "배포 시점"이 아니라 "실거래 authorize"에 있다 — 킬 스위치 halt 기본값으로 흡수
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-07-08
 - **Deciders**: chnu-kim
 - **관련 이슈/PR**: (TBD)
