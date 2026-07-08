@@ -26,4 +26,14 @@
 // caller does with an unsatisfied Result — that wiring (dispatch-issue /
 // architect skills invoking this before autonomous work) is left to a future
 // issue. It only answers the yes/no question truthfully.
+//
+// This package also hosts InstallationTokenMinter (installtoken.go), the
+// credential-minting half of ADR-0009 point 5: once check (c) above proves
+// the App identity has taken over, something still has to hand git/gh an
+// actual installation access token to author commits/PRs as that identity.
+// Minting reuses signAppJWT — same signing logic as CheckIdentity's App JWT,
+// a different GitHub endpoint. It is a separate concern from the
+// presence-check pillars (it does not appear in Result) and, as of #43, is
+// deliberately untested against a live App private key — see
+// internal/enforcement/installtoken.go.
 package enforcement

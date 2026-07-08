@@ -43,6 +43,20 @@ fi
 # 이후 모든 gh 호출 예시: gh auth switch --user <그 계정> >/dev/null && gh <cmd> --repo "$SLUG" ...
 ```
 
+**loop PR identity(ADR-0009 point 5, #43)**: 이 스킬이 만드는 PR(3단계 서브에이전트가 만드는 PR)의
+목표 작성자는 사람 계정이 아니라 GitHub App(`mechanu[bot]`)이다 — 사람 검토자와 identity가 같으면
+GitHub의 self-approval 차단 때문에 사람 본인이 그 PR을 승인하지 못한다(#41/#42에서 실측). App
+installation token 발급 로직은 `internal/enforcement.InstallationTokenMinter`
+(`internal/enforcement/installtoken.go`)에 있고, git/gh에 그 토큰을 먹이는 구체적 CLI 사용법은
+`.claude/agents/go-tdd-implementer.md`의 "완료 절차"에 있다. **이 전환은 App 자격증명(App
+ID·installation ID·private key)이 이 오케스트레이터 세션에 실제로 공급됐을 때만 적용된다** — 그
+자격증명이 없으면(오늘 시점 기본값) 서브에이전트는 위 §0의 기존 `gh auth switch --user <그 계정>`
+경로로 fail-closed 폴백한다(ADR-0009 point 8의 "증거 없음 ≠ 이미 안전함" 철학과 동일). **사람이 직접
+개입하는 PR**(예: `/architect` grilling 세션 산출물, 수동 hotfix — 이 스킬 밖의 작업)은 이 전환과
+무관하게 항상 사람 계정으로 만든다. App 자격증명을 이 오케스트레이터 세션에 안전하게 공급하는 방법
+(시크릿 provisioning)은 아직 미결이며, 실제 `mechanu[bot]` identity 전환의 실측 검증도 아직이다
+(#43 scope 밖, 별도 진행).
+
 **절대 금지**: main/master 직접 작업, `gh issue develop`(권한 부족), 자동 머지, 주문/쓰기 경로 자동 재시도.
 **git 서명/인증**: repo-local 설정이 이미 잡혀 있다. 단, **CLI로 커밋·푸시하기 전 SSH agent 소켓이
 설정돼야** 서명·인증이 된다(이 머신은 1Password agent 사용 — 메인이 환경/메모리에서 실제 `SSH_AUTH_SOCK`
