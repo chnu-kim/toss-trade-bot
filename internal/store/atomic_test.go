@@ -10,6 +10,56 @@ import (
 
 var errBoom = errors.New("boom")
 
+// TestAtomicallyRecoversConnectionAfterCallbackPanic is the regression guard for
+// issue #24 (security audit finding H-1): a write callback that panics must not
+// permanently leak the sole write connection. Before the fix, BeginTx was not
+// followed by a deferred Rollback, so a panicking fn left the *sql.Tx neither
+// committed nor rolled back. Because writeDB is the dedicated single connection
+// (SetMaxOpenConns(1)), that leaked connection blocked every subsequent write
+// (TripHalt, AppendIntent, ...) forever — a "zombie" store that still serves
+// reads (readDB) but can never write again, even after the caller (e.g.
+// runtime.Supervisor) recovers the panic and keeps running.
+func TestAtomicallyRecoversConnectionAfterCallbackPanic(t *testing.T) {
+	db := openTemp(t)
+	ctx := context.Background()
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("callback did not panic; test setup broken")
+			}
+		}()
+		_ = db.Atomically(ctx, func(tx Tx) error {
+			panic("simulated callback panic")
+		})
+	}()
+
+	// The next write must succeed promptly, even on a context with no deadline
+	// (Acceptance Criteria): if the write connection leaked, BeginTx would block
+	// forever waiting for the pool to free a connection (MaxOpenConns=1), since
+	// context.Background() never cancels. Race the call against a generous
+	// timeout so a regression fails the test instead of hanging the suite.
+	done := make(chan error, 1)
+	go func() { done <- db.TripHalt(context.Background(), "post-panic recovery check") }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("TripHalt after recovered panic: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("TripHalt after recovered panic blocked >5s: write connection leaked (issue #24)")
+	}
+
+	hs, err := db.Halt(ctx)
+	if err != nil {
+		t.Fatalf("Halt: %v", err)
+	}
+	if !hs.Halted || hs.Reason != "post-panic recovery check" {
+		t.Fatalf("halt = %+v, want halted with reason after recovery TripHalt", hs)
+	}
+}
+
 // TestAtomicallyRollsBackAllWrites is the atomicity guard for ADR-0005 point 3:
 // when a single logical event touches the journal AND halt/counter, a failure
 // mid-event must roll back everything — they live or die together.
