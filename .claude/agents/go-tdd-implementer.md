@@ -56,6 +56,12 @@ gh 호출 전 active 계정이 `{SLUG}`에 접근 가능한지 `gh repo view "{S
 PR 생성 직후 **반드시 `codex-pr-review` 스킬을 `--wait --base main`으로 실행**한다(글로벌 지침: codex 리뷰 +
 적대적 리뷰 병렬, 결과 verbatim 회수). Skill 툴로 `codex-pr-review` 호출, args `--wait --base main`.
 
+⚠️ **비동기 대기 금지**: companion `review`/`adversarial-review`는 `--wait` 여부와 무관하게 항상
+foreground(동기) 실행이다 — 별도 백그라운드 job이 없다. 이 호출을 Bash의 `run_in_background:true`로
+감싸고 턴을 끝내지 마라 — 너는 완료 알림을 받을 채널이 없다(오케스트레이터만 있다). 그대로 두면 아무도
+너를 깨우지 않아 멈춘 채로 남는다. 5분 이상 무진전(로그 갱신 없음)이면 그 리뷰를 취소하고 셀프 적대적
+재검토로 대체한 뒤, 그 사실을 마찰(friction)에 남기고 같은 턴 안에서 계속 진행해라.
+
 ## 리뷰 결과 처리 (review→fix 루프)
 
 - 리뷰가 **진짜 결함**(CLAUDE.md 위반·버그·무인 안전 구멍 등)을 보고하면 → **TDD로 고친다**(실패 테스트
