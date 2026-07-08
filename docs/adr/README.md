@@ -15,7 +15,19 @@
 
 ## 형식
 
-각 ADR은 4칸으로 쓴다(`0000-template.md` 참조):
+각 ADR은 상단 YAML frontmatter + 본문 4칸의 하이브리드로 쓴다(`0000-template.md` 참조, ADR-0010에서 결정).
+
+**frontmatter(기계 판독용)**:
+
+- `id` — **반드시 따옴표로 감싼 문자열**(`id: "0007"`). 앞자리 0이 있는 unquoted 숫자는 YAML 파서에 따라 8진수 등으로 잘못 해석될 수 있다 — 따옴표 없이 쓰지 않는다.
+- `status` — `Proposed` | `Accepted` | `Superseded`.
+- `date`, `deciders` — 사람이 읽는 메타데이터.
+- `domain` — 이슈 라벨의 `area:` 축과 어휘를 통일한다(killswitch/order/auth/persistence/loop-governance 등).
+- `protects` — 이 ADR이 지키는/건드리면 안 되는 sacred invariant id 배열(없으면 빈 배열). sacred invariant 목록과 그 강제 메커니즘은 ADR-0009 참조.
+- `supersedes` / `superseded_by` — 대체 관계.
+- `verification` — 독립 검증자 이력(누가/언제/verdict). N-of-2 게이트는 ADR-0008 참조.
+
+**본문(사람이 읽는 서사, 4칸)**:
 
 1. **Context** — 어떤 문제/제약/힘(forces)이 결정을 강제했나.
 2. **Decision** — 무엇을 골랐나.
@@ -25,10 +37,10 @@
 ## 규칙
 
 - 파일명: `NNNN-kebab-slug.md` (4자리 순번, 예: `0001-single-flight-token-refresh.md`).
-- 번호는 **순차 증가**, 재사용 금지.
-- `Status`: `Proposed`(검토 중) → `Accepted`(사용자 승인) → `Superseded by ADR-NNNN`(대체됨).
+- 번호는 **순차 증가**, 재사용 금지. frontmatter의 `id`는 파일명의 네 자리와 정확히 일치해야 한다.
+- `Status`: `Proposed`(검토 중) → `Accepted`(사용자 승인) → `Superseded by ADR-NNNN`(대체됨). frontmatter `status`와 본문 헤더의 `Status`는 항상 동일해야 한다.
 - **수정하지 말고 대체한다.** 결정이 바뀌면 기존 ADR을 `Superseded`로 표시하고 새 ADR을 쓴다. 역사를 지우지 않는다.
-- ADR은 결정을 *기록*할 뿐 강제하지 않는다. 강제는 CLAUDE.md(원칙)·훅(enforcement)·코드 리뷰가 한다.
+- ADR은 결정을 *기록*할 뿐 강제하지 않는다. 강제는 CLAUDE.md(원칙)·코드 리뷰, 그리고 ADR-0009/0010이 설계한 CODEOWNERS·branch protection(`protects`가 걸린 경로)이 맡는다. **단, 이 CODEOWNERS·branch protection 강제는 ADR-0009 point 8이 규정한 enforcement 계층(GitHub App 설치·branch protection 실제 적용)이 사람 손으로 완성돼야 비로소 발효된다 — 그 전까지는 이 문서 3칸이 설계일 뿐 아직 발효된 강제가 아니다.** enforcement 계층이 서 있는지 불확실하면 **이 레포의 기존 사람 게이트 체제(CLAUDE.md의 사람 PR 검수·머지)가 계속 유효하다**고 가정한다 — "설계돼 있음"을 "이미 강제되고 있음"으로 읽지 않는다(codex adversarial-review 지적: 이 README를 현재형으로 읽으면 미래의 loop나 검수자가 존재하지 않는 가드를 존재한다고 오인할 수 있다). **CI는 frontmatter 구조 정합성(스키마·`id` 중복·참조 무결성)만 검증하고, `status`/`protects` 값을 근거로 merge를 직접 막거나 허용하지 않는다** — 그 판단은 CI가 아니라 CODEOWNERS+branch protection의 몫이다(ADR-0009/0010, CI 자가검증은 loop가 우회 가능해 순환이라 기각됨).
 
 ## 파이프라인과의 연결
 

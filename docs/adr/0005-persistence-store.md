@@ -1,3 +1,15 @@
+---
+id: "0005"
+status: Accepted
+date: 2026-07-02
+deciders: [chnu-kim]
+domain: [persistence]
+protects: []
+supersedes: []
+superseded_by: null
+verification: []
+---
+
 # ADR-0005: 영속 저장소는 도메인 인지형 단일 트랜잭션 store(임베디드 SQLite / 순수 Go)이고, 사건 단위 fsync commit·라이브 상태만 보존한다
 
 - **Status**: Accepted

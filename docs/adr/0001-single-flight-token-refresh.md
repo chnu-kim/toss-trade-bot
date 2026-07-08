@@ -1,3 +1,15 @@
+---
+id: "0001"
+status: Accepted
+date: 2026-06-29
+deciders: [chnu-kim]
+domain: [auth, runtime]
+protects: []
+supersedes: []
+superseded_by: null
+verification: []
+---
+
 # ADR-0001: OAuth2 토큰은 단일 매니저에서 single-flight로 발급·갱신한다
 
 - **Status**: Accepted

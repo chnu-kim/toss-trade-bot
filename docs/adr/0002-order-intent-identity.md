@@ -1,3 +1,15 @@
+---
+id: "0002"
+status: Accepted
+date: 2026-06-30
+deciders: [chnu-kim]
+domain: [order]
+protects: []
+supersedes: []
+superseded_by: null
+verification: []
+---
+
 # ADR-0002: 주문 intent는 write-ahead journal(2-마커)에 기록하고, 사후 검증 1차 키는 orderId다 (clientOrderId는 서버측 중복방지용)
 
 - **Status**: Accepted
