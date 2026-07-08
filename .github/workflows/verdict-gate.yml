@@ -329,12 +329,14 @@ jobs:
           # check-runs/run history, (b) a chnu-kim PR review submission, or
           # (c) a chnu-kim-actor workflow_dispatch (the clear-global-escalation
           # job) — never from client_payload, a label, or an issue comment.
-          check_context="verdict-gate"
-
           # (a) existing-SHA record: the most recent check-run named
-          # "verdict-gate" on this exact head SHA, if any.
+          # "verdict-gate" (approve/reject) OR "verdict-gate-record"
+          # (indeterminate — see "Publish verdict-gate check-run" in the
+          # finalize job for why indeterminate is deliberately NOT
+          # published under the required "verdict-gate" context) on this
+          # exact head SHA, if any.
           existing_conclusion=$(gh api "repos/${{ github.repository }}/commits/$HEAD_SHA/check-runs" --jq \
-            "[.check_runs[] | select(.name==\"$check_context\")] | sort_by(.started_at) | last | .conclusion // \"\"")
+            "[.check_runs[] | select(.name==\"verdict-gate\" or .name==\"verdict-gate-record\")] | sort_by(.started_at) | last | .conclusion // \"\"")
           sha_recorded=false
           existing_outcome="approve"
           if [ -n "$existing_conclusion" ]; then
@@ -354,7 +356,7 @@ jobs:
           # PR strictly after the most recent verdict-gate check-run's
           # started_at (so a stale old review does not perpetually unstick).
           last_verdict_at=$(gh api "repos/${{ github.repository }}/commits/$HEAD_SHA/check-runs" --jq \
-            "[.check_runs[] | select(.name==\"$check_context\")] | sort_by(.started_at) | last | .started_at // \"\"")
+            "[.check_runs[] | select(.name==\"verdict-gate\" or .name==\"verdict-gate-record\")] | sort_by(.started_at) | last | .started_at // \"\"")
           pr_intervention=false
           owner_review_at=$(gh pr view "$PR_NUMBER" --json reviews --jq \
             '[.reviews[] | select(.author.login=="chnu-kim")] | sort_by(.submittedAt) | last | .submittedAt // ""')
@@ -376,7 +378,7 @@ jobs:
               continue
             fi
             concl=$(gh api "repos/${{ github.repository }}/commits/$sha/check-runs" --jq \
-              "[.check_runs[] | select(.name==\"$check_context\")] | sort_by(.started_at) | last | .conclusion // \"\"")
+              "[.check_runs[] | select(.name==\"verdict-gate\" or .name==\"verdict-gate-record\")] | sort_by(.started_at) | last | .conclusion // \"\"")
             case "$concl" in
               "") continue ;;
               success) break ;;
@@ -655,10 +657,10 @@ jobs:
           # step's comments and the workflow-level header for the BEST-EFFORT
           # / #50 HANDOFF note. Counters are per verdict-check (this PR/SHA
           # combination), not per leg (ADR-0011 point 4(g)) — both legs read
-          # the same check_context and therefore the same existing record.
-          check_context="verdict-gate"
+          # the same two context names ("verdict-gate" / "verdict-gate-record")
+          # and therefore the same existing record.
           existing_conclusion=$(gh api "repos/${{ github.repository }}/commits/$HEAD_SHA/check-runs" --jq \
-            "[.check_runs[] | select(.name==\"$check_context\")] | sort_by(.started_at) | last | .conclusion // \"\"")
+            "[.check_runs[] | select(.name==\"verdict-gate\" or .name==\"verdict-gate-record\")] | sort_by(.started_at) | last | .conclusion // \"\"")
           sha_recorded=false
           existing_outcome="approve"
           if [ -n "$existing_conclusion" ]; then
@@ -675,7 +677,7 @@ jobs:
           fi
 
           last_verdict_at=$(gh api "repos/${{ github.repository }}/commits/$HEAD_SHA/check-runs" --jq \
-            "[.check_runs[] | select(.name==\"$check_context\")] | sort_by(.started_at) | last | .started_at // \"\"")
+            "[.check_runs[] | select(.name==\"verdict-gate\" or .name==\"verdict-gate-record\")] | sort_by(.started_at) | last | .started_at // \"\"")
           pr_intervention=false
           owner_review_at=$(gh pr view "$PR_NUMBER" --json reviews --jq \
             '[.reviews[] | select(.author.login=="chnu-kim")] | sort_by(.submittedAt) | last | .submittedAt // ""')
@@ -692,7 +694,7 @@ jobs:
               continue
             fi
             concl=$(gh api "repos/${{ github.repository }}/commits/$sha/check-runs" --jq \
-              "[.check_runs[] | select(.name==\"$check_context\")] | sort_by(.started_at) | last | .conclusion // \"\"")
+              "[.check_runs[] | select(.name==\"verdict-gate\" or .name==\"verdict-gate-record\")] | sort_by(.started_at) | last | .conclusion // \"\"")
             case "$concl" in
               "") continue ;;
               success) break ;;
@@ -975,22 +977,55 @@ jobs:
           OUTCOME: ${{ steps.combine.outputs.outcome }}
         run: |
           set -euo pipefail
+          # codex:review [P1] finding, confirmed against GitHub's own docs
+          # ("Required status checks must have a successful, skipped, or
+          # neutral status before collaborators can make changes to a
+          # protected branch"): a `neutral` conclusion SATISFIES a required
+          # status check — it does not block merging. Publishing
+          # indeterminate as `verdict-gate: neutral` would therefore have
+          # let a failed-sanity-check verdict pass as if approved the
+          # moment this check becomes required in Phase B — the exact
+          # opposite of ADR-0011 point 4(e)(iii)'s "판정 불능 fail-closed
+          # (check 미설정 = 머지 차단)".
+          #
+          # Fix: only approve/reject ever publish under the REQUIRED
+          # "verdict-gate" context (success/failure — both correctly
+          # gate merging). Indeterminate publishes under a *different*,
+          # never-required context ("verdict-gate-record") instead — this
+          # keeps a durable, check-run-based SHA-sticky record (so a
+          # re-dispatch of the same indeterminate SHA doesn't re-invoke the
+          # legs — ADR-0011 point 4(e)(iv)) without ever satisfying the
+          # "verdict-gate" required check itself. The retry-decision lookup
+          # steps read both context names when resolving the existing
+          # record for a SHA (see "Retry decision" step comments).
           case "$OUTCOME" in
-            approve) conclusion=success ;;
-            reject) conclusion=failure ;;
-            indeterminate) conclusion=neutral ;;
+            approve)
+              check_name="verdict-gate"
+              conclusion=success
+              summary_suffix="This check has no effect on merging until a human adds it to required status checks in Phase B (#50)."
+              ;;
+            reject)
+              check_name="verdict-gate"
+              conclusion=failure
+              summary_suffix="This check has no effect on merging until a human adds it to required status checks in Phase B (#50)."
+              ;;
+            indeterminate)
+              check_name="verdict-gate-record"
+              conclusion=neutral
+              summary_suffix="This is a bookkeeping-only check (never required) recording a fail-closed sanity failure — the required verdict-gate context is deliberately left unset for this SHA."
+              ;;
             *)
               echo "::error::unrecognized combined outcome '$OUTCOME' — failing closed, not publishing a check-run."
               exit 1
               ;;
           esac
           gh api "repos/${{ github.repository }}/check-runs" \
-            -f name="verdict-gate" \
+            -f name="$check_name" \
             -f head_sha="$HEAD_SHA" \
             -f status="completed" \
             -f conclusion="$conclusion" \
-            -f "output[title]=verdict-gate: $OUTCOME" \
-            -f "output[summary]=Combined verdict-check outcome: $OUTCOME (ADR-0008/ADR-0011). This check has no effect on merging until a human adds it to required status checks in Phase B (#50)."
+            -f "output[title]=$check_name: $OUTCOME" \
+            -f "output[summary]=Combined verdict-check outcome: $OUTCOME (ADR-0008/ADR-0011). $summary_suffix"
 
       - name: Fail this run's own conclusion for non-approve (feeds the global M counter — see retry steps)
         if: steps.combine.outputs.outcome == 'reject' || steps.combine.outputs.outcome == 'indeterminate'

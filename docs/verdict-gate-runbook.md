@@ -157,5 +157,23 @@ The following are explicitly **not done** by this issue and are the input
    - The PR-streak (N) and global-count (M) queries are `gh api` calls
      written and reasoned about, not run — see the workflow's own header
      comment for the exact fail-closed behavior on any lookup error.
-6. Only after (1)–(5): run the Phase B hard-precondition ⑤ sign-off itself
+6. **Deliberately deferred: ADR-0008 point 4's non-critical codex-unavailable
+   → Claude fallback is not wired.** ADR-0008 point 4 permits (does not
+   strictly require) falling back to an independent Claude session for
+   non-critical paths when codex is unavailable — `risk:critical` has no
+   fallback (fail-closed queue) either way. Today, if codex login/exec fails
+   for any reason (including the current Task-0-blocked state), the
+   `verdict-codex` job simply fails closed for both critical and
+   non-critical paths — no verdict is produced, no check-run is published,
+   and no merge happens. This is a safe-direction gap (reduced availability
+   during a codex outage, not reduced safety — a non-critical PR just
+   doesn't get evaluated instead of getting waved through), acknowledged
+   rather than implemented in this PR: wiring it correctly (detecting
+   "codex genuinely unavailable" vs. "codex ran and rejected" vs. "our own
+   bug", routing `verdict-claude` to run as a *substitute* rather than an
+   addition for the non-critical case, and keeping retry counters
+   consistent) is nontrivial glue that would be added and reasoned about,
+   not tested, exactly like the queries in item 5 — #50 should decide
+   whether to implement it before or after Phase B entry.
+7. Only after (1)–(6): run the Phase B hard-precondition ⑤ sign-off itself
    (owned by #50, not this issue).
