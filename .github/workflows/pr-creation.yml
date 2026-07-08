@@ -87,6 +87,13 @@ jobs:
             ;;
           esac
 
+      # --- ADR-0011 실측 목록 4 프로브 마커 (이 브랜치 전용 — main에는 없음) ---
+      # 이 스텝이 Actions 로그에 나타나면 repository_dispatch가 main이 아닌 이 브랜치의
+      # workflow 정의를 실행했다는 뜻이다 — ADR-0011 point 3("repository_dispatch는 항상
+      # default 브랜치의 정의로만 실행된다")의 위반 신호. 이 브랜치는 머지하지 않는다.
+      - name: "[PROBE] tamper marker — ADR-0011 실측 목록 4"
+        run: echo "TAMPERED DEFINITION EXECUTED — ADR-0011 실측 목록 4 위반 신호 (docs/runbooks/loop-pr-environment-provisioning.md #4 참조)"
+
       # 액션은 mutable 태그가 아니라 full commit SHA로 핀 고정한다(ci.yml과 동일 원칙 —
       # 이 workflow는 App 자격증명을 다루므로 공급망 안전이 더더욱 중요하다).
       - name: Checkout
