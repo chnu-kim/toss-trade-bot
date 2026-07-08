@@ -116,6 +116,12 @@ gh api --method POST "repos/chnu-kim/toss-trade-bot/dispatches" \
 
 결과를 이 PR(#47) 코멘트로 기록한다.
 
+> **watch item**: `Mint App installation token` 스텝은 `permission-pull-requests: write`만
+> narrowing한다(`POST /pulls`는 Pull requests: write + 암묵적 Metadata:read로 충분하다는 판단).
+> 이 스모크에서 `gh pr create` 호출이 403으로 실패하면, **첫 대응은 `permission-contents: read`
+> 하나만 추가하는 것**이다(narrowing 원칙을 지키는 최소 추가) — 다른 permission을 넓히거나
+> `permission-*: write`로 올리지 않는다. 그래도 실패하면 사람에게 에스컬레이션한다.
+
 ## 6. 머지 게이트 기록
 
 이 PR(#47)의 머지는 위 (3)(=#46 목록 7 (ix) 통과 확인)이 **먼저** 기록된 뒤에만 진행한다. 머지 직전
