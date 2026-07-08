@@ -349,14 +349,28 @@ jobs:
           # check-runs/run history, (b) a chnu-kim PR review submission, or
           # (c) a chnu-kim-actor workflow_dispatch (the clear-global-escalation
           # job) — never from client_payload, a label, or an issue comment.
+          # codex:adversarial-review [high] finding: the check-runs-for-a-
+          # commit endpoint is itself paginated (default page size), and a
+          # plain `gh api ... --jq` only ever sees the first page — if this
+          # SHA later accumulates more check-runs than fit on one page (more
+          # required checks, other CI systems) and "verdict-gate"/
+          # "verdict-gate-record" isn't on that first page, this would
+          # silently look unrecorded and both the SHA-sticky guard and the
+          # PR-streak walk below would lose real history. Fetch every page
+          # (`--paginate --slurp`) and flatten before filtering — same
+          # pattern as the "Global count" step's workflow-run fetch.
+          fetch_verdict_check_run() {
+            gh api "repos/${{ github.repository }}/commits/$1/check-runs" --paginate --slurp | jq \
+              '[.[].check_runs[]] | map(select(.name=="verdict-gate" or .name=="verdict-gate-record")) | sort_by(.started_at) | last'
+          }
+
           # (a) existing-SHA record: the most recent check-run named
           # "verdict-gate" (approve/reject) OR "verdict-gate-record"
           # (indeterminate — see "Publish verdict-gate check-run" in the
           # finalize job for why indeterminate is deliberately NOT
           # published under the required "verdict-gate" context) on this
           # exact head SHA, if any.
-          head_sha_runs=$(gh api "repos/${{ github.repository }}/commits/$HEAD_SHA/check-runs" --jq \
-            "[.check_runs[] | select(.name==\"verdict-gate\" or .name==\"verdict-gate-record\")] | sort_by(.started_at) | last")
+          head_sha_runs=$(fetch_verdict_check_run "$HEAD_SHA")
           existing_conclusion=$(echo "$head_sha_runs" | jq -r '.conclusion // ""')
           existing_started_at=$(echo "$head_sha_runs" | jq -r '.started_at // ""')
           sha_recorded=false
@@ -389,8 +403,7 @@ jobs:
             if [ "$sha" = "$HEAD_SHA" ]; then
               continue
             fi
-            commit_runs=$(gh api "repos/${{ github.repository }}/commits/$sha/check-runs" --jq \
-              "[.check_runs[] | select(.name==\"verdict-gate\" or .name==\"verdict-gate-record\")] | sort_by(.started_at) | last")
+            commit_runs=$(fetch_verdict_check_run "$sha")
             concl=$(echo "$commit_runs" | jq -r '.conclusion // ""')
             started_at=$(echo "$commit_runs" | jq -r '.started_at // ""')
             if [ -n "$started_at" ] && [ -z "$latest_prior_verdict_at" ]; then
@@ -712,8 +725,15 @@ jobs:
           # combination), not per leg (ADR-0011 point 4(g)) — both legs read
           # the same two context names ("verdict-gate" / "verdict-gate-record")
           # and therefore the same existing record.
-          head_sha_runs=$(gh api "repos/${{ github.repository }}/commits/$HEAD_SHA/check-runs" --jq \
-            "[.check_runs[] | select(.name==\"verdict-gate\" or .name==\"verdict-gate-record\")] | sort_by(.started_at) | last")
+          # codex:adversarial-review [high] finding (same as the codex leg):
+          # the check-runs-for-a-commit endpoint is itself paginated — fetch
+          # every page and flatten before filtering, not just the first.
+          fetch_verdict_check_run() {
+            gh api "repos/${{ github.repository }}/commits/$1/check-runs" --paginate --slurp | jq \
+              '[.[].check_runs[]] | map(select(.name=="verdict-gate" or .name=="verdict-gate-record")) | sort_by(.started_at) | last'
+          }
+
+          head_sha_runs=$(fetch_verdict_check_run "$HEAD_SHA")
           existing_conclusion=$(echo "$head_sha_runs" | jq -r '.conclusion // ""')
           existing_started_at=$(echo "$head_sha_runs" | jq -r '.started_at // ""')
           sha_recorded=false
@@ -743,8 +763,7 @@ jobs:
             if [ "$sha" = "$HEAD_SHA" ]; then
               continue
             fi
-            commit_runs=$(gh api "repos/${{ github.repository }}/commits/$sha/check-runs" --jq \
-              "[.check_runs[] | select(.name==\"verdict-gate\" or .name==\"verdict-gate-record\")] | sort_by(.started_at) | last")
+            commit_runs=$(fetch_verdict_check_run "$sha")
             concl=$(echo "$commit_runs" | jq -r '.conclusion // ""')
             started_at=$(echo "$commit_runs" | jq -r '.started_at // ""')
             if [ -n "$started_at" ] && [ -z "$latest_prior_verdict_at" ]; then
