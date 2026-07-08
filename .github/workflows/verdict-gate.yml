@@ -1100,6 +1100,15 @@ jobs:
             echo "outcome=skipped" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # A critical-path PR can still reach here with exactly one of
+          # CODEX_OUTCOME/CLAUDE_OUTCOME equal to "skipped" and the other a
+          # real outcome, if the two legs' retry-decision computations
+          # diverged (a race on the same mutable external state each leg
+          # queries independently — e.g. a chnu-kim PR review landing
+          # between the two jobs' otherwise-identical queries). `combine`
+          # itself now fails this closed as indeterminate rather than
+          # erroring unrecognizably (see cmd/verdict-gate's
+          # TestRunCombine_OneLegSkippedOtherProducedRealOutcome_FailsClosedAsIndeterminate).
           outcomes_json="[\"$CODEX_OUTCOME\""
           if [ "$RISK_CLASS" = "critical" ]; then
             outcomes_json="$outcomes_json, \"$CLAUDE_OUTCOME\""

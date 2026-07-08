@@ -277,6 +277,65 @@ func TestRunCombine_EmptyOutcomeStringErrorsRatherThanApproving(t *testing.T) {
 	}
 }
 
+func TestRunCombine_OneLegSkippedOtherProducedRealOutcome_FailsClosedAsIndeterminate(t *testing.T) {
+	// The workflow's shell-level short-circuit (finalize job's "Combine leg
+	// outcomes" step) only ever calls this command with a "skipped" value
+	// mixed in when the two legs' retry-decision computations have
+	// genuinely diverged for a risk:critical PR (e.g. a chnu-kim PR review
+	// landing between the codex leg's and the claude leg's otherwise
+	// identical retry-decision queries, flipping one leg's produce decision
+	// but not the other's, since both run as separate parallel jobs taking
+	// independent snapshots of the same mutable external state). Before
+	// this fix, "skipped" was not a recognized token here: parseOutcome
+	// rejected it, runCombine returned an error before writing anything to
+	// stdout, and the workflow's `jq -r '.outcome' combine-out.json` then
+	// crashed on an empty file — an opaque failure rather than a clear,
+	// diagnosable fail-closed message. A partial N-of-2 verdict (one leg
+	// silently produced nothing this run) is not a valid basis for
+	// approve — this must fail closed as indeterminate, not error out
+	// unrecognizably and not silently drop the skipped leg's non-vote.
+	stdin := strings.NewReader(`{"outcomes": ["approve", "skipped"]}`)
+	var stdout bytes.Buffer
+	code, err := runCombine(stdin, &stdout)
+	if err != nil {
+		t.Fatalf("runCombine() error = %v, want nil (this is a judgement, not malformed input)", err)
+	}
+	if code != 1 {
+		t.Errorf("runCombine() exit code = %d, want 1 (fail-closed)", code)
+	}
+	var out combineOutput
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("decoding stdout: %v", err)
+	}
+	if out.Outcome != "indeterminate" {
+		t.Errorf("combine output = %q, want indeterminate", out.Outcome)
+	}
+}
+
+func TestRunCombine_AllLegsSkipped_PassesThroughSkippedRatherThanErroring(t *testing.T) {
+	// Defense in depth: the workflow's shell-level short-circuit already
+	// never calls this command when every leg skipped this run, but this
+	// command must not depend on that caller behavior to stay safe — if
+	// reached with only "skipped" entries, it must not error and must not
+	// resolve to approve.
+	stdin := strings.NewReader(`{"outcomes": ["skipped", "skipped"]}`)
+	var stdout bytes.Buffer
+	code, err := runCombine(stdin, &stdout)
+	if err != nil {
+		t.Fatalf("runCombine() error = %v, want nil", err)
+	}
+	if code != 1 {
+		t.Errorf("runCombine() exit code = %d, want 1 (never approve)", code)
+	}
+	var out combineOutput
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("decoding stdout: %v", err)
+	}
+	if out.Outcome != "skipped" {
+		t.Errorf("combine output = %q, want skipped", out.Outcome)
+	}
+}
+
 // TestRunClassify_RealMappingFile exercises the actual on-disk
 // configs/gate/risk-classification.json (not a synthetic fixture) — a
 // regression guard tying this CLI's behavior to the real, CODEOWNERS-

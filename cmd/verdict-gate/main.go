@@ -300,20 +300,66 @@ type combineOutput struct {
 	Outcome string `json:"outcome"`
 }
 
+// legOutcomeSkipped is the one non-Verdict token this command recognizes: a
+// leg job's retry-decision computed produce=false for this run (sticky,
+// escalated, or genuinely no verdict to re-affirm) and so contributed no
+// outcome. It is not a gate.Outcome — parseOutcome deliberately continues to
+// reject it everywhere else (e.g. retry-decision's existing_outcome), since
+// only this combine step's shell caller can legitimately produce it.
+const legOutcomeSkipped = "skipped"
+
 func runCombine(stdin io.Reader, stdout io.Writer) (int, error) {
 	var in combineInput
 	if err := json.NewDecoder(stdin).Decode(&in); err != nil {
 		return 0, fmt.Errorf("combine: malformed stdin: %w", err)
 	}
-	outcomes := make([]gate.Outcome, 0, len(in.Outcomes))
+	realOutcomes := make([]gate.Outcome, 0, len(in.Outcomes))
+	skippedCount := 0
 	for _, s := range in.Outcomes {
+		if s == legOutcomeSkipped {
+			skippedCount++
+			continue
+		}
 		o, err := parseOutcome(s)
 		if err != nil {
 			return 0, fmt.Errorf("combine: %w", err)
 		}
-		outcomes = append(outcomes, o)
+		realOutcomes = append(realOutcomes, o)
 	}
-	combined := gate.CombineLegOutcomes(outcomes)
+
+	if skippedCount > 0 && len(realOutcomes) > 0 {
+		// Divergence: some leg(s) produced a real verdict this run while at
+		// least one other reported no verdict at all. The workflow's shell
+		// short-circuit only ever calls this command with a mix like this
+		// when the legs' retry-decision computations disagreed on
+		// `produce` for the same (PR, head SHA) — e.g. a chnu-kim PR review
+		// landing between the two legs' otherwise-identical queries, each
+		// job taking its own independent snapshot of the same mutable
+		// external state. A partial N-of-2 verdict is not a valid basis for
+		// approve or reject — fail closed as indeterminate rather than
+		// silently trusting whichever leg happened to produce something (or
+		// erroring unrecognizably, which is what feeding "skipped" into the
+		// strict gate.Outcome parser used to do — see
+		// TestRunCombine_OneLegSkippedOtherProducedRealOutcome_FailsClosedAsIndeterminate).
+		if err := json.NewEncoder(stdout).Encode(combineOutput{Outcome: gate.OutcomeIndeterminate.String()}); err != nil {
+			return 0, err
+		}
+		return 1, nil
+	}
+
+	if len(realOutcomes) == 0 {
+		// Every leg skipped this run (defense in depth: the workflow's own
+		// shell short-circuit already never reaches this command in that
+		// case, but this command must not depend on that to stay safe) —
+		// nothing new to combine; pass "skipped" straight through, never
+		// approve.
+		if err := json.NewEncoder(stdout).Encode(combineOutput{Outcome: legOutcomeSkipped}); err != nil {
+			return 0, err
+		}
+		return 1, nil
+	}
+
+	combined := gate.CombineLegOutcomes(realOutcomes)
 	if err := json.NewEncoder(stdout).Encode(combineOutput{Outcome: combined.String()}); err != nil {
 		return 0, err
 	}
