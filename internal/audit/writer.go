@@ -104,6 +104,43 @@ func warnIfDirPermissive(dir string, info os.FileInfo, logger *slog.Logger) {
 	}
 }
 
+// tightenSegmentPerm brings a pre-existing segment file — one created by a
+// version of this package predating segmentPerm's tightening to 0600 (issue
+// #25 review) — to the current owner-only mode. Unlike warnIfDirPermissive,
+// this auto-corrects rather than only warning: a segment file is entirely
+// internal (created and consumed only by this writer, never operator-facing
+// like the containing directory might be), so there is no plausible reason
+// something else legitimately depends on it being group/world-readable, and
+// leaving historical order/fill/error data exposed indefinitely defeats M-3
+// for exactly the data most likely to already exist in production. It never
+// fails the caller: chmod on a file this process owns should not realistically
+// fail, but if it does, bricking boot over a permission-hardening side effect
+// would reintroduce the very boot-brick class issue #25 closes — so failures
+// are best-effort logged, not fail-closed.
+func tightenSegmentPerm(path string, logger *slog.Logger) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	if info.Mode().Perm()&0o077 == 0 {
+		return // already owner-only
+	}
+	if err := os.Chmod(path, segmentPerm); err != nil {
+		if logger != nil {
+			logger.Warn("failed to tighten pre-existing audit segment permissions",
+				slog.String("path", path),
+				slog.String("error", err.Error()),
+			)
+		}
+		return
+	}
+	if logger != nil {
+		logger.Info("tightened pre-existing audit segment permissions to owner-only",
+			slog.String("path", path),
+		)
+	}
+}
+
 type config struct {
 	maxSegmentSize int64
 	logger         *slog.Logger
@@ -215,6 +252,7 @@ func openWriter(dir string, fs fsOps, cfg config) (*Writer, error) {
 	for i, name := range segs {
 		path := filepath.Join(dir, name)
 		isLast := i == len(segs)-1
+		tightenSegmentPerm(path, cfg.logger)
 		count, goodOffset, torn, serr := scanSegment(path)
 		if serr != nil {
 			return nil, failClosed("scan-segment", serr)

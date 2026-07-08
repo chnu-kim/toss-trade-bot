@@ -953,3 +953,74 @@ func TestExistingPermissiveDirWarnsButIsNotAutoTightened(t *testing.T) {
 		t.Errorf("expected a permission warning logged for the pre-existing permissive directory, got: %s", buf.String())
 	}
 }
+
+// TestReopenTightensPreExistingSegmentPermissions covers the upgrade gap a
+// GitHub-native codex review flagged on PR #31: segments written by a version
+// of this package predating the 0600 segmentPerm tightening (issue #25)
+// otherwise stay group/world-readable forever after upgrade, because
+// recovery's OpenFile calls have no O_CREATE (so their mode argument is
+// ignored) and nothing else ever revisits an existing segment's mode. New()
+// must actively tighten every pre-existing segment — sealed AND active — to
+// segmentPerm on open, not just the containing directory.
+func TestReopenTightensPreExistingSegmentPermissions(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	// Small segment size forces rotation, so recovery on reopen must handle
+	// BOTH a sealed segment and the active one.
+	w := newTestWriter(t, dir, realFS(), WithMaxSegmentSize(64))
+	for i := 0; i < 5; i++ {
+		if _, err := w.EmitError(ctx, ErrorEvent{Operation: "op", ErrorClass: "class", Message: fmt.Sprintf("m-%d", i)}); err != nil {
+			t.Fatalf("EmitError %d: %v", i, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	segs, err := filepath.Glob(filepath.Join(dir, "segment-*.log"))
+	if err != nil || len(segs) < 2 {
+		t.Fatalf("glob segments: %v, %v (need >=2 to cover sealed+active)", segs, err)
+	}
+
+	// Simulate legacy data: every segment written under the pre-fix 0644 mode.
+	for _, s := range segs {
+		if err := os.Chmod(s, 0o644); err != nil {
+			t.Fatalf("chmod legacy segment %s: %v", s, err)
+		}
+	}
+
+	var buf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	w2, err := New(dir, WithMaxSegmentSize(64), WithLogger(logger))
+	if err != nil {
+		t.Fatalf("New (reopen over legacy 0644 segments): %v", err)
+	}
+	t.Cleanup(func() { _ = w2.Close() })
+
+	for _, s := range segs {
+		info, err := os.Stat(s)
+		if err != nil {
+			t.Fatalf("stat %s: %v", s, err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Errorf("segment %s mode after reopen = %o, want 0600 (pre-existing segments must be tightened, not left at their legacy mode)", s, got)
+		}
+	}
+	if !strings.Contains(buf.String(), "tightened") {
+		t.Errorf("expected a log line about tightening pre-existing segment permissions, got: %s", buf.String())
+	}
+
+	// The writer must still be fully functional after the tightening — a
+	// further emit commits normally and recovers.
+	if _, err := w2.EmitError(ctx, ErrorEvent{Operation: "op", ErrorClass: "class", Message: "after-tighten"}); err != nil {
+		t.Fatalf("EmitError after permission tightening: %v", err)
+	}
+	recs, err := readAll(dir)
+	if err != nil {
+		t.Fatalf("readAll: %v", err)
+	}
+	if len(recs) != 6 {
+		t.Fatalf("records = %d, want 6 (5 legacy + 1 after tightening)", len(recs))
+	}
+}
