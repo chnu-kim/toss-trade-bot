@@ -36,10 +36,11 @@ verification: []
    - **`enforcement-integrity`**(이 ADR이 신설) — *"이 게이트 체계를 강제하는 메커니즘 자체는 loop가 스스로 약화시킬 수 없다."* 보호 대상: `.github/workflows/**`, branch protection 설정, **`.github/CODEOWNERS` 자신**(CODEOWNERS가 자기 자신을 소유하지 않으면 loop가 CODEOWNERS를 고쳐 `chnu-kim`을 소유자에서 빼는 PR이 리뷰 없이 통과한다 — advisor 하드닝 2차에서 지적), ADR-0008이 정의한 `risk:critical` 경로 분류 매핑, 그리고 이 두 sacred invariant를 정의하는 ADR-0007/0008/0009/0010 본문.
    
    이 둘을 **약화·제거·우회하는 내용을 담은 ADR·PR은 절대 자동 `Accepted`/자동 merge될 수 없다.** 항상 사람이 직접 검토·승인해야 한다.
-4. **`enforcement-integrity`는 CI가 아니라 GitHub branch protection + CODEOWNERS로 강제한다.** CI 잡은 loop가 고칠 수 있는 코드이므로 자기 자신을 지키는 근거가 될 수 없다 — branch protection 설정은 레포 관리자 권한으로만 바꿀 수 있는 GitHub 플랫폼 기능이라 loop가 못 건드리는 유일한 층이다. 구체적으로:
-   - `CODEOWNERS`에 `enforcement-integrity`가 보호하는 경로(`.github/workflows/**`, **`.github/CODEOWNERS` 자기 자신**, `docs/adr/000{7,8,9,10}-*.md`, risk-classification 매핑 파일)를 등록하고 소유자를 `chnu-kim`으로 지정한다. **`CODEOWNERS` 파일 자신의 항목이 빠지면 이 전체 메커니즘이 자기 자신을 보호하지 못한다** — 반드시 자기 경로를 포함해 등록한다.
+4. **`enforcement-integrity`는 CI가 아니라 GitHub branch protection + CODEOWNERS로 강제한다.** CI 잡은 loop가 고칠 수 있는 코드이므로 자기 자신을 지키는 근거가 될 수 없다 — branch protection 설정은 레포 관리자 권한으로만 바꿀 수 있는 GitHub 플랫폼 기능이라 loop가 못 건드리는 유일한 층이다. **CODEOWNERS는 gitignore 스타일 경로 매칭만 하고 brace expansion을 지원하지 않으며, frontmatter 값(`protects` 등)을 읽지 못한다**(codex adversarial-review 3차 지적, GitHub 공식 문서로 확인) — 그래서 보호는 "`protects`가 채워진 파일을 동적으로 찾아 보호"가 아니라 **정적으로 나열된 파일 경로 집합 + "수정하지 말고 대체한다" 컨벤션**으로 성립한다. 구체적으로:
+   - `CODEOWNERS`에 현재 sacred 경로를 **각각 명시적으로(brace 없이) 나열**한다: `.github/workflows/**`, **`.github/CODEOWNERS` 자기 자신**, `docs/adr/0004-*.md`, `docs/adr/0007-*.md`, `docs/adr/0008-*.md`, `docs/adr/0009-*.md`, `docs/adr/0010-*.md`, risk-classification 매핑 파일. 소유자는 `chnu-kim`. **`CODEOWNERS` 파일 자신의 항목이 빠지면 이 전체 메커니즘이 자기 자신을 보호하지 못한다** — 반드시 자기 경로를 포함해 등록한다.
    - branch protection이 이 경로를 건드리는 PR에 **CODEOWNERS 리뷰(사람 approve)** 를 required로 요구한다.
-   - `live-execution-human-gate`가 보호하는 경로(킬 스위치의 halt 기본값·clear 절차 관련 코드, `docs/adr/0007-*.md`)도 동일하게 CODEOWNERS에 등록한다. **`docs/adr/0004-*.md`도 여기 포함한다** — ADR-0007이 흡수한 "전역 halt = 사람 수동 해제만" 절차의 원 출처가 ADR-0004이므로, ADR-0007을 안 건드리고 ADR-0004만 조용히 개정해도(예: point 6을 자동 재개 허용으로 수정) 같은 불변식이 깨진다. frontmatter 소급 마이그레이션에서 ADR-0004에 `protects: [live-execution-human-gate]`를 부여했다.
+   - `docs/adr/0004-*.md`를 포함하는 이유: ADR-0007이 흡수한 "전역 halt = 사람 수동 해제만" 절차의 원 출처가 ADR-0004이므로, ADR-0007을 안 건드리고 ADR-0004만 조용히 개정해도(예: point 6을 자동 재개 허용으로 수정) 같은 불변식이 깨진다. frontmatter 소급 마이그레이션에서 ADR-0004에 `protects: [live-execution-human-gate]`를 부여했다.
+   - **미래에 새 ADR이 sacred invariant를 다루게 되는 경우, "수정하지 말고 대체한다"(`docs/adr/README.md`) 컨벤션이 안전망이다.** 기존 sacred 결정을 바꾸려면 반드시 원본 ADR을 `Superseded`로 표시해야 하는데, 그 표시 자체가 이미 CODEOWNERS로 보호된 파일(`docs/adr/000{4,7,8,9,10}-*.md`)의 `status`/`superseded_by` frontmatter를 건드리는 편집이라 자동으로 사람 리뷰가 걸린다. **완전히 새로운 sacred invariant를 도입하는 경우**(예: 향후 ADR-0009 자체를 개정해 새 invariant를 목록에 추가)는 point 7에 따라 ADR-0009 편집이 필요하고, ADR-0009 자체가 CODEOWNERS 보호 대상이므로 역시 사람 리뷰가 걸린다. 즉 "새 sacred 경로가 정적 목록에 없어서 빠져나가는" 경우는, 그 새 결정이 기존 sacred ADR을 대체하거나 sacred invariant 목록 자체를 건드리는 한 발생하지 않는다 — **기존 sacred 결정과 무관하게 완전히 새로운 파일에서 조용히 모순되는 내용을 선언하는 것**만 이 모델의 사각지대이며, 이는 CODEOWNERS의 구조적 한계(경로 기반)이지 이 설계의 결함이 아니다(ADR README의 "수정하지 말고 대체" 컨벤션을 우회하는 것 자체가 이미 이 레포의 다른 규범 위반이다).
 5. **loop가 만드는 PR의 작성자 identity는 사람 검토자(`chnu-kim`)와 분리된 별도 identity여야 한다** — 구체적으로 **GitHub App**을 만들어 그 앱의 bot identity(`<app-name>[bot]`)로 커밋·PR을 생성한다. 이렇게 하면 GitHub의 self-approval 차단이 "사람이 자기 자신을 승인 못 함"이 아니라 "**사람이 loop의 산출물을 실제로 승인할 수 있음**"으로 정확히 작동한다.
 6. **이 GitHub App의 설치 권한은 `enforcement-integrity`를 기술적으로도 뒷받침해야 한다** — `Administration`·`Workflows` 권한을 부여하지 않는다. `Workflows` 권한이 없으면 GitHub이 `.github/workflows/**`를 건드리는 push 자체를 거부하고, `Administration` 권한이 없으면 branch protection 설정 변경 API를 호출할 수 없다. 즉 CODEOWNERS 게이트가 뚫리기 전에 GitHub 플랫폼이 한 번 더 막는다(belt-and-suspenders).
 7. **이 예외 목록(sacred invariant 목록) 자체도 sacred다.** 목록에 새 항목을 추가하거나 제거하는 것 자체가 사람 승인을 요구한다(이 규칙이 재귀적으로 자기 자신을 보호한다).
@@ -57,6 +58,8 @@ verification: []
 - **별도 GitHub 계정(사람 계정처럼)을 봇용으로 새로 생성** — 기각: identity 분리는 되지만 이메일 인증·2FA 등 계정 관리 부담이 추가되고, GitHub App처럼 설치 단위 세밀 권한 제어(예: `Workflows` 권한 배제)를 기본 제공하지 않는다. GitHub App이 같은 목적을 더 적은 부담으로 달성한다.
 - **ADR `Accepted` 시점부터 즉시 자율 동작 허용(presence-check 없음)** — 기각(advisor 하드닝 2차 지적): enforcement 계층 구축(사람의 GitHub App 설치·CODEOWNERS 작성)에는 이 세션 밖의 시간이 걸린다. 그 사이를 "이미 자율"로 읽으면 오늘 실측한 admin 자격증명이 여전히 살아있는 구간에서 자율 행동이 시작될 수 있다 — 정확히 이 ADR 군이 막으려는 상황이 메타 레벨에서 재발한다.
 - **CODEOWNERS 자기 항목 생략(다른 sacred 경로만 등록)** — 기각(advisor 하드닝 2차 지적): CODEOWNERS가 자기 자신을 소유하지 않으면, loop가 CODEOWNERS를 고쳐 `chnu-kim`을 제거하는 PR이 리뷰 없이 통과해 전체 메커니즘이 스스로 열린다.
+- **CODEOWNERS 경로를 brace expansion(`docs/adr/000{7,8,9,10}-*.md`)으로 축약** — 기각(codex adversarial-review 3차 지적): GitHub CODEOWNERS는 gitignore 스타일 매칭이라 brace expansion을 지원하지 않는다. 이 패턴은 의도한 파일을 하나도 매칭하지 못해 보호가 전혀 작동하지 않았을 것이다 — 각 경로를 명시적으로 나열한다.
+- **`protects`가 채워진 모든 ADR을 CODEOWNERS가 동적으로 찾아 보호** — 기각(codex adversarial-review 3차 지적): CODEOWNERS는 파일 경로만 매칭하고 YAML frontmatter 값을 읽지 못한다 — "동적 보호"는 애초에 이 플랫폼 기능으로 구현 불가능한 약속이었다. 정적 목록 + "수정하지 말고 대체한다" 컨벤션(point 4)으로 대체한다.
 
 ## Consequences
 
@@ -64,6 +67,7 @@ verification: []
 - (좋음) ADR 자율화로 architect 고도까지 loop engineering 범위에 들어온다 — 사용자 목표를 완전히 달성한다.
 - (좋음) sacred invariant 보호가 "정책 문서" 차원이 아니라 GitHub 플랫폼이 기술적으로 강제하는 계층까지 내려간다 — CI를 고쳐서 우회하는 경로가 막힌다.
 - (좋음) point 8의 presence-check 덕에 "ADR은 Accepted됐지만 enforcement는 아직 안 서 있는" 위험한 간극이 자동으로 기존 사람 게이트로 fail-closed된다 — 이 ADR 군 자체가 자기가 기술하는 안전 철학(fail-closed, 증거 없음≠안전함)을 어긴 채 발효되지 않는다.
+- (알려진 잔여 위험) CODEOWNERS 보호는 **정적 파일 경로 목록**이지 `protects` 필드를 동적으로 읽는 게 아니다(codex adversarial-review 3차 지적, point 4). 기존 sacred ADR을 "수정하지 말고 대체"하는 정상 경로는 항상 걸리지만, 이론적으로는 **기존 sacred 파일을 전혀 건드리지 않는 완전히 새로운 ADR이 조용히 모순되는 내용을 선언**하는 경우까지는 이 메커니즘이 못 막는다. CODEOWNERS의 구조적 한계이며, `docs/adr/README.md`의 "수정하지 말고 대체" 컨벤션 준수에 의존한다 — 완벽한 보증이 아니라 실용적 완화다.
 - (비용) GitHub App을 실제로 만들고 설치해야 한다 — 이건 사람의 GitHub 웹 UI 작업이 필요하고 이 세션에서 대신 완료할 수 없다(구현 이슈, 사람 액션 필요).
 - (비용) 기존 CLAUDE.md의 "`gh auth switch --user chnu-kim` 후 `gh pr create`" 관행을 이 GitHub App 기반 flow로 갱신해야 한다 — 사람이 직접 만드는 PR(예외적 수동 개입)과 loop가 만드는 PR을 구분해야 하므로 워크플로 문서 갱신이 필요하다(구현 이슈).
 - (비용) `CODEOWNERS`·branch protection 설정 자체를 실제로 구성해야 한다 — 공유 인프라 변경이라 사람이 직접 확인하며 적용한다.
