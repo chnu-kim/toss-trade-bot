@@ -38,13 +38,24 @@ func main() {
 		os.Exit(1)
 	}
 
+	branch := getenv("PRESENCE_CHECK_BRANCH", defaultBranch)
+	branchChecker := enforcement.NewGitHubClient(branchProtectionToken())
+
+	// CODEOWNERS is read from the protected branch via the GitHub API — not
+	// local disk. GitHub evaluates CODEOWNERS (and everything branch
+	// protection cares about) from the target branch's committed content;
+	// reading local disk here would let a feature branch that edits
+	// CODEOWNERS, or a dirty checkout, silently report "protected" while main
+	// itself is not (codex GitHub-native review finding on this PR).
 	codeownersPath := getenv("PRESENCE_CHECK_CODEOWNERS_PATH", defaultCodeownersPath)
-	content, err := os.ReadFile(codeownersPath)
+	content, err := branchChecker.FetchFileContent(ctx, owner, repo, codeownersPath, branch)
 	if err != nil {
-		// A missing/unreadable CODEOWNERS is itself the unmet condition for
+		// A missing/unfetchable CODEOWNERS is itself the unmet condition for
 		// check (a) — pass an empty string through so Run reports that
 		// specific, correct reason instead of us guessing here.
-		logger.Warn("could not read CODEOWNERS file, check (a) will fail-closed", "path", codeownersPath, "err", err)
+		logger.Warn("could not fetch CODEOWNERS from the protected branch, check (a) will fail-closed",
+			"path", codeownersPath, "branch", branch, "err", err)
+		content = ""
 	}
 
 	resolver, identityWarning := identityResolver()
@@ -53,11 +64,11 @@ func main() {
 	}
 
 	result := enforcement.Run(ctx, enforcement.Params{
-		CodeownersContent: string(content),
+		CodeownersContent: content,
 		Owner:             owner,
 		Repo:              repo,
-		Branch:            getenv("PRESENCE_CHECK_BRANCH", defaultBranch),
-		BranchChecker:     enforcement.NewGitHubClient(branchProtectionToken()),
+		Branch:            branch,
+		BranchChecker:     branchChecker,
 		IdentityResolver:  resolver,
 		ExpectedActor:     getenv("PRESENCE_CHECK_EXPECTED_ACTOR", defaultExpectedActor),
 	})
