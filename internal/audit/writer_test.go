@@ -794,6 +794,80 @@ func TestBootDirectoryCreationMultiLevelFsyncsImmediateParent(t *testing.T) {
 	}
 }
 
+// TestBootDirectoryCreationMultiLevelFsyncsAllCreatedAncestors closes a codex
+// adversarial-review finding on this issue: a multi-level MkdirAll that
+// creates several missing ancestors at once must fsync EVERY created
+// directory's parent, not just dir's own immediate parent — each created
+// ancestor's own entry-list changed too and needs its parent durable. For
+// dir = root/a/b/audit where only root pre-exists, MkdirAll creates a, b, and
+// audit; making all three new entries durable requires fsyncing root (a's
+// parent), a (b's parent), and b (audit's parent).
+func TestBootDirectoryCreationMultiLevelFsyncsAllCreatedAncestors(t *testing.T) {
+	spy := &spyFS{}
+	root := t.TempDir()
+	a := filepath.Join(root, "a")
+	b := filepath.Join(a, "b")
+	dir := filepath.Join(b, "audit")
+	_ = newTestWriter(t, dir, spy.ops())
+
+	dirArgs := spy.dirArgsSnapshot()
+	want := map[string]bool{root: false, a: false, b: false}
+	for _, d := range dirArgs {
+		if _, ok := want[d]; ok {
+			want[d] = true
+		}
+	}
+	for d, seen := range want {
+		if !seen {
+			t.Errorf("expected a parent-dir fsync for newly-created ancestor's parent %q; dirArgs=%v", d, dirArgs)
+		}
+	}
+}
+
+// TestBootParentFsyncFailureAllowsRetryOnNextOpen guards a codex review
+// finding (P2): a failed boot parent-dir fsync must not leave the just-created
+// directory behind looking "already existed" to a later retry — otherwise
+// ensureDirDurable's existed-skip would permanently skip the fsync it still
+// needs, turning one transient failure into a permanently
+// unconfirmed-durable directory across every future retry. After a failed
+// attempt, the created path must be gone (so MkdirAll recreates it on retry)
+// and a subsequent openWriter must re-attempt — and this time succeed — the
+// parent-dir fsync.
+func TestBootParentFsyncFailureAllowsRetryOnNextOpen(t *testing.T) {
+	real := realFS()
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "audit")
+	failingFS := fsOps{
+		syncFile: real.syncFile,
+		rename:   real.rename,
+		syncDir: func(d string) error {
+			if d == parent {
+				return errInjected
+			}
+			return real.syncDir(d)
+		},
+	}
+
+	if _, err := openWriter(dir, failingFS, config{maxSegmentSize: defaultMaxSegmentSize}); !IsFailClosed(err) {
+		t.Fatal("first attempt with failing parent fsync did not fail-closed")
+	}
+	if dirExists(dir) {
+		t.Fatal("failed boot fsync must not leave dir behind looking pre-existing (blocks retry)")
+	}
+
+	spy := &spyFS{}
+	w, err := openWriter(dir, spy.ops(), config{maxSegmentSize: defaultMaxSegmentSize})
+	if err != nil {
+		t.Fatalf("retry with healthy fs failed: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+
+	dirArgs := spy.dirArgsSnapshot()
+	if len(dirArgs) == 0 || dirArgs[0] != parent {
+		t.Fatalf("retry must re-attempt the parent-dir fsync, got dirArgs=%v", dirArgs)
+	}
+}
+
 // TestBootParentFsyncFailureFailsClosed guards the failure path: if the boot
 // parent-dir fsync itself fails (disk trouble), openWriter must fail closed
 // rather than silently proceeding with a directory whose entry may not survive
