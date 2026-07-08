@@ -51,11 +51,17 @@ installation token 발급 로직은 `internal/enforcement.InstallationTokenMinte
 `.claude/agents/go-tdd-implementer.md`의 "완료 절차"에 있다. **이 전환은 App 자격증명(App
 ID·installation ID·private key)이 이 오케스트레이터 세션에 실제로 공급됐을 때만 적용된다** — 그
 자격증명이 없으면(오늘 시점 기본값) 서브에이전트는 위 §0의 기존 `gh auth switch --user <그 계정>`
-경로로 fail-closed 폴백한다(ADR-0009 point 8의 "증거 없음 ≠ 이미 안전함" 철학과 동일). **사람이 직접
-개입하는 PR**(예: `/architect` grilling 세션 산출물, 수동 hotfix — 이 스킬 밖의 작업)은 이 전환과
-무관하게 항상 사람 계정으로 만든다. App 자격증명을 이 오케스트레이터 세션에 안전하게 공급하는 방법
-(시크릿 provisioning)은 아직 미결이며, 실제 `mechanu[bot]` identity 전환의 실측 검증도 아직이다
-(#43 scope 밖, 별도 진행).
+경로로 폴백한다. **사람이 직접 개입하는 PR**(예: `/architect` grilling 세션 산출물, 수동 hotfix —
+이 스킬 밖의 작업)은 이 전환과 무관하게 항상 사람 계정으로 만든다.
+> ⚠️ **알려진 잔여 위험(codex adversarial-review 지적, #43)**: 이 폴백은 사람 게이트(PR
+> 검수·머지)를 우회하지 않는다는 의미에서는 안전하지만, `#43`이 원래 풀려던 self-approval
+> 교착(작성자==검토자라 `chnu-kim` 스스로 자기 PR을 승인 못 함)은 App 자격증명이 실제로
+> 배선되기 전까지 **그대로 남는다** — 그동안은 기존 방식대로 다른 협업자 계정이 승인하거나
+> 사람이 직접 병합해야 한다. App 자격증명 부재 시 PR 생성 자체를 막을지(hard stop)는 이 PR
+> 범위 밖의 별도 정책 결정이다(dispatch-issue 가용성 전체에 영향을 주므로 `/architect`급
+> 논의가 필요 — 섣불리 이 문서 갱신 PR에서 묵시적으로 정하지 않는다).
+> App 자격증명을 이 오케스트레이터 세션에 안전하게 공급하는 방법(시크릿 provisioning)은
+> 아직 미결이며, 실제 `mechanu[bot]` identity 전환의 실측 검증도 아직이다(#43 scope 밖, 별도 진행).
 
 **절대 금지**: main/master 직접 작업, `gh issue develop`(권한 부족), 자동 머지, 주문/쓰기 경로 자동 재시도.
 **git 서명/인증**: repo-local 설정이 이미 잡혀 있다. 단, **CLI로 커밋·푸시하기 전 SSH agent 소켓이
