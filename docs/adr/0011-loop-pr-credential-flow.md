@@ -16,7 +16,7 @@ verification:
     verdict: fixed (P2 — CODEOWNERS 등재와 presence-check 기대 집합(sacredRequiredPaths)이 함께 움직이지 않음 → 같은 PR에서 TDD로 반영)
   - reviewer: codex:adversarial-review
     date: 2026-07-09
-    verdict: 1차 needs-attention(Accepted ADR이 Proposed ADR에 위임하는 split-brain → Accepted flip으로 해소), 2차 needs-attention(구 check (c)가 Accepted 상태에서 false-positive로 잔존 → 같은 PR에서 hard fail-closed로 즉시 집행, point 10) — 재리뷰 결과는 PR #45에서 갱신
+    verdict: approve (3 rounds — 1차 needs-attention: Accepted ADR이 Proposed ADR에 위임하는 split-brain → Accepted flip으로 해소; 2차 needs-attention: 구 check (c)가 Accepted 상태에서 false-positive로 잔존 → 같은 PR에서 hard fail-closed로 즉시 집행(point 10); 3차 approve — no material findings)
   - reviewer: chnu-kim
     date: 2026-07-09
     verdict: approved (결정 자율 위임 — ADR-0009 point 1 경로; 최종 확정은 PR #45 code-owner 검수·머지)
