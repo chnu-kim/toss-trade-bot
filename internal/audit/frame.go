@@ -21,8 +21,20 @@ const (
 	frameHeaderLen = 8 // 4-byte length + 4-byte CRC
 	// maxRecordSize bounds a single record so a torn length header cannot make
 	// recovery try to read gigabytes. Audit records are small JSON objects.
+	//
+	// This is the SAME bound the writer enforces at commit time (writer.go
+	// commit, before encodeFrame) — sharing one constant makes "a record that
+	// was accepted at write time is always readable on recovery" an invariant
+	// rather than something that can drift between the two call sites (issue
+	// #25 / ADR-0006 point 4).
 	maxRecordSize = 8 << 20 // 8 MiB
 )
+
+// maxRecordSizeFitsUint32 is a compile-time guarantee that maxRecordSize always
+// fits the uint32 length field encodeFrame writes. If maxRecordSize is ever
+// widened past math.MaxUint32 this line fails to compile, catching the
+// uint32(len(payload)) truncation risk noted in issue #25 before it can ship.
+const maxRecordSizeFitsUint32 uint32 = maxRecordSize
 
 // crc32cTable is the Castagnoli polynomial table (hardware-accelerated on most
 // CPUs), used for frame integrity.
