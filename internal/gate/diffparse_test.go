@@ -76,3 +76,26 @@ index 0000000..1111111
 		t.Errorf("files[0].Path = %q, want new.go", files[0].Path)
 	}
 }
+
+func TestParseUnifiedDiff_DeletedFileUsesRealPathNotDevNull(t *testing.T) {
+	// codex:review finding: a deleted file's "+++ /dev/null" header must
+	// not become the recorded Path — that would make an evidence citation
+	// against the real (deleted) path fail SanityCheck's grounding check
+	// even though the deletion is right there in the diff.
+	diff := `diff --git a/old.go b/old.go
+deleted file mode 100644
+index 1111111..0000000
+--- a/old.go
++++ /dev/null
+@@ -1,2 +0,0 @@
+-package gate
+-// removed
+`
+	files := ParseUnifiedDiff(diff)
+	if len(files) != 1 {
+		t.Fatalf("ParseUnifiedDiff() returned %d files, want 1", len(files))
+	}
+	if files[0].Path != "old.go" {
+		t.Errorf("files[0].Path = %q, want old.go (not /dev/null)", files[0].Path)
+	}
+}

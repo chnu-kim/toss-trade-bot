@@ -132,9 +132,17 @@ The following are explicitly **not done** by this issue and are the input
    reaching a genuine `approve` outcome and a published `verdict-gate`
    check-run with `conclusion: success`.
 3. Empirically validate `auto-merge`/merge permission requirements (ADR-0011
-   Consequences list 9) — the `merge` job's `gh pr merge --auto --squash`
-   call has never been executed; if it fails, redesign the trigger per
-   ADR-0011 point 5 (never restore `Pull requests: write` to the loop PAT).
+   Consequences list 9) — the `merge` job's
+   `gh pr merge --auto --squash --match-head-commit "$HEAD_SHA"` call has
+   never been executed; if it fails, redesign the trigger per ADR-0011
+   point 5 (never restore `Pull requests: write` to the loop PAT).
+   **Stale-head regression (codex:adversarial-review finding on PR #52):**
+   as part of this validation, also confirm the TOCTOU guard actually
+   works — approve a PR at head SHA A (verdict-gate check published
+   green), then push a new commit (SHA B) before the merge job runs, and
+   assert `gh pr merge --match-head-commit A` is rejected by GitHub (the
+   merge job fails closed) rather than silently merging the unreviewed
+   SHA B.
 4. Reconcile the `merge` job's `environment: loop-pr` placeholder name with
    whatever #47 (issue B) finalizes as its environment name.
 5. **Known precision gaps to harden, found by inspection (not yet

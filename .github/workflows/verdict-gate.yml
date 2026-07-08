@@ -1032,8 +1032,19 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
         run: |
           set -euo pipefail
+          # TOCTOU guard (codex:adversarial-review [high]): the verdict was
+          # reviewed and published against needs.resolve.outputs.head_sha,
+          # but the PR branch could have moved between that check-run and
+          # this merge step (new commits pushed, none of them reviewed).
+          # `--match-head-commit` makes GitHub itself reject the merge
+          # atomically if the PR's current head no longer matches the
+          # reviewed SHA — this is not a race-prone "check then merge" in
+          # two separate calls, it is enforced server-side in the same
+          # request.
+          #
           # UNVERIFIED (ADR-0011 Consequences list 9): GraphQL
           # enablePullRequestAutoMerge's required permission is undocumented.
           # This call is exactly the empirical measurement list 9 calls for —
@@ -1042,4 +1053,4 @@ jobs:
           # a different trigger path, redesigned — never restoring
           # Pull requests: write to the loop PAT (that reopens the
           # approval-forgery vector, point 5 (c)).
-          gh pr merge "$PR_NUMBER" --auto --squash
+          gh pr merge "$PR_NUMBER" --auto --squash --match-head-commit "$HEAD_SHA"
