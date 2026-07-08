@@ -104,44 +104,18 @@ func branchProtectionToken() string {
 	return os.Getenv("GITHUB_TOKEN")
 }
 
-// identityResolver wires check (c)'s ActorResolver. It prefers the GitHub
-// App's own credentials (GITHUB_APP_ID + a private key) so the check proves
-// the App identity has actually taken over; if App credentials aren't
-// configured it falls back to a PAT-based resolver against GITHUB_TOKEN,
-// which correctly reports "chnu-kim" (or whatever human account owns that
-// token) and therefore correctly fails the check until the App is wired in.
-// If neither is configured, it returns a nil resolver — Run already
-// fail-closes on that.
+// identityResolver wires check (c)'s ActorResolver. ADR-0011 point 10
+// withdrew the previous wiring (App-JWT GET /app, with a PAT fallback): key
+// possession proves nothing about which identity authors PRs — the probe
+// passed while every loop PR was still authored by the human account
+// (semantic false positive, empirically demonstrated; codex
+// adversarial-review finding on PR #45). Until the c-1/c-2 redefinition
+// (PR-creation workflow existence on main + actual recent loop-PR author)
+// lands in ADR-0011's follow-up issue, check (c) is hard fail-closed no
+// matter what credentials the environment carries — GITHUB_APP_ID /
+// GITHUB_APP_PRIVATE_KEY(_PATH) are deliberately no longer read here.
 func identityResolver() (enforcement.ActorResolver, string) {
-	appID := os.Getenv("GITHUB_APP_ID")
-	keyPEM, keyErr := appPrivateKeyPEM()
-	if appID != "" && keyErr == nil && len(keyPEM) > 0 {
-		resolver, err := enforcement.NewAppActorResolverFromPEM(appID, keyPEM)
-		if err == nil {
-			return resolver, ""
-		}
-		return nil, "GITHUB_APP_ID/private key configured but invalid, falling back: " + err.Error()
-	}
-
-	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
-		return enforcement.NewPATActorResolver(token), "no GitHub App credentials configured; using PAT identity resolver (will report the human actor, correctly failing check (c) until the App is wired in)"
-	}
-
-	return nil, "no identity credentials configured (neither GITHUB_APP_ID+private key nor GITHUB_TOKEN); check (c) will fail-closed"
-}
-
-// appPrivateKeyPEM reads the App's private key from a file path
-// (GITHUB_APP_PRIVATE_KEY_PATH) or inline PEM content (GITHUB_APP_PRIVATE_KEY,
-// with escaped "\n" sequences un-escaped — the common way to fit a multi-line
-// PEM into a single-line env var).
-func appPrivateKeyPEM() ([]byte, error) {
-	if path := os.Getenv("GITHUB_APP_PRIVATE_KEY_PATH"); path != "" {
-		return os.ReadFile(path)
-	}
-	if raw := os.Getenv("GITHUB_APP_PRIVATE_KEY"); raw != "" {
-		return []byte(strings.ReplaceAll(raw, `\n`, "\n")), nil
-	}
-	return nil, nil
+	return enforcement.WithdrawnActorResolver{}, "check (c) is hard fail-closed pending the ADR-0011 c-1/c-2 redefinition — configured App/PAT credentials are intentionally ignored (key possession is not authorship evidence)"
 }
 
 // logResult writes the presence-check verdict as a single structured log

@@ -162,6 +162,26 @@ func (r *AppActorResolver) ResolveActor(ctx context.Context) (string, error) {
 	return parsed.Slug + "[bot]", nil
 }
 
+// --- WithdrawnActorResolver ---
+
+// WithdrawnActorResolver always fails to resolve, citing ADR-0011 point 10:
+// App-key possession (a successful App-JWT GET /app) proves nothing about
+// which identity actually authors the loop's PRs — the probe passed while
+// every loop PR was still authored by the human account (semantic false
+// positive, empirically demonstrated). cmd/presence-check wires this resolver
+// so check (c) stays fail-closed — regardless of what credentials are
+// configured — until the ADR-0011 c-1/c-2 redefinition (PR-creation workflow
+// existence + actual recent loop-PR author) is implemented in its follow-up
+// issue. AppActorResolver is kept for that future reuse (App-JWT signing),
+// not as identity evidence.
+type WithdrawnActorResolver struct{}
+
+// ResolveActor always returns the withdrawal error — CheckIdentity turns it
+// into an unmet, fail-closed result whose reason an operator can act on.
+func (WithdrawnActorResolver) ResolveActor(context.Context) (string, error) {
+	return "", errors.New("ADR-0011 point 10: App-key 보유 증명(GET /app)은 PR 작성 identity의 증거에서 폐기됨(의미상 false positive) — c-1/c-2 재정의 구현 전까지 check (c)는 fail-closed")
+}
+
 // --- CheckIdentity ---
 
 // CheckIdentity implements ADR-0009 point 8(c): the identity that would
