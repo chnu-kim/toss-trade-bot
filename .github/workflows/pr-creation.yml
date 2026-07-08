@@ -1,0 +1,129 @@
+name: PR Creation
+
+# ADR-0011 (docs/adr/0011-loop-pr-credential-flow.md) point 3: 이 workflow가 loop PR 생성의
+# 유일한 경로다. 트리거는 repository_dispatch 하나뿐이다 — GitHub은 repository_dispatch를 항상
+# default 브랜치(main)의 workflow 정의로만 실행하므로(플랫폼 사실, 실측 목록 4), 이 정의는
+# 어떤 브랜치에 변조된 사본이 존재해도 그 사본이 대신 실행될 수 없다. workflow_dispatch(트리거
+# API가 fine-grained PAT에 Actions: write를 요구해 post-narrowing loop 자격증명으로 자기잠금 —
+# ADR-0011 Alternatives)와 push(브랜치 정의로 실행돼 시크릿 노출 벡터 — 같은 문서 Alternatives)는
+# ADR-0011이 이미 기각한 대안이므로 여기 추가하지 않는다.
+on:
+  repository_dispatch:
+    types: [create-loop-pr] # event_type — ADR-0011이 구현 이슈(#47)에 위임한 확정값.
+
+# 이 workflow는 GITHUB_TOKEN을 전혀 사용하지 않는다 — PR 생성에 필요한 쓰기 권한은 전부
+# actions/create-github-app-token이 발급하는 narrowed App 설치 토큰으로만 수행한다(point 1).
+# contents: read는 checkout 한 단계에만 쓰인다.
+permissions:
+  contents: read
+
+# 같은 head 브랜치로 dispatch가 중복 도착해도 PR 생성 시도가 겹치지 않게 전역으로 직렬화한다.
+# client_payload 값을 concurrency key에 넣지 않는다 — AC의 "client_payload는 env: 경유만"
+# grep 검증을 이 파일 어디에서도 흔들리지 않게 하기 위함(judgment call, 기능상 필수는 아님).
+concurrency:
+  group: pr-creation
+  cancel-in-progress: false
+
+jobs:
+  create-pr:
+    name: create loop PR as mechanu[bot]
+    runs-on: ubuntu-latest
+    # main-제한 environment(point 3) — deployment branch policy가 main만 허용하도록
+    # 프로비저닝된다(프로비저닝 절차: docs/runbooks/loop-pr-environment-provisioning.md).
+    # repository_dispatch는 플랫폼이 항상 main 정의로만 실행하므로 이 게이트는 belt-and-suspenders다:
+    # 정의 고정은 트리거 선택이, 시크릿 격리는 이 environment가 맡는다.
+    environment: loop-pr
+    steps:
+      # --- 잡 최상단 가드(ADR-0011 point 3) ---
+      # sender/actor allowlist + head repo == base repo(fork 차단). repository_dispatch 자체가
+      # write 권한자만 보낼 수 있어 fork 행위자는 애초에 트리거 불가하지만(추가 방어층), 이 가드는
+      # 그 플랫폼 성질에 기대지 않고 독립적으로 검사한다.
+      #
+      # client_payload 값은 신뢰 입력이 아니므로 run 스크립트에 ${{ }}로 직접 보간하지 않고
+      # env: 변수로만 전달한다(injection 방어 — point 3, AC "client_payload 직접 보간 0건").
+      - name: "Guard: actor/sender allowlist + head repo == base repo"
+        env:
+          ACTOR: ${{ github.actor }}
+          SENDER: ${{ github.event.sender.login }}
+          HEAD_BRANCH: ${{ github.event.client_payload.head_branch }}
+        run: |
+          set -euo pipefail
+
+          allowed="chnu-kim"
+
+          if [ "$ACTOR" != "$allowed" ]; then
+            echo "::error::actor '$ACTOR'는 허용된 발신자($allowed)가 아닙니다 — ADR-0011 point 3 sender allowlist 위반."
+            exit 1
+          fi
+
+          if [ "$SENDER" != "$allowed" ]; then
+            echo "::error::sender '$SENDER'는 허용된 발신자($allowed)가 아닙니다 — ADR-0011 point 3 sender allowlist 위반."
+            exit 1
+          fi
+
+          if [ -z "$HEAD_BRANCH" ]; then
+            echo "::error::client_payload.head_branch가 비어 있습니다."
+            exit 1
+          fi
+
+          # git 참조 이름은 ':'를 포함할 수 없다 — 유일하게 ':'가 의미를 갖는 곳은
+          # "gh pr create --head <owner>:<branch>"의 포크 지정 문법이다. head_branch에 ':'가
+          # 있으면 base repo가 아닌 다른 owner(포크)를 head repo로 지정하려는 시도로 간주해
+          # 거부한다 — 이 workflow에 head repo == base repo를 강제하는 지점(point 3).
+          case "$HEAD_BRANCH" in
+          *:*)
+            echo "::error::head_branch에 ':'(owner 접두사)가 포함되어 있습니다 — fork head repo는 허용되지 않습니다(ADR-0011 point 3, head repo == base repo)."
+            exit 1
+            ;;
+          esac
+
+          # 방어적 charset 제한 — 이 값은 이후 스텝에서 'gh pr create --head' 인자로 그대로
+          # 쓰인다(env 경유이므로 셸 injection 자체는 이미 봉쇄돼 있지만, 예상 밖 문자는
+          # 애초에 정당한 브랜치명이 아니다).
+          case "$HEAD_BRANCH" in
+          *[!A-Za-z0-9._/-]*)
+            echo "::error::head_branch에 허용되지 않는 문자가 포함되어 있습니다: '$HEAD_BRANCH'"
+            exit 1
+            ;;
+          esac
+
+      # 액션은 mutable 태그가 아니라 full commit SHA로 핀 고정한다(ci.yml과 동일 원칙 —
+      # 이 workflow는 App 자격증명을 다루므로 공급망 안전이 더더욱 중요하다).
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      # --- App 토큰 발급(ADR-0011 point 1) ---
+      # repositories로 이 레포 하나만, permission-pull-requests로 PR 생성에 필요한 최소 권한만
+      # narrowing한다. App private key는 main-제한 environment 시크릿에서만 읽는다 — 레포-레벨
+      # 시크릿은 쓰지 않는다(point 3).
+      - name: Mint App installation token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.MECHANU_APP_ID }}
+          private-key: ${{ secrets.MECHANU_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-pull-requests: write
+
+      # --- PR 생성(ADR-0011 point 2·6) ---
+      # 이 토큰으로 만든 PR의 작성자는 mechanu[bot]이 된다 — 사람 검토자(chnu-kim)와 identity가
+      # 분리되어 self-approval 교착(PR #42/#44)이 구조적으로 해소된다. sacred 경로 PR도 예외 없이
+      # 이 경로를 거친다(point 6) — 이 workflow 자체는 sacred 경로 여부를 구분하지 않는다.
+      - name: Create loop PR as mechanu[bot]
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          HEAD_BRANCH: ${{ github.event.client_payload.head_branch }}
+          PR_TITLE: ${{ github.event.client_payload.pr_title }}
+          PR_BODY: ${{ github.event.client_payload.pr_body }}
+        run: |
+          set -euo pipefail
+          gh pr create \
+            --repo "$REPO" \
+            --base main \
+            --head "$HEAD_BRANCH" \
+            --title "$PR_TITLE" \
+            --body "$PR_BODY"
