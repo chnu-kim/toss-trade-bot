@@ -2,9 +2,9 @@
 #
 # 주의: 이 파일이 존재하는 것만으로는 아무것도 강제되지 않는다. GitHub은 branch
 # protection에서 "require review from code owners"가 켜져 있어야만 이 파일을 읽고
-# 리뷰를 요구한다. 그 branch protection 설정은 아직 사람 손으로 적용되지 않았다
-# (ADR-0009 point 8의 presence-check가 이걸 확인하는 이유이기도 하다) — 이 파일은
-# 그 설정이 켜지는 순간 바로 의미를 갖도록 미리 준비해두는 정적 목록이다.
+# 리뷰를 요구한다. 그 branch protection 설정은 이슈 #40에서 사람 손으로 적용됐고
+# (require_code_owner_reviews=true 실측 — ADR-0011 Context), ADR-0009 point 8의
+# presence-check(이슈 #41)가 그 실재를 기동 시마다 기계적으로 재확인한다.
 #
 # brace expansion(예: docs/adr/000{7,8,9,10}-*.md)은 CODEOWNERS 문법에서 지원되지
 # 않는다(gitignore 스타일 매칭) — 각 경로를 반드시 개별로 나열한다.
@@ -23,6 +23,9 @@
 /docs/adr/0008-*.md @chnu-kim
 /docs/adr/0009-*.md @chnu-kim
 /docs/adr/0010-*.md @chnu-kim
+# 0011: loop PR 자격증명 흐름·특권 workflow 트리거·시크릿 배치 — 게이트 강제
+# 메커니즘의 구성을 정의하므로 enforcement-integrity 보호 대상(ADR-0011 point 11).
+/docs/adr/0011-*.md @chnu-kim
 
 # risk:critical 경로 분류 매핑 파일 — 위치·형식은 아직 미확정(ADR-0008 후속 이슈).
 # 그 파일이 생기면 이 자리에 명시적 경로를 추가한다.

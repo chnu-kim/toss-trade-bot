@@ -32,6 +32,7 @@ var sacredRequiredPaths = []string{
 	"docs/adr/0008-independent-verification-gate.md",
 	"docs/adr/0009-adr-autonomy-sacred-invariant.md",
 	"docs/adr/0010-adr-ssot-frontmatter-hybrid.md",
+	"docs/adr/0011-loop-pr-credential-flow.md",
 }
 
 // codeownersEntry is one non-comment, non-blank CODEOWNERS line: a path

@@ -230,3 +230,19 @@ func TestCheckIdentity_NilResolverFailsClosed(t *testing.T) {
 		t.Fatal("nil resolver must fail-closed, not satisfy the check")
 	}
 }
+
+func TestWithdrawnActorResolver_AlwaysFailsClosed(t *testing.T) {
+	// ADR-0011 point 10 withdrew App-key possession (GET /app) as identity
+	// evidence — holding the key proves nothing about which identity authors
+	// PRs (semantic false positive, empirically demonstrated: the probe passed
+	// while every loop PR was still authored by chnu-kim). Until the c-1/c-2
+	// redefinition lands, check (c) must fail-closed no matter what
+	// credentials are configured (codex adversarial-review finding, PR #45).
+	got := CheckIdentity(context.Background(), WithdrawnActorResolver{}, "mechanu[bot]")
+	if got.Satisfied {
+		t.Fatal("withdrawn resolver must fail-closed, not satisfy the check")
+	}
+	if !strings.Contains(got.Reason, "ADR-0011") {
+		t.Fatalf("Reason = %q, want it to cite ADR-0011 so an operator reading the log knows why", got.Reason)
+	}
+}
