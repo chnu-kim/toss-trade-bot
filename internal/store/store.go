@@ -124,13 +124,22 @@ func (d *DB) schemaVersion(ctx context.Context) (int, error) {
 // Atomically runs fn in one write transaction on the dedicated write
 // connection. Because writeDB has a single connection, concurrent Atomically
 // calls queue rather than race, so there is no spurious SQLITE_BUSY.
+//
+// The deferred Rollback (same pattern as applyMigration in schema.go) is the
+// panic safety net: if fn panics, Go still runs deferred calls while the panic
+// propagates, so the transaction is rolled back and the sole write connection
+// (SetMaxOpenConns(1)) is returned to the pool before the panic reaches the
+// caller. Without it, a panicking fn leaks the write *sql.Tx forever, and every
+// later write (TripHalt, AppendIntent, ...) blocks on BeginTx indefinitely —
+// see issue #24. Rollback after a successful Commit is a documented no-op
+// (sql.ErrTxDone), so this is safe on the happy path too.
 func (d *DB) Atomically(ctx context.Context, fn func(tx Tx) error) error {
 	sqlTx, err := d.writeDB.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("store: begin tx: %w", err)
 	}
+	defer sqlTx.Rollback() //nolint:errcheck // no-op after a successful Commit; panic safety net otherwise
 	if err := fn(&txn{q: sqlTx}); err != nil {
-		_ = sqlTx.Rollback()
 		return err
 	}
 	if err := sqlTx.Commit(); err != nil {
