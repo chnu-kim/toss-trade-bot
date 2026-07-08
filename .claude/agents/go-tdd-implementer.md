@@ -61,18 +61,22 @@ self-approval 차단 때문에 사람 본인이 그 PR을 승인하지 못한다
   > 소켓 값이 아니라 *경로*로 넘기는 이 문서의 기존 패턴과 같은 원칙이다: **아래 두 명령 모두
   > 이미 export된 env var *이름*만 참조하고, 그 값을 처음 export하는 방법은 이 문서가 규정하지
   > 않는다**(오케스트레이터/시크릿 provisioning의 몫).
-  - **`git push` 인증**: `git`은 `GITHUB_TOKEN`을 읽지 않는다(gh CLI만 읽는다). 이 worktree의 origin은
-    SSH remote(`git@github.com:...`)라 그대로 두면 push가 여전히 사람의 SSH 키로 서명·인증된다. App
-    토큰으로 push하려면 GitHub 공식 "Authenticating as a GitHub App installation" 문서의
-    `x-access-token` Basic-Auth 자격증명을, **URL에 박지 말고** 이미 export된 `GIT_APP_TOKEN`을
-    참조하는 일회성 credential helper로 공급한다:
+  - **`git push` 인증**: `git`은 `GITHUB_TOKEN`을 읽지 않는다(gh CLI만 읽는다). 이 worktree의 `origin`
+    remote는 SSH(`git@github.com:...`)로 잡혀 있다 — **`push origin`으로 그대로 두면** git이 SSH
+    프로토콜을 쓰므로 `credential.https://github.com.helper`가 아예 호출되지 않고 push는 여전히
+    사람의 SSH 키로 인증된다(codex:review P2 지적, PR #44). App 토큰으로 실제로 인증시키려면
+    **HTTPS URL을 push 대상으로 명시**해 그 프로토콜의 credential helper가 실행되게 하고, 자격증명
+    자체는 GitHub 공식 "Authenticating as a GitHub App installation" 문서의 `x-access-token`
+    Basic-Auth 패턴을 **URL에 박지 않고** 이미 export된 `GIT_APP_TOKEN`을 참조하는 일회성 helper로
+    공급한다:
     ```bash
     git -C "{WT}" -c credential.helper= \
       -c 'credential.https://github.com.helper=!f() { echo username=x-access-token; echo "password=$GIT_APP_TOKEN"; }; f' \
-      push origin "{BR}"
+      push "https://github.com/{SLUG}.git" "{BR}"
     ```
     (`GIT_APP_TOKEN`은 오케스트레이터가 `InstallationTokenMinter.Mint()` 결과로 이미 export해둔 것을
-    전제한다 — 이 명령 텍스트 자체엔 토큰 값이 없다.)
+    전제한다 — 이 명령 텍스트 자체엔 토큰 값이 없다. `origin` alias가 아니라 `https://github.com/{SLUG}.git`
+    URL을 직접 push 대상으로 써야 credential helper가 실제로 개입한다.)
   - **`gh pr create` 인증**: `gh` CLI는 `GH_TOKEN`/`GITHUB_TOKEN` env var를 인증에 우선 사용하므로,
     같은 토큰이 이미 `GIT_APP_TOKEN`(또는 오케스트레이터가 지정한 동등한 변수)에 export돼 있다면
     `gh` 전용 이름으로 다시 참조만 하면 된다 — **여기서도 토큰 원문을 타이핑하지 않는다**:
