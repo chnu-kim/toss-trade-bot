@@ -43,6 +43,24 @@ fi
 # 이후 모든 gh 호출 예시: gh auth switch --user <그 계정> >/dev/null && gh <cmd> --repo "$SLUG" ...
 ```
 
+**loop PR 작성 identity(ADR-0011)**: 3단계 서브에이전트가 만드는 PR의 목표 작성자는 사람 계정이
+아니라 GitHub App(`mechanu[bot]`)이다 — 사람 검토자와 identity가 같으면 GitHub의 self-approval
+차단 때문에 사람 본인이 그 PR을 승인하지 못한다(#41/#42에서 실측). 흐름: 커밋·push는 그대로
+`chnu-kim`(identity 분할 — point 2), 이후 `gh pr create`를 직접 부르지 않고
+`POST /repos/{owner}/{repo}/dispatches`(`event_type: create-loop-pr`)로 트리거하면 main에 고정된
+`.github/workflows/pr-creation.yml`이 narrowing된 App 토큰으로 PR을 생성한다 — 구체적 CLI 사용법·
+`client_payload` 구성·PR 확인 폴링은 `.claude/agents/go-tdd-implementer.md`의 "완료 절차"에 있다.
+App private key는 main-제한 GitHub Actions environment(`loop-pr`) 시크릿에서만 읽히고, 이
+오케스트레이터·서브에이전트 세션에는 절대 존재하지 않는다(point 1 — 조회·발급 시도조차 금지).
+**사람이 직접 개입하는 PR**(`/architect` grilling 세션 산출물, 수동 hotfix 등 이 스킬 밖의 작업)은
+이 흐름과 무관하게 계속 사람 계정으로 만든다.
+
+> ⚠️ **가동 전제**: 이 흐름은 `pr-creation.yml`이 main에 존재하고 + loop 자격증명 narrowing(ADR-0011
+> point 5 ②)이 완료되고 + `loop-pr` environment가 실키로 프로비저닝된 뒤에만 실제로 동작한다(절차:
+> `docs/runbooks/loop-pr-environment-provisioning.md`). 그 전(부트스트랩 구간 — 이 workflow 자체를
+> 도입하는 PR들이 여기 해당한다)에는 서브에이전트가 기존 `gh auth switch --user <사람 계정>` →
+> `gh pr create` 경로로 폴백한다(go-tdd-implementer.md에 명시).
+
 **절대 금지**: main/master 직접 작업, `gh issue develop`(권한 부족), 자동 머지, 주문/쓰기 경로 자동 재시도.
 **git 서명/인증**: repo-local 설정이 이미 잡혀 있다. 단, **CLI로 커밋·푸시하기 전 SSH agent 소켓이
 설정돼야** 서명·인증이 된다(이 머신은 1Password agent 사용 — 메인이 환경/메모리에서 실제 `SSH_AUTH_SOCK`
