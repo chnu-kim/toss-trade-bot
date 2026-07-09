@@ -251,6 +251,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.meta.outputs.head_sha }}
         run: |
           set -euo pipefail
           gh pr diff "$PR_NUMBER" --patch > pr.diff
@@ -266,6 +267,27 @@ jobs:
           gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)' > changed-paths.txt
           if [ ! -s changed-paths.txt ]; then
             echo "::error::PR #$PR_NUMBER reports zero changed files — failing closed (gate.ClassifyChangedPaths treats an empty path list as critical, but an empty *file list* for a real PR most likely means the files API call failed silently)."
+            exit 1
+          fi
+          # codex:adversarial-review [high] finding: `gh pr diff`/the
+          # `pulls/{n}/files` endpoint both read the PR's CURRENT head, not
+          # the exact head_sha this run recorded in the "Fetch PR metadata"
+          # step above — if the PR's head moves between those two steps (an
+          # eligible same-repo bot branch has push/force-push capability),
+          # the diff/files just fetched reflect a DIFFERENT commit than
+          # $HEAD_SHA, yet finalize later publishes the verdict-check-run
+          # against $HEAD_SHA. SHA-sticky logic would then treat that
+          # mis-associated check-run as authoritative forever for
+          # $HEAD_SHA, and if the branch is later reset back to exactly
+          # that SHA, `--match-head-commit` at merge time would succeed —
+          # merging content that was never actually reviewed as-is. Re-fetch
+          # the head right after the diff/files snapshot and fail closed on
+          # any mismatch (repeated again immediately before the check-run
+          # publish in "finalize", since the leg jobs in between can take
+          # long enough for the head to move again).
+          current_head=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid')
+          if [ "$current_head" != "$HEAD_SHA" ]; then
+            echo "::error::PR #$PR_NUMBER's head moved from $HEAD_SHA to $current_head between metadata fetch and diff fetch — the diff/files just fetched do not correspond to the recorded head SHA. Failing closed rather than reviewing content for a different commit than the one this run's verdict-check would be published against."
             exit 1
           fi
 
@@ -1153,10 +1175,25 @@ jobs:
         if: steps.combine.outputs.outcome != 'skipped'
         env:
           GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
           HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
           OUTCOME: ${{ steps.combine.outputs.outcome }}
         run: |
           set -euo pipefail
+          # codex:adversarial-review [high] finding: the "resolve" job's
+          # diff-fetch step already re-validates the head once, but the leg
+          # jobs in between (codex/claude API calls) can take long enough
+          # for the PR's head to move again before this exact moment — the
+          # moment a check-run actually gets attached to $HEAD_SHA. A stale
+          # check-run is exactly what SHA-sticky logic would later treat as
+          # an authoritative, reusable record for that SHA, so re-validate
+          # immediately before publishing rather than trusting a
+          # potentially-minutes-old snapshot.
+          current_head=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid')
+          if [ "$current_head" != "$HEAD_SHA" ]; then
+            echo "::error::PR #$PR_NUMBER's head moved from $HEAD_SHA to $current_head since this run started reviewing it — refusing to publish a verdict-gate check-run for a SHA that no longer reflects what was actually reviewed. Failing closed; a fresh dispatch against the new head will review it correctly."
+            exit 1
+          fi
           # codex:review [P1] finding, confirmed against GitHub's own docs
           # ("Required status checks must have a successful, skipped, or
           # neutral status before collaborators can make changes to a
