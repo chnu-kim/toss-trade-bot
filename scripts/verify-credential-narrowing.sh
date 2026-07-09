@@ -266,9 +266,12 @@ else
   gh auth status >/dev/null 2>&1 && printf '    - gh 캐시 세션: 있음\n' || printf '    - gh 캐시 세션: 없음\n'
 
   # ambient PUT protection — ★ main이 아니라 일회용 브랜치 대상(파괴 방지).
+  #   ★ 완전한 protection body를 --input으로 넘긴다(codex P2) — `-f enforce_admins=true`만
+  #     보내면 body 불완전으로 admin 잔존 시에도 422가 나 INCONCLUSIVE로 빠지고, over-privileged를
+  #     malformed와 구분 못 한다. 완전한 body라야 2xx=admin 잔존(FAIL)이 신뢰 가능하다.
   if [ -n "$_PROBE_BRANCH" ]; then
-    perr=$(gh api --method PUT "repos/${OWNER_REPO}/branches/${_PROBE_BRANCH}/protection" \
-      -f 'enforce_admins=true' 2>&1 >/dev/null); prc=$?
+    perr=$(printf '%s' '{"required_status_checks":null,"enforce_admins":true,"required_pull_request_reviews":null,"restrictions":null}' \
+      | gh api --method PUT "repos/${OWNER_REPO}/branches/${_PROBE_BRANCH}/protection" --input - 2>&1 >/dev/null); prc=$?
     pcode=$(printf '%s' "$perr" | grep -oE 'HTTP [0-9]+' | head -1)
     if [ $prc -ne 0 ] && printf '%s' "$perr" | grep -qE 'HTTP (403|404)'; then
       pass "7-ix" "ambient PUT protection 거부" "${pcode:-n/a}"
