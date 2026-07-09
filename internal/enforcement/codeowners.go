@@ -16,16 +16,23 @@ const RequiredOwner = "@chnu-kim"
 // (entirely, not merged — see codeownersPatternMatches doc), so a later,
 // narrower CODEOWNERS entry that strips protection from exactly one real
 // sacred file is only caught if the check evaluates that exact file, not a
-// made-up stand-in. The risk:critical path-classification mapping file is
-// deliberately absent here — ADR-0009 point 4 and the issue tracking this
-// check both say its location/format is unconfirmed and out of scope.
+// made-up stand-in.
 //
 // These paths are expected to stay stable: ADR-0009's own "수정하지 말고
 // 대체한다" convention (docs/adr/README.md) means sacred ADRs are superseded
 // by new files, not renamed, and the workflow/CODEOWNERS self-reference paths
 // are structural, not content that changes.
+//
+// The verdict-gate.yml/internal/gate/cmd/verdict-gate/configs/gate entries
+// (#48) are the ADR-0011 point 11 registration for the ADR-0008 verdict
+// gate's own judgement logic, CLI, and risk-classification mapping: all three
+// live outside .github/workflows/** but are executed/read by the privileged
+// verdict-generating job, so — per ADR-0011 point 4(b) round 9 ("main에
+// 있음 ≠ 보호됨") — they must be CODEOWNERS-protected exactly like the
+// workflow YAML itself, not merely present on the default branch.
 var sacredRequiredPaths = []string{
 	".github/workflows/ci.yml",
+	".github/workflows/verdict-gate.yml",
 	".github/CODEOWNERS",
 	"docs/adr/0004-kill-switch-submit-guard.md",
 	"docs/adr/0007-dev-time-autonomy-boundary.md",
@@ -33,6 +40,24 @@ var sacredRequiredPaths = []string{
 	"docs/adr/0009-adr-autonomy-sacred-invariant.md",
 	"docs/adr/0010-adr-ssot-frontmatter-hybrid.md",
 	"docs/adr/0011-loop-pr-credential-flow.md",
+	// Every non-test .go source file in internal/gate, individually — not
+	// just one representative file (codex:review [P2] finding on #48's PR:
+	// the privileged workflow compiles and executes the whole package via
+	// cmd/verdict-gate, so a later, narrower CODEOWNERS entry stripping
+	// protection from any ONE of these files — not only
+	// riskclassification.go — must be caught).
+	"internal/gate/diffparse.go",
+	"internal/gate/doc.go",
+	"internal/gate/eligibility.go",
+	"internal/gate/gateconfig.go",
+	"internal/gate/outcome.go",
+	"internal/gate/pattern.go",
+	"internal/gate/retry.go",
+	"internal/gate/riskclassification.go",
+	"internal/gate/sanity.go",
+	"internal/gate/verdict.go",
+	"cmd/verdict-gate/main.go",
+	"configs/gate/risk-classification.json",
 }
 
 // codeownersEntry is one non-comment, non-blank CODEOWNERS line: a path
