@@ -112,9 +112,11 @@ func runClassify(args []string, stdin io.Reader, stdout io.Writer) (int, error) 
 // --- eligibility ---
 
 type eligibilityInput struct {
-	HeadRepo string `json:"head_repo"`
-	BaseRepo string `json:"base_repo"`
-	Author   string `json:"author"`
+	// IsCrossRepository is sourced from `gh pr view --json`'s
+	// `isCrossRepository` field — there is no `baseRepository` field to
+	// derive a manual head/base comparison from (see gate.PRContext).
+	IsCrossRepository bool   `json:"is_cross_repository"`
+	Author            string `json:"author"`
 }
 
 type eligibilityOutput struct {
@@ -126,7 +128,7 @@ func runEligibility(stdin io.Reader, stdout io.Writer) (int, error) {
 	if err := json.NewDecoder(stdin).Decode(&in); err != nil {
 		return 0, fmt.Errorf("eligibility: malformed stdin: %w", err)
 	}
-	eligible := gate.Eligible(gate.PRContext{HeadRepo: in.HeadRepo, BaseRepo: in.BaseRepo, Author: in.Author})
+	eligible := gate.Eligible(gate.PRContext{IsCrossRepository: in.IsCrossRepository, Author: in.Author})
 	if err := json.NewEncoder(stdout).Encode(eligibilityOutput{Eligible: eligible}); err != nil {
 		return 0, err
 	}

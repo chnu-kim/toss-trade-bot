@@ -203,9 +203,17 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
         run: |
           set -euo pipefail
+          # An independent adversarial review actually ran `gh pr view
+          # --json ...,baseRepository,...` live and confirmed it fails with
+          # "Unknown JSON field: \"baseRepository\"" — that field does not
+          # exist. `gh pr view --json` has no field to build a manual
+          # head/base "owner/repo" comparison from. Use `isCrossRepository`
+          # instead — GitHub's own authoritative fork/same-repo computation
+          # — and pass it straight through as a boolean (see
+          # gate.PRContext.IsCrossRepository).
           gh pr view "$PR_NUMBER" \
-            --json headRepositoryOwner,headRepository,baseRepository,author,headRefOid,title,body,commits \
-            --jq '{head_repo: (.headRepositoryOwner.login + "/" + .headRepository.name), base_repo: .baseRepository.nameWithOwner, author: .author.login, head_sha: .headRefOid, title: .title, body: (.body // ""), commit_messages: [.commits[].messageHeadline]}' \
+            --json headRepositoryOwner,headRepository,isCrossRepository,author,headRefOid,title,body,commits \
+            --jq '{head_repo: (.headRepositoryOwner.login + "/" + .headRepository.name), is_cross_repository: .isCrossRepository, author: .author.login, head_sha: .headRefOid, title: .title, body: (.body // ""), commit_messages: [.commits[].messageHeadline]}' \
             > pr-meta.json
           cat pr-meta.json
           head_sha=$(jq -r '.head_sha' pr-meta.json)
@@ -219,7 +227,7 @@ jobs:
         id: eligibility
         run: |
           set -euo pipefail
-          jq '{head_repo, base_repo, author}' pr-meta.json > eligibility-in.json
+          jq '{is_cross_repository, author}' pr-meta.json > eligibility-in.json
           set +e
           go run ./cmd/verdict-gate eligibility < eligibility-in.json > eligibility-out.json
           code=$?
@@ -342,6 +350,20 @@ jobs:
           PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
           HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
           LEG: codex
+          # ADR-0011 point 4(e)(i)'s "instruction/data separation, env: only"
+          # principle, applied without exception (an independent adversarial
+          # review caught this exact step splicing these three directly via
+          # `${{ }}` into the shell script below instead — inconsistent with
+          # every other guard in this file, e.g. "Guard — sender/actor
+          # allowlist" above. `inputs.action` is `type: choice`, but GitHub
+          # does not enforce that constraint server-side for a
+          # workflow_dispatch fired via the REST API — a write-access
+          # actor could send an arbitrary string, which direct `${{ }}`
+          # interpolation would splice into this privileged (checks:write)
+          # job's shell script unescaped.
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_ACTION: ${{ github.event.inputs.action }}
+          ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
           # BEST-EFFORT / #50 HANDOFF: see the workflow-level header comment.
@@ -468,7 +490,7 @@ jobs:
             '[.[] | select((.display_title | startswith("verdict-gate request-verdict")) and .conclusion=="failure" and ($boundary == "" or .created_at > $boundary))] | length')
 
           global_intervention=false
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.action }}" = "request-verdict" ] && [ "${{ github.actor }}" = "chnu-kim" ]; then
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$INPUT_ACTION" = "request-verdict" ] && [ "$ACTOR" = "chnu-kim" ]; then
             : # a chnu-kim-actor manual re-run does NOT by itself clear the
               # global counter (only the dedicated clear-global-escalation
               # action does) — left false intentionally.
@@ -1213,9 +1235,21 @@ jobs:
     steps:
       - name: "Mint App installation token (permission-contents write — merge API is a Contents write operation)"
         id: app-token
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494e13a2bc3 # v2.1.4
+        # Pinned to the same version/SHA as #47's pr-creation.yml (sibling
+        # workflow, same App, same environment) — an independent
+        # adversarial review flagged the two had drifted (this file was on
+        # v2.1.4, #47 on v3.2.0).
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.MECHANU_APP_ID }}
+          # MECHANU_APP_ID is registered as an environment secret (not a
+          # repo-level variable) on the `loop-pr` environment — see
+          # docs/runbooks/loop-pr-environment-provisioning.md (#47, SSOT).
+          # `vars.*` and `secrets.*` are disjoint stores in GitHub Actions;
+          # reading `vars.MECHANU_APP_ID` here would silently resolve to an
+          # empty string and break App token minting the moment this job
+          # actually runs (an independent adversarial review caught this
+          # namespace mismatch against #47's runbook).
+          app-id: ${{ secrets.MECHANU_APP_ID }}
           private-key: ${{ secrets.MECHANU_APP_PRIVATE_KEY }}
           repositories: ${{ github.event.repository.name }}
           permission-contents: write

@@ -88,7 +88,7 @@ func TestRunParseDiff_SplitsFilesAndHunks(t *testing.T) {
 }
 
 func TestRunEligibility_Eligible_ExitsZero(t *testing.T) {
-	stdin := strings.NewReader(`{"head_repo":"chnu-kim/toss-trade-bot","base_repo":"chnu-kim/toss-trade-bot","author":"mechanu[bot]"}`)
+	stdin := strings.NewReader(`{"is_cross_repository":false,"author":"mechanu[bot]"}`)
 	var stdout bytes.Buffer
 	code, err := runEligibility(stdin, &stdout)
 	if err != nil {
@@ -100,7 +100,12 @@ func TestRunEligibility_Eligible_ExitsZero(t *testing.T) {
 }
 
 func TestRunEligibility_ForkPR_ExitsNonZero(t *testing.T) {
-	stdin := strings.NewReader(`{"head_repo":"attacker/toss-trade-bot","base_repo":"chnu-kim/toss-trade-bot","author":"mechanu[bot]"}`)
+	// is_cross_repository is sourced from the real `gh pr view --json`
+	// field `isCrossRepository` — there is no `baseRepository` field to
+	// compare against manually (an independent adversarial review caught a
+	// live `gh pr view --json ...,baseRepository,...` call failing with
+	// "Unknown JSON field").
+	stdin := strings.NewReader(`{"is_cross_repository":true,"author":"mechanu[bot]"}`)
 	var stdout bytes.Buffer
 	code, err := runEligibility(stdin, &stdout)
 	if err != nil {
