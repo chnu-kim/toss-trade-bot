@@ -8,6 +8,11 @@
 // back off and retry on 5xx/network errors and reissue once on 401, while write
 // requests (POST) are never auto-retried because a re-sent order risks a
 // duplicate fill.
+//
+// Transport hardening: the base URL must be https (plain http is allowed only
+// for loopback test servers), redirects are never followed (a token-endpoint
+// redirect would re-send the credential form body elsewhere), and response
+// decoding is byte-capped so a misbehaving upstream cannot OOM the process.
 package toss
 
 import (
@@ -16,6 +21,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -35,6 +42,13 @@ const (
 	backoffCap      = 5 * time.Second
 	headerAccount   = "X-Tossinvest-Account"
 	formContentType = "application/x-www-form-urlencoded"
+
+	// maxResponseBytes caps how much of any response body is read into memory
+	// while decoding (1 MiB). The HTTP client timeout bounds time, not bytes: a
+	// malicious or misbehaving upstream could otherwise stream hundreds of MB
+	// of JSON onto the heap and OOM the unattended process, killing the order
+	// loop. Real Toss payloads are orders of magnitude below this cap.
+	maxResponseBytes = 1 << 20
 )
 
 // Client talks to the Toss Open API. It owns the single OAuth token for the
@@ -51,18 +65,80 @@ type Client struct {
 	sleep func(ctx context.Context, d time.Duration) error
 }
 
-// NewClient constructs a Client with a sane default HTTP timeout.
-func NewClient(baseURL, clientID, clientSecret string) *Client {
+// NewClient constructs a Client with a sane default HTTP timeout. It fails
+// when baseURL does not pass ValidateBaseURL, so a plain-http typo can never
+// silently boot a process that would send credentials unencrypted.
+func NewClient(baseURL, clientID, clientSecret string) (*Client, error) {
+	if err := ValidateBaseURL(baseURL); err != nil {
+		return nil, err
+	}
 	c := &Client{
 		baseURL:      strings.TrimRight(baseURL, "/"),
 		clientID:     clientID,
 		clientSecret: clientSecret,
-		http:         &http.Client{Timeout: 10 * time.Second},
-		sleep:        sleepCtx,
+		http: &http.Client{
+			Timeout: 10 * time.Second,
+			// Never follow redirects. Go's default policy strips the
+			// Authorization header cross-host but re-sends request BODIES, so
+			// a 307/308 from the token endpoint would forward the
+			// client_id/client_secret form to an arbitrary Location target.
+			// The Toss API never legitimately redirects; surface the status.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		sleep: sleepCtx,
 	}
 	c.tokens = newTokenManager(c.issueToken)
-	return c
+	return c, nil
 }
+
+// ValidateBaseURL enforces that credentials and bearer tokens only ever travel
+// over TLS: the base URL must be https. Plain http is allowed solely for
+// loopback hosts (httptest servers, local stubs) so tests never need the
+// production scheme relaxed.
+func ValidateBaseURL(raw string) error {
+	if strings.TrimSpace(raw) == "" {
+		return errors.New("toss: base URL is empty")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("toss: invalid base URL: %w", err)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if isLoopbackHost(u.Hostname()) {
+			return nil
+		}
+		return fmt.Errorf("toss: base URL %s uses plain http: credentials and tokens would be sent unencrypted (use https; http is allowed only for loopback hosts)", u.Redacted())
+	default:
+		return fmt.Errorf("toss: base URL %s must use https, got scheme %q", u.Redacted(), u.Scheme)
+	}
+}
+
+// isLoopbackHost reports whether host (no port) is localhost or a loopback IP.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// SetLogger routes the client's operational warnings (e.g. serving a cached
+// token because a refresh failed) to l. Call it at boot; the default is
+// slog.Default() so warnings are never silently dropped.
+func (c *Client) SetLogger(l *slog.Logger) {
+	c.tokens.setLogger(l)
+}
+
+// String keeps the client printable (%v/%+v/%s) without exposing credentials.
+func (c *Client) String() string { return "toss.Client(" + c.baseURL + ")" }
+
+// GoString keeps %#v from dumping unexported credential fields via reflection.
+func (c *Client) GoString() string { return c.String() }
 
 // RequestOption mutates an outgoing request before it is sent.
 type RequestOption func(*http.Request)
@@ -224,13 +300,36 @@ func (c *Client) issueToken(ctx context.Context) (string, time.Duration, error) 
 		TokenType   string `json:"token_type"`
 		ExpiresIn   int64  `json:"expires_in"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
+	if err := DecodeJSON(resp.Body, &tr); err != nil {
 		return "", 0, fmt.Errorf("toss: decode token response: %w", err)
 	}
 	if tr.AccessToken == "" {
 		return "", 0, errors.New("toss: token response missing access_token")
 	}
+	if tr.ExpiresIn <= 0 {
+		// Fail fast on an anomalous lifetime instead of caching a token that
+		// is expired the moment it is stored: that would silently turn every
+		// call into a reissue, each new token invalidating the previous one
+		// (the ADR-0001 thundering herd, self-inflicted). Terminal on purpose
+		// — retrying would mint more mutually invalidating tokens.
+		return "", 0, fmt.Errorf("toss: token response has invalid expires_in %d (want positive seconds per OAuth2 spec)", tr.ExpiresIn)
+	}
 	return tr.AccessToken, time.Duration(tr.ExpiresIn) * time.Second, nil
+}
+
+// DecodeJSON decodes a single JSON value from r into v, reading at most
+// maxResponseBytes (1 MiB). An oversized body fails with a clear error instead
+// of growing the heap without bound — the OOM guard for every response decode
+// in this module (the account/market wrappers use it too).
+func DecodeJSON(r io.Reader, v any) error {
+	lr := &io.LimitedReader{R: r, N: maxResponseBytes + 1}
+	if err := json.NewDecoder(lr).Decode(v); err != nil {
+		if lr.N <= 0 {
+			return fmt.Errorf("toss: response body exceeds %d bytes", maxResponseBytes)
+		}
+		return err
+	}
+	return nil
 }
 
 // decodeOAuthError reads the OAuth2 standard error envelope ({error,
@@ -240,7 +339,7 @@ func decodeOAuthError(resp *http.Response) error {
 		Err  string `json:"error"`
 		Desc string `json:"error_description"`
 	}
-	_ = json.NewDecoder(resp.Body).Decode(&oe)
+	_ = DecodeJSON(resp.Body, &oe)
 	switch {
 	case oe.Err != "" && oe.Desc != "":
 		return fmt.Errorf("toss: token issuance failed (%d): %s: %s", resp.StatusCode, oe.Err, oe.Desc)

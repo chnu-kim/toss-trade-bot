@@ -30,7 +30,30 @@ func tokenAndThen(t *testing.T, api http.HandlerFunc) *httptest.Server {
 }
 
 func newClient(srv *httptest.Server) *Client {
-	return NewClient(toss.NewClient(srv.URL, "id", "secret"))
+	api, err := toss.NewClient(srv.URL, "id", "secret")
+	if err != nil {
+		panic(err) // httptest URLs are loopback, which always validates
+	}
+	return NewClient(api)
+}
+
+// TestClient_OversizedResponseRejected guards the decode byte cap: a huge
+// (malicious or misbehaving) response body must fail decoding instead of being
+// loaded onto the heap wholesale (OOM stops the order loop).
+func TestClient_OversizedResponseRejected(t *testing.T) {
+	srv := tokenAndThen(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"result":"` + strings.Repeat("x", 2<<20) + `"}`))
+	})
+	defer srv.Close()
+
+	_, err := newClient(srv).Accounts(context.Background())
+	if err == nil {
+		t.Fatal("expected oversized response to be rejected, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("error %q should say the body exceeds the cap", err)
+	}
 }
 
 func TestClient_Accounts(t *testing.T) {
