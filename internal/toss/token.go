@@ -33,6 +33,15 @@ const defaultLeeway = 5 * time.Minute
 // attempts — stays inside one holdoff and is coalesced to a single issuance.
 const defaultHoldoff = backoffBase
 
+// defaultRefreshBudget bounds how long a caller waits for a refresh while it
+// still holds a stale-but-valid token. A healthy refresh completes well within
+// it and the caller gets the fresh token; a slow or hung AUTH endpoint hits the
+// budget and the caller is served the stale (still server-accepted) token
+// instead of blocking until the HTTP timeout — the availability guarantee of
+// the stale fallback (L-3) would be defeated if callers blacked out whenever
+// the token endpoint merely slowed down.
+const defaultRefreshBudget = 3 * time.Second
+
 // issueFunc mints a fresh access token, returning the token string and its
 // lifetime. It is the single point of token issuance for a client.
 type issueFunc func(ctx context.Context) (token string, ttl time.Duration, err error)
@@ -59,26 +68,32 @@ type tokenManager struct {
 	expiresAt time.Time // hard expiry: the server stops accepting the token
 	refreshAt time.Time // soft expiry: proactively refresh once now >= refreshAt
 
-	// Negative cache for terminal issuance failures.
-	lastErr   error
-	holdUntil time.Time
+	// Failure state. lastErr + holdUntil pace retries manager-wide (any
+	// failure). terminalErr additionally marks a non-transient failure so the
+	// stale fallback fails fast instead of masking a credential problem until
+	// hard expiry; it is cleared on the next successful issuance.
+	lastErr     error
+	terminalErr error
+	holdUntil   time.Time
 
 	inflight *issuance
 
-	leeway  time.Duration
-	holdoff time.Duration
-	now     func() time.Time
-	issue   issueFunc
-	logger  *slog.Logger
+	leeway        time.Duration
+	holdoff       time.Duration
+	refreshBudget time.Duration
+	now           func() time.Time
+	issue         issueFunc
+	logger        *slog.Logger
 }
 
 func newTokenManager(issue issueFunc) *tokenManager {
 	return &tokenManager{
-		leeway:  defaultLeeway,
-		holdoff: defaultHoldoff,
-		now:     time.Now,
-		issue:   issue,
-		logger:  slog.Default(),
+		leeway:        defaultLeeway,
+		holdoff:       defaultHoldoff,
+		refreshBudget: defaultRefreshBudget,
+		now:           time.Now,
+		issue:         issue,
+		logger:        slog.Default(),
 	}
 }
 
@@ -93,59 +108,49 @@ func (m *tokenManager) setLogger(l *slog.Logger) {
 	m.logger = l
 }
 
-// get returns a valid token, minting one if the cache is empty or near expiry.
+// get returns a valid token. It has three regimes, by cache state:
 //
-// Refresh is single-flight: the first eligible caller starts one issuance
-// goroutine and every caller — starter included — waits on it via select, so a
-// caller whose context expires abandons the wait instead of being wedged behind
-// an uninterruptible lock. The flight runs on a context detached from any single
-// caller (its outcome is shared state), bounded by the HTTP client timeout.
+//   - Fresh: served directly, no refresh.
+//   - Stale-but-valid (past refreshAt, before hard expiry): the token is still
+//     server-accepted, so the caller is never blacked out. A paced refresh is
+//     triggered and the caller waits at most refreshBudget for it — getting the
+//     fresh token if the endpoint is healthy, or the stale token if it is slow
+//     or fails transiently. A terminal (credential) refresh failure fails fast
+//     rather than being masked.
+//   - No usable token (empty or hard-expired): the caller must block on a
+//     refresh (or fail); there is nothing safe to serve meanwhile.
 //
-// Two gates guard the "start a NEW flight" path (joining an in-flight refresh is
-// never gated — that shares a result, it is not a fresh mint):
-//   - the failure holdoff, which paces issuance manager-wide (defect ②);
-//   - a cancellation check, so an already-dead caller never starts a detached
-//     flight that could invalidate a live request's token (defect ①).
+// Refresh is single-flight and every wait is select-based, so a caller whose
+// context expires abandons the wait instead of wedging behind an uninterruptible
+// lock. The flight runs on a context detached from any single caller (its
+// outcome is shared), bounded by the HTTP client timeout.
 func (m *tokenManager) get(ctx context.Context) (string, error) {
 	m.mu.Lock()
+
 	if m.valid() {
 		token := m.token
 		m.mu.Unlock()
 		return token, nil
 	}
 
+	if m.stale() {
+		return m.getStaleLocked(ctx)
+	}
+
+	// No usable token: block on a refresh, gated so a fast-failing endpoint is
+	// paced (defect ②) and a dead caller never starts a detached flight
+	// (defect ①). Joining an in-flight refresh is never gated — that shares a
+	// result, it is not a fresh mint.
 	if m.inflight == nil {
-		// (a) Failure holdoff — the manager-wide pacing gate. For the holdoff
-		// window after any failure, do not start a new issuance:
-		//   - serve the stale-but-valid token if the server still accepts it
-		//     (the stale fallback returns failures as successes and so escapes
-		//     acquireToken's backoff — only this gate can pace it), else
-		//   - return the cached error. A caller that has genuinely backed off
-		//     crosses holdUntil and reaches a real attempt below; a no-wait
-		//     burst stays inside the window and is coalesced to one issuance.
 		if m.lastErr != nil && m.now().Before(m.holdUntil) {
-			if m.stale() {
-				token := m.token
-				m.mu.Unlock()
-				return token, nil
-			}
 			err := m.lastErr
 			m.mu.Unlock()
 			return "", err
 		}
-
-		// (b) Cancellation gate — only on the new-flight path. startFlightLocked
-		// strips cancellation (context.WithoutCancel), so a caller whose context
-		// is already done must not start a flight: the detached issuance would
-		// outlive this corpse and could invalidate a token another live request
-		// is using (the ADR-0001 herd, triggered by a dead caller). A valid or
-		// stale token was already served above without minting; only a fresh
-		// mint is refused here.
 		if err := ctx.Err(); err != nil {
 			m.mu.Unlock()
 			return "", err
 		}
-
 		m.startFlightLocked(ctx)
 	}
 	fl := m.inflight
@@ -156,22 +161,91 @@ func (m *tokenManager) get(ctx context.Context) (string, error) {
 		return "", ctx.Err()
 	case <-fl.done:
 	}
+	if fl.err != nil {
+		return "", fl.err
+	}
+	return fl.token, nil
+}
+
+// getStaleLocked serves a stale-but-valid token without ever blacking the
+// caller out. Caller holds m.mu; this function releases it. See get for the
+// regime description.
+func (m *tokenManager) getStaleLocked(ctx context.Context) (string, error) {
+	// Fail fast on a known terminal failure: masking revoked/rotated
+	// credentials behind the stale token until hard expiry would let the bot
+	// keep trading on broken auth (review P2). A paced refresh is still kicked
+	// below via the earlier maybeStart so the state can recover if credentials
+	// are fixed.
+	m.maybeStartRefreshLocked(ctx)
+	if m.terminalErr != nil {
+		err := m.terminalErr
+		m.mu.Unlock()
+		return "", err
+	}
+	fl := m.inflight
+	token := m.token
+	budget := m.refreshBudget
+	m.mu.Unlock()
+
+	if fl == nil {
+		// No refresh running (paced off between attempts, or a dead caller must
+		// not start one): serve the stale token immediately.
+		return token, nil
+	}
+
+	// A refresh is in flight. Wait at most the budget: a healthy endpoint
+	// completes well within it (caller gets the fresh token); a slow/hung one
+	// is not allowed to block the caller — serve the stale token and let the
+	// detached refresh keep running.
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-timer.C:
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.stale() {
+			return m.token, nil
+		}
+		if fl.err != nil {
+			return "", fl.err
+		}
+		return fl.token, nil
+	case <-fl.done:
+	}
+
 	if fl.err == nil {
 		return fl.token, nil
 	}
-
-	// Stale-but-valid fallback: the refresh failed inside the leeway window,
-	// but the previous token has not hard-expired — the server still accepts
-	// it, so serving it beats blacking out every API call for up to the
-	// leeway duration. Past hard expiry the failure propagates.
+	if !isTransient(fl.err) {
+		// Terminal failure observed on completion: fail fast (do not mask).
+		return "", fl.err
+	}
+	// Transient failure: the stale token still works, so serve it rather than
+	// black out. Past hard expiry stale() is false and the error propagates.
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.stale() {
-		m.logger.Warn("toss: token refresh failed; serving cached token until hard expiry",
-			"expires_at", m.expiresAt, "err", fl.err.Error())
 		return m.token, nil
 	}
 	return "", fl.err
+}
+
+// maybeStartRefreshLocked starts a paced, detached refresh when warranted: none
+// already in flight, past the failure holdoff, and the caller's context is live
+// (a dead caller must not start a fresh mint — defect ①). Caller holds m.mu.
+func (m *tokenManager) maybeStartRefreshLocked(ctx context.Context) {
+	if m.inflight != nil {
+		return // a refresh is already running; do not pile on
+	}
+	if m.lastErr != nil && m.now().Before(m.holdUntil) {
+		return // paced: within the holdoff after a recent failure (defect ②)
+	}
+	if ctx.Err() != nil {
+		return // dead caller: do not start a detached flight (defect ①)
+	}
+	m.startFlightLocked(ctx)
 }
 
 // startFlightLocked begins a new issuance flight. Caller must hold m.mu.
@@ -215,11 +289,20 @@ func (m *tokenManager) finishLocked(fl *issuance) {
 	}
 	if fl.err != nil {
 		// Every failure — transient or terminal — arms the holdoff: it is the
-		// manager-wide pacing gate (see get's gate (a)). Within the window the
-		// stale token or the cached error is served without a new issuance; a
-		// backed-off caller crosses the window and reaches a real retry.
+		// manager-wide pacing gate. Within the window the stale token or the
+		// cached error is served without a new issuance; a backed-off caller
+		// crosses the window and reaches a real retry. A terminal failure is
+		// also recorded so the stale fallback fails fast (review P2) instead of
+		// masking a credential problem.
 		m.lastErr = fl.err
 		m.holdUntil = m.now().Add(m.holdoff)
+		if !isTransient(fl.err) {
+			m.terminalErr = fl.err
+		}
+		if m.stale() {
+			m.logger.Warn("toss: token refresh failed; cached token still valid until hard expiry",
+				"expires_at", m.expiresAt, "terminal", !isTransient(fl.err), "err", fl.err.Error())
+		}
 		return
 	}
 	// Clamp the effective leeway to half the ttl: a ttl at or below the
@@ -234,6 +317,7 @@ func (m *tokenManager) finishLocked(fl *issuance) {
 	m.expiresAt = now.Add(fl.ttl)
 	m.refreshAt = m.expiresAt.Add(-leeway)
 	m.lastErr = nil
+	m.terminalErr = nil
 	m.holdUntil = time.Time{}
 }
 

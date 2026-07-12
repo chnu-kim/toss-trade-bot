@@ -443,6 +443,85 @@ func TestTokenManager_StaleWindowTransientFailuresArePaced(t *testing.T) {
 	}
 }
 
+// TestTokenManager_SlowRefreshServesStalePromptly is the adversarial-review
+// high: a stale-but-valid token must be served promptly even when the AUTH
+// endpoint is merely slow. Blocking the caller on a hung refresh until the HTTP
+// timeout would black out API calls during the very window L-3 exists to keep
+// available.
+func TestTokenManager_SlowRefreshServesStalePromptly(t *testing.T) {
+	block := make(chan struct{})
+	var calls int32
+	m := newTokenManager(func(ctx context.Context) (string, time.Duration, error) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			return "tok-1", time.Hour, nil // seed
+		}
+		<-block // a degraded AUTH endpoint hangs
+		return "tok-2", time.Hour, nil
+	})
+	clock := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	m.now = clock.now
+	m.refreshBudget = 20 * time.Millisecond // keep the test snappy
+
+	if _, err := m.get(context.Background()); err != nil {
+		t.Fatalf("seed get: %v", err)
+	}
+	clock.advance(time.Hour - 2*time.Minute) // stale-but-valid window
+
+	done := make(chan string, 1)
+	go func() {
+		tok, _ := m.get(context.Background())
+		done <- tok
+	}()
+	select {
+	case tok := <-done:
+		if tok != "tok-1" {
+			t.Fatalf("stale get returned %q, want stale tok-1 (must not block on the hung refresh)", tok)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("get blocked on a hung refresh instead of serving the stale token promptly (L-3 availability)")
+	}
+	close(block) // let the detached refresh finish so it does not leak
+}
+
+// TestTokenManager_TerminalRefreshFailureFailsFastInStaleWindow is the
+// review's P2: a refresh that fails with a terminal (non-transient) auth error
+// — revoked/rotated credentials, malformed response — must fail fast rather
+// than be masked by the stale token until hard expiry.
+func TestTokenManager_TerminalRefreshFailureFailsFastInStaleWindow(t *testing.T) {
+	var calls int32
+	m := newTokenManager(func(ctx context.Context) (string, time.Duration, error) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			return "tok-1", time.Hour, nil
+		}
+		return "", 0, errors.New("toss: token issuance failed (401): invalid_client")
+	})
+	clock := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	m.now = clock.now
+
+	if _, err := m.get(context.Background()); err != nil {
+		t.Fatalf("seed get: %v", err)
+	}
+	clock.advance(time.Hour - 2*time.Minute) // stale window
+
+	// The terminal failure must surface (the first stale get that observes the
+	// completed refresh, or the next one via the sticky terminal state), not be
+	// masked indefinitely.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		_, err := m.get(context.Background())
+		if err != nil {
+			if !strings.Contains(err.Error(), "invalid_client") {
+				t.Fatalf("error = %v, want the terminal credential error surfaced", err)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("terminal refresh failure stayed masked by the stale token; it must fail fast (auth fail-fast contract)")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestTokenManager_InvalidatedTokenIsNeverServedAsFallback(t *testing.T) {
 	var calls int32
 	m := newTokenManager(func(ctx context.Context) (string, time.Duration, error) {
