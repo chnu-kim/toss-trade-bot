@@ -98,14 +98,23 @@ func TestVerdictGateWorkflow_NoDirectInterpolationOfUntrustedGitHubContext(t *te
 // back to exactly that SHA, `--match-head-commit` at merge time would
 // succeed — merging content that was never actually reviewed as reviewed.
 //
+// Issue #54 update: these two revalidations are no longer the load-bearing
+// defense for diff↔SHA correspondence — an A→B→A reset re-passes a
+// fetch-then-check sequence, so the real fix is fetching the diff/files
+// from an immutable compare source keyed to the recorded SHAs (see
+// TestVerdictGateWorkflow_DiffFetchUsesImmutableCompareKeyedToRecordedSha
+// and the A→B→A reproduction in workflow_diff_fetch_test.go). The two
+// revalidations remain as defense in depth and early-exit economy (don't
+// spend both legs' API budgets, or publish a check-run, for a SHA that is
+// already superseded) and must still not be silently deleted.
+//
 // This does not verify runtime correctness (that would need a live PR and a
-// real race) — it is a structural lint ensuring the fix (re-fetch
-// headRefOid and fail closed on mismatch) is present at both required
-// checkpoints and cannot be silently deleted later: once right after the
-// diff/files snapshot in "resolve" (before that data is uploaded as an
-// artifact for the leg jobs), and once more immediately before "finalize"
-// publishes the check-run (since the leg jobs in between can take long
-// enough for the head to move again).
+// real race) — it is a structural lint ensuring the recheck (re-fetch
+// headRefOid and fail closed on mismatch) is present at both checkpoints:
+// once right after the diff/files snapshot in "resolve" (before that data
+// is uploaded as an artifact for the leg jobs), and once more immediately
+// before "finalize" publishes the check-run (since the leg jobs in between
+// can take long enough for the head to move again).
 func TestVerdictGateWorkflow_RevalidatesHeadShaBeforeArtifactUploadAndCheckRunPublish(t *testing.T) {
 	const workflowPath = "../../.github/workflows/verdict-gate.yml"
 	data, err := os.ReadFile(workflowPath)
@@ -126,5 +135,136 @@ func TestVerdictGateWorkflow_RevalidatesHeadShaBeforeArtifactUploadAndCheckRunPu
 	mismatchCheck := `if [ "$current_head" != "$HEAD_SHA" ]; then`
 	if strings.Count(content, mismatchCheck) < 2 {
 		t.Errorf("the head-SHA revalidation pattern is present but not consistently paired with %q (fail-closed on mismatch) at least twice in %s", mismatchCheck, workflowPath)
+	}
+}
+
+// TestVerdictGateWorkflow_ClaudeLegPassesJSONSchemaValueInline is the
+// structural lint for issue #54 ①: the claude CLI's --json-schema flag
+// takes the schema *value* (inline JSON), not a file path. Passing a path
+// fails argument parsing before auth with "--json-schema is not valid
+// JSON" (empirically reproduced against the real CLI: the path form exits
+// 1 at parse time; the inline form reaches the API stage). With the path
+// form, the critical-path N-of-2 Claude leg could never produce an outcome
+// once Phase B activates — the gate would fail its own regime for every
+// risk:critical / unmapped-path PR (ADR-0008 points 3–5).
+//
+// The codex leg is deliberately asymmetric: the codex CLI's
+// --output-schema flag DOES take a file path and must stay that way.
+func TestVerdictGateWorkflow_ClaudeLegPassesJSONSchemaValueInline(t *testing.T) {
+	const workflowPath = "../../.github/workflows/verdict-gate.yml"
+	data, err := os.ReadFile(workflowPath)
+	if err != nil {
+		t.Fatalf("reading %s: %v", workflowPath, err)
+	}
+	content := string(data)
+
+	const pathForm = `--json-schema "$WORKDIR/schema.json"`
+	if strings.Contains(content, pathForm) {
+		t.Errorf("%s passes a file PATH to the claude CLI's --json-schema (%s) — the flag takes the schema value (inline JSON) and a path fails parsing pre-auth, so the Claude leg can never produce an outcome (issue #54 ①)", workflowPath, pathForm)
+	}
+	const inlineForm = `--json-schema "$(cat "$WORKDIR/schema.json")"`
+	if got := strings.Count(content, inlineForm); got != 1 {
+		t.Errorf("want exactly 1 occurrence of the inline schema-value form %s in %s (the Claude leg invocation), got %d", inlineForm, workflowPath, got)
+	}
+	const codexForm = `--output-schema "$WORKDIR/schema.json"`
+	if got := strings.Count(content, codexForm); got != 1 {
+		t.Errorf("want exactly 1 occurrence of %s in %s — the codex CLI's --output-schema is a *path* argument (separate CLI, separate contract) and must not be \"fixed\" to match the claude flag; got %d", codexForm, workflowPath, got)
+	}
+}
+
+// TestVerdictGateWorkflow_DiffFetchUsesImmutableCompareKeyedToRecordedSha is
+// the structural lint for issue #54 ②: PR-number-keyed diff/file reads
+// (`gh pr diff`, the pulls/{n}/files endpoint) return the PR's CURRENT head
+// at request time. A fetch-then-check sequence closes a simple A→B push but
+// not A→B→A — the head can be B during the fetch window and back at A by
+// the time the current_head==HEAD_SHA recheck runs, so the recheck passes
+// while the fetched content describes B. The fix this test pins: fetch both
+// the diff and the changed-file list from the compare API keyed to the
+// immutable commit SHAs themselves ($base_sha...$HEAD_SHA), whose response
+// is a pure function of the two SHAs — no branch movement at any moment can
+// change what it returns. The runtime behavior (fetched content follows
+// HEAD_SHA, not the moving branch) is separately reproduced in
+// workflow_diff_fetch_test.go by executing the real step body against a
+// fake gh that simulates the A→B→A race.
+func TestVerdictGateWorkflow_DiffFetchUsesImmutableCompareKeyedToRecordedSha(t *testing.T) {
+	const workflowPath = "../../.github/workflows/verdict-gate.yml"
+	data, err := os.ReadFile(workflowPath)
+	if err != nil {
+		t.Fatalf("reading %s: %v", workflowPath, err)
+	}
+	content := string(data)
+
+	// (a) No PR-number-keyed mutable diff/file reads on any non-comment
+	// line. (Comments may mention them when documenting this very fix.)
+	forbidden := []string{"gh pr diff", "/pulls/$PR_NUMBER/files"}
+	for i, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		for _, pattern := range forbidden {
+			if strings.Contains(line, pattern) {
+				t.Errorf("%s:%d: PR-number-keyed mutable read %q — this reads the PR's *current* head, not the recorded head SHA, and reopens the A→B→A fetch-window race (issue #54 ②). Fetch from the immutable compare source instead. Line: %s",
+					workflowPath, i+1, pattern, trimmed)
+			}
+		}
+	}
+
+	// (b) The immutable compare source, keyed to the recorded SHAs, must be
+	// what both the diff fetch and the file-list fetch use.
+	const compareKey = `"repos/$REPO/compare/$base_sha...$HEAD_SHA"`
+	if got := strings.Count(content, compareKey); got < 2 {
+		t.Errorf("want at least 2 occurrences of the SHA-keyed immutable compare source %s in %s (diff fetch + changed-file-list fetch), got %d", compareKey, workflowPath, got)
+	}
+	if !strings.Contains(content, "Accept: application/vnd.github.diff") {
+		t.Errorf("%s must fetch the raw diff via the compare endpoint's diff media type (Accept: application/vnd.github.diff) — otherwise pr.diff is not coming from the immutable SHA-keyed source", workflowPath)
+	}
+	// (c) The compare API caps the files array at 300 entries (first page
+	// only; no SHA-immutable paginated alternative exists). A silently
+	// truncated list could hide a critical path from risk classification
+	// (ADR-0008 point 5), so the step must fail closed at the cap.
+	if !strings.Contains(content, `-ge 300 ]`) {
+		t.Errorf("%s must fail closed when the compare file list reaches the 300-entry platform cap (possible truncation ⇒ possible unclassified critical path) — the -ge 300 guard is missing", workflowPath)
+	}
+}
+
+// TestVerdictGateWorkflow_DiffFetchValidatesBaseRefIsDefaultBranch is the
+// structural lint for issue #54 additional ① (adversarial panel): fix ②'s
+// compare source ($base_sha...$HEAD_SHA) introduced base_ref as a new
+// mutable input to the risk-classification boundary — the changed-paths a
+// three-dot compare produces are only "this PR's contribution vs main" when
+// base_ref is the default branch. ADR-0008 point 5 makes classification the
+// security boundary (codex-single vs N-of-2) and mandates "when in doubt,
+// critical", so an unvalidated base_ref reaching that boundary must be
+// rejected. The step must resolve the default branch from the API (not
+// hardcode "main") and fail closed on any mismatch before the compare
+// fetch. This guard also subsumes the codex:review P2 base-ref-resolution
+// concern (an unexpected base_ref with "#"/"%" is rejected here before it
+// can silently resolve to a wrong ref at the commits endpoint).
+func TestVerdictGateWorkflow_DiffFetchValidatesBaseRefIsDefaultBranch(t *testing.T) {
+	const workflowPath = "../../.github/workflows/verdict-gate.yml"
+	data, err := os.ReadFile(workflowPath)
+	if err != nil {
+		t.Fatalf("reading %s: %v", workflowPath, err)
+	}
+	content := string(data)
+
+	// Default branch must be read from the API, not hardcoded.
+	const defaultBranchRead = `gh api "repos/$REPO" --jq '.default_branch'`
+	if !strings.Contains(content, defaultBranchRead) {
+		t.Errorf("%s must resolve the repo default branch from the API (%s) to validate base_ref against it (issue #54 ①) — a hardcoded 'main' would silently pass a mis-based compare on a repo whose default branch is renamed", workflowPath, defaultBranchRead)
+	}
+	// The equality guard + fail-closed must be present.
+	const mismatchGuard = `if [ "$BASE_REF" != "$default_branch" ]; then`
+	if !strings.Contains(content, mismatchGuard) {
+		t.Errorf("%s must fail closed when base_ref != default_branch (%s is missing) — an unexpected base_ref feeds an unvalidated changed-paths set into the ADR-0008 point 5 risk-classification boundary", workflowPath, mismatchGuard)
+	}
+	// The guard must precede the compare fetch it protects (ordering: a
+	// guard after the base_sha resolution would not stop the mis-based
+	// compare from being built).
+	guardIdx := strings.Index(content, mismatchGuard)
+	baseShaIdx := strings.Index(content, `base_sha=$(gh api "repos/$REPO/commits/$BASE_REF"`)
+	if guardIdx < 0 || baseShaIdx < 0 || guardIdx > baseShaIdx {
+		t.Errorf("the base_ref==default_branch guard must appear before base_sha resolution in %s (guard idx %d, base_sha idx %d)", workflowPath, guardIdx, baseShaIdx)
 	}
 }

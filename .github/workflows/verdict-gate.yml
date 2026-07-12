@@ -212,8 +212,8 @@ jobs:
           # — and pass it straight through as a boolean (see
           # gate.PRContext.IsCrossRepository).
           gh pr view "$PR_NUMBER" \
-            --json headRepositoryOwner,headRepository,isCrossRepository,author,headRefOid,title,body,commits \
-            --jq '{head_repo: (.headRepositoryOwner.login + "/" + .headRepository.name), is_cross_repository: .isCrossRepository, author: .author.login, head_sha: .headRefOid, title: .title, body: (.body // ""), commit_messages: [.commits[].messageHeadline]}' \
+            --json headRepositoryOwner,headRepository,isCrossRepository,author,headRefOid,baseRefName,title,body,commits \
+            --jq '{head_repo: (.headRepositoryOwner.login + "/" + .headRepository.name), is_cross_repository: .isCrossRepository, author: .author.login, head_sha: .headRefOid, base_ref: .baseRefName, title: .title, body: (.body // ""), commit_messages: [.commits[].messageHeadline]}' \
             > pr-meta.json
           cat pr-meta.json
           head_sha=$(jq -r '.head_sha' pr-meta.json)
@@ -222,6 +222,16 @@ jobs:
             exit 1
           fi
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          # base_ref keys the immutable compare diff fetch below (issue
+          # #54 ②) — resolve it here, next to head_sha, and fail closed if
+          # absent rather than letting the diff step interpolate an empty
+          # compare URL.
+          base_ref=$(jq -r '.base_ref' pr-meta.json)
+          if [ -z "$base_ref" ] || [ "$base_ref" = "null" ]; then
+            echo "::error::could not resolve base ref name for PR #$PR_NUMBER (needed to key the immutable compare diff fetch — issue #54 ②)"
+            exit 1
+          fi
+          echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
 
       - name: Eligibility guard (ADR-0011 point 4(f) — AND, fail-closed)
         id: eligibility
@@ -245,17 +255,111 @@ jobs:
               ;;
           esac
 
-      - name: Fetch diff + changed paths (data only) — eligible PRs only
+      - name: Fetch diff + changed paths (data only, immutable compare keyed to the recorded head SHA) — eligible PRs only
         if: steps.eligibility.outputs.eligible == 'true'
         id: diff
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           HEAD_SHA: ${{ steps.meta.outputs.head_sha }}
+          BASE_REF: ${{ steps.meta.outputs.base_ref }}
         run: |
           set -euo pipefail
-          gh pr diff "$PR_NUMBER" --patch > pr.diff
-          # codex:review [P1] finding: a renamed file's "files" entry
+          # issue #54 ② (A→B→A head race — supersedes #52's
+          # codex:adversarial-review fetch-then-check fix, which this step
+          # previously relied on): PR-number-keyed reads (a PR diff or
+          # file-list request addressed by PR number) return the PR's
+          # CURRENT head at request time, not the head_sha recorded by the
+          # "Fetch PR metadata" step. A post-fetch current_head==HEAD_SHA
+          # recheck closes a simple A→B push but not A→B→A: a head moved
+          # to B during the fetch window and reset back to A before the
+          # recheck passes the recheck, and finalize would publish a
+          # verdict for A that was actually produced from B's diff — which
+          # SHA-sticky logic and merge-time --match-head-commit (both
+          # keyed to A) then honor. Fix: fetch the diff and the
+          # changed-file list from the compare API keyed to the immutable
+          # commit SHAs themselves. A compare response is a pure function
+          # of the two SHAs — no branch movement at any moment can change
+          # what it returns — so the reviewed content and the SHA the
+          # verdict is later published against cannot diverge. (Three-dot
+          # compare = merge-base diff, the same semantics as a PR diff —
+          # empirically byte-identical to a PR-number diff fetch for the
+          # same base tip + head SHA. base_sha below is resolved from the
+          # mutable base ref, but any base-tip value yields the PR's full
+          # cumulative content relative to a base-history point, so base
+          # movement affects only diff context, never the reviewed-content
+          # ↔ HEAD_SHA correspondence; repeated compare reads below are
+          # mutually consistent for the same reason. Side effect: pr.diff
+          # switches from per-commit patch format to one cumulative
+          # unified diff — exactly the "전체 누적 diff" ADR-0011 point 4
+          # (e)(iv) requires the legs to review, and
+          # gate.ParseUnifiedDiff keys only on diff/---/+++/@@ lines,
+          # which both formats share.)
+          # Base ref must be the repo default branch (issue #54 additional
+          # ①, adversarial panel): fix ②'s compare source introduced a new
+          # mutable input, base_ref, into the risk-classification boundary
+          # (the changed-paths below are classify's ONLY input, and
+          # ADR-0008 point 5 makes that classification the security
+          # boundary between codex-single and N-of-2). A three-dot compare
+          # is a merge-base diff, so an unexpected base_ref would yield a
+          # changed-paths set that is not "this PR's contribution vs main"
+          # — an unvalidated input to a security boundary, which ADR-0008
+          # point 5's "when in doubt, critical" philosophy forbids. Resolve
+          # the default branch (metadata read — within the post-narrowing
+          # PAT spec) and fail closed on any mismatch. This guard also
+          # closes the codex:review P2 (base-ref resolution — see below):
+          # an unexpected base_ref is rejected here before it reaches the
+          # commits endpoint at all.
+          default_branch=$(gh api "repos/$REPO" --jq '.default_branch')
+          if [ -z "$default_branch" ] || [ "$default_branch" = "null" ]; then
+            echo "::error::could not resolve the repo default branch — failing closed."
+            exit 1
+          fi
+          if [ "$BASE_REF" != "$default_branch" ]; then
+            echo "::error::PR base ref '$BASE_REF' is not the repo default branch '$default_branch'. The base...head compare that risk classification derives from must be measured against the default branch. Failing closed (no verdict = merge blocked)."
+            exit 1
+          fi
+          # Base-tip resolution notes (codex:review P2 on #54 — REVISED:
+          # my first response held this as safe on a "/" test and was
+          # WRONG). (1) The commits endpoint does resolve "/"-containing
+          # refs unencoded, but "#" and "%XX" do NOT round-trip: `gh api`
+          # truncates everything after a literal "#" as a URL fragment
+          # (verified live: `.../commits/foo#bar` requests `.../commits/
+          # foo`) and passes "%XX" through to be percent-decoded server-
+          # side — both are valid git branch chars, so an unencoded
+          # base_ref with either could silently resolve to a DIFFERENT ref
+          # (a valid-but-wrong SHA the -z/null guard cannot catch: a
+          # silent fail-OPEN, not the fail-closed I claimed). This is now
+          # moot: the default-branch equality guard above rejects any
+          # base_ref != default_branch first, and the default branch
+          # (main) contains no "#"/"%", so the value reaching the commits
+          # endpoint below is always the literal, round-tripping default
+          # branch name. (2) `gh pr view`'s baseRefOid was rejected as the
+          # key — it is a stale creation-time snapshot, not the live base
+          # tip (verified live: a months-old open PR's baseRefOid differs
+          # from its base branch's current tip), which would pollute the
+          # three-dot compare with already-merged base commits.
+          base_sha=$(gh api "repos/$REPO/commits/$BASE_REF" --jq '.sha')
+          if [ -z "$base_sha" ] || [ "$base_sha" = "null" ]; then
+            echo "::error::could not resolve base ref '$BASE_REF' to a commit SHA — failing closed."
+            exit 1
+          fi
+          gh api -H "Accept: application/vnd.github.diff" \
+            "repos/$REPO/compare/$base_sha...$HEAD_SHA" > pr.diff
+          # Fail closed on file-list truncation: the compare API caps the
+          # files array at 300 entries (first page only — there is no
+          # SHA-immutable paginated alternative; the PR-number files
+          # endpoint paginates further but is exactly the mutable read
+          # this step exists to avoid). A silently truncated list could
+          # hide a critical path from risk classification (ADR-0008 point
+          # 5), so a PR at/above the cap gets no verdict at all instead.
+          files_count=$(gh api "repos/$REPO/compare/$base_sha...$HEAD_SHA" --jq '.files | length')
+          if [ "$files_count" -ge 300 ]; then
+            echo "::error::compare for $HEAD_SHA reports $files_count changed files — at/above the compare API's 300-file cap, so the list may be truncated. Failing closed rather than risk-classifying a possibly partial path list."
+            exit 1
+          fi
+          # codex:review [P1] finding (#52): a renamed file's entry
           # carries the NEW path in `filename` and the OLD path in
           # `previous_filename` (only present for renames). Recording only
           # `filename` would let a rename that moves a critical path (e.g.
@@ -264,30 +368,23 @@ jobs:
           # unmapped-defaults-critical rule was designed to catch exactly
           # this kind of path-based evasion. Include both paths so the
           # classifier sees the file was ever at a critical location.
-          gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)' > changed-paths.txt
+          # (The compare files array carries the same filename/
+          # previous_filename fields as the PR-number files endpoint —
+          # empirically identical output for the same base tip + head.)
+          gh api "repos/$REPO/compare/$base_sha...$HEAD_SHA" --jq '.files[] | .filename, (.previous_filename // empty)' > changed-paths.txt
           if [ ! -s changed-paths.txt ]; then
-            echo "::error::PR #$PR_NUMBER reports zero changed files — failing closed (gate.ClassifyChangedPaths treats an empty path list as critical, but an empty *file list* for a real PR most likely means the files API call failed silently)."
+            echo "::error::PR #$PR_NUMBER (head $HEAD_SHA) reports zero changed files — failing closed (gate.ClassifyChangedPaths treats an empty path list as critical, but an empty *file list* for a real PR most likely means the compare API call failed silently)."
             exit 1
           fi
-          # codex:adversarial-review [high] finding: `gh pr diff`/the
-          # `pulls/{n}/files` endpoint both read the PR's CURRENT head, not
-          # the exact head_sha this run recorded in the "Fetch PR metadata"
-          # step above — if the PR's head moves between those two steps (an
-          # eligible same-repo bot branch has push/force-push capability),
-          # the diff/files just fetched reflect a DIFFERENT commit than
-          # $HEAD_SHA, yet finalize later publishes the verdict-check-run
-          # against $HEAD_SHA. SHA-sticky logic would then treat that
-          # mis-associated check-run as authoritative forever for
-          # $HEAD_SHA, and if the branch is later reset back to exactly
-          # that SHA, `--match-head-commit` at merge time would succeed —
-          # merging content that was never actually reviewed as-is. Re-fetch
-          # the head right after the diff/files snapshot and fail closed on
-          # any mismatch (repeated again immediately before the check-run
-          # publish in "finalize", since the leg jobs in between can take
-          # long enough for the head to move again).
+          # Defense in depth + leg-API-spend economy — since the
+          # immutable-compare fix above, NOT load-bearing for diff↔SHA
+          # correspondence: if the PR's head has already moved on, this
+          # run's verdict would target a superseded SHA — bail out early
+          # instead of spending both legs' API budgets on it. finalize
+          # re-checks once more immediately before the check-run publish.
           current_head=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid')
           if [ "$current_head" != "$HEAD_SHA" ]; then
-            echo "::error::PR #$PR_NUMBER's head moved from $HEAD_SHA to $current_head between metadata fetch and diff fetch — the diff/files just fetched do not correspond to the recorded head SHA. Failing closed rather than reviewing content for a different commit than the one this run's verdict-check would be published against."
+            echo "::error::PR #$PR_NUMBER's head moved from $HEAD_SHA to $current_head since this run's metadata fetch — this run's verdict would target a superseded SHA. Failing closed early; a fresh dispatch against the new head will review it."
             exit 1
           fi
 
@@ -1020,11 +1117,19 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.CLAUDE_VERDICT_API_KEY }}
         run: |
           set -euo pipefail
+          # issue #54 ①: the claude CLI's --json-schema takes the schema
+          # *value* (inline JSON), not a file path — a path fails argument
+          # parsing before auth with "--json-schema is not valid JSON"
+          # (empirically reproduced: path form exits 1 at parse time,
+          # inline form reaches the API stage), which would leave this
+          # critical-path N-of-2 leg unable to produce any outcome. The
+          # codex leg's --output-schema is a different CLI whose flag DOES
+          # take a path — do not "fix" it to match.
           claude --bare \
             --print \
             --allowedTools "" \
             --output-format json \
-            --json-schema "$WORKDIR/schema.json" \
+            --json-schema "$(cat "$WORKDIR/schema.json")" \
             --add-dir "$WORKDIR" \
             < "$WORKDIR/prompt.md" \
             > "$WORKDIR/claude-raw.json"
@@ -1180,18 +1285,21 @@ jobs:
           OUTCOME: ${{ steps.combine.outputs.outcome }}
         run: |
           set -euo pipefail
-          # codex:adversarial-review [high] finding: the "resolve" job's
-          # diff-fetch step already re-validates the head once, but the leg
-          # jobs in between (codex/claude API calls) can take long enough
-          # for the PR's head to move again before this exact moment — the
-          # moment a check-run actually gets attached to $HEAD_SHA. A stale
-          # check-run is exactly what SHA-sticky logic would later treat as
-          # an authoritative, reusable record for that SHA, so re-validate
-          # immediately before publishing rather than trusting a
-          # potentially-minutes-old snapshot.
+          # codex:adversarial-review [high] finding (#52), role narrowed by
+          # the #54 immutable-compare fix: the diff this verdict was
+          # produced from is now fetched keyed to $HEAD_SHA itself
+          # (resolve job), so a verdict here can no longer describe content
+          # other than $HEAD_SHA's — mis-association is structurally
+          # impossible, and this recheck is defense in depth, not the
+          # correctness guarantee. It still pays for itself: the leg jobs
+          # (codex/claude API calls) can take long enough for the PR's head
+          # to move before this exact moment, and publishing a check-run
+          # for a SHA that is no longer the PR head would only record a
+          # verdict for a superseded commit — bail out and let a fresh
+          # dispatch review the new head instead.
           current_head=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid')
           if [ "$current_head" != "$HEAD_SHA" ]; then
-            echo "::error::PR #$PR_NUMBER's head moved from $HEAD_SHA to $current_head since this run started reviewing it — refusing to publish a verdict-gate check-run for a SHA that no longer reflects what was actually reviewed. Failing closed; a fresh dispatch against the new head will review it correctly."
+            echo "::error::PR #$PR_NUMBER's head moved from $HEAD_SHA to $current_head since this run started reviewing it — refusing to publish a verdict-gate check-run for a SHA that is no longer the PR's head (the verdict, produced from that SHA's immutable diff, would only record a superseded commit). Failing closed; a fresh dispatch against the new head will review it."
             exit 1
           fi
           # codex:review [P1] finding, confirmed against GitHub's own docs
