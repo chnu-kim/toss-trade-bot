@@ -75,13 +75,15 @@ func TestProtectedBranchContentGovernsNotLocalDisk(t *testing.T) {
 	}
 
 	got := Run(context.Background(), Params{
-		CodeownersContent: fetched, // the fix under test: NOT localDiskContent
-		Owner:             "chnu-kim",
-		Repo:              "toss-trade-bot",
-		Branch:            "main",
-		BranchChecker:     fakeBranchProtectionChecker{result: metResult(CheckNameBranchProtection)},
-		IdentityResolver:  fakeActorResolver{actor: "mechanu[bot]"},
-		ExpectedActor:     "mechanu[bot]",
+		CodeownersContent:      fetched, // the fix under test: NOT localDiskContent
+		Owner:                  "chnu-kim",
+		Repo:                   "toss-trade-bot",
+		Branch:                 "main",
+		BranchChecker:          fakeBranchProtectionChecker{result: metResult(CheckNameBranchProtection)},
+		WorkflowFetcher:        fakeFileFetcher{content: "name: pr-creation\non: repository_dispatch\n"},
+		PRCreationWorkflowPath: ".github/workflows/pr-creation.yml",
+		AuthorLister:           fakeAuthorLister{authors: []string{"mechanu[bot]"}},
+		ExpectedActor:          "mechanu[bot]",
 	})
 
 	if got.Satisfied {

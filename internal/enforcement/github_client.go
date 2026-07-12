@@ -23,11 +23,18 @@ const defaultGitHubAPIBaseURL = "https://api.github.com"
 // a transient error behind a retry would only delay (not avoid) the correct
 // unmet verdict, at the cost of test/CLI latency.
 //
-// The token here is the branch-protection *reader's* credential (ADR-0009
-// point 8(b) needs admin-level read access, which the loop's GitHub App
-// deliberately lacks per point 6 — see cmd/presence-check for how the caller
-// is expected to supply an admin-capable token for this specific check,
-// separate from the App credential used for CheckIdentity).
+// Credential note for check (b) (ADR-0011 point 10·point 5 ② implementation
+// note): GET /repos/{owner}/{repo}/branches/{branch}/protection requires
+// fine-grained **Administration: read** — read-only is sufficient; a classic
+// "admin token" is NOT required, and Administration: write must never be
+// held by the loop (that is the (a) protection-editing vector point 5 ②
+// closes). The post-narrowing loop PAT includes Administration: read exactly
+// so check (b) keeps passing after the admin token is retired. The loop's
+// GitHub App deliberately has no Administration permission at all (ADR-0009
+// point 6), so an App/installation token can never answer (b). The same
+// client also serves plain Contents/Pull-requests reads (checks (a), (c-1),
+// (c-2)), which need no Administration permission — see cmd/presence-check
+// for the per-check token wiring.
 type GitHubClient struct {
 	baseURL string
 	token   string
