@@ -87,6 +87,7 @@ func main() {
 		WorkflowFetcher:        readClient,
 		PRCreationWorkflowPath: getenv("PRESENCE_CHECK_PR_CREATION_WORKFLOW_PATH", defaultPRCreationWorkflowPath),
 		PRLister:               readClient,
+		RevisionFetcher:        readClient,
 		ExpectedActor:          getenv("PRESENCE_CHECK_EXPECTED_ACTOR", defaultExpectedActor),
 	})
 

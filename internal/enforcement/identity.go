@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // recentLoopPRWindow is how many of the repo's most recent PRs (by creation
@@ -36,12 +37,26 @@ type FileContentFetcher interface {
 type PullRequestSummary struct {
 	Author   string
 	SameRepo bool
+	// CreatedAt is when the PR was opened. The zero value means the API did
+	// not report a parseable creation time — such a PR can never be
+	// freshness-eligible (fail-closed), see checkLoopPRAuthor.
+	CreatedAt time.Time
 }
 
 // PullRequestLister is the c-2 seam: something that can report the repo's
 // most recent pull requests (newest first). *GitHubClient satisfies it.
 type PullRequestLister interface {
 	ListRecentPullRequests(ctx context.Context, owner, repo string, limit int) ([]PullRequestSummary, error)
+}
+
+// WorkflowRevisionFetcher is the c-2 freshness seam: it reports when the file
+// at path on ref was last changed (the commit that produced the revision now
+// live on the protected branch). *GitHubClient.FetchLastCommitTime satisfies
+// it via GET /repos/{owner}/{repo}/commits?path=...&sha=ref&per_page=1 —
+// requiring only Contents: read, within the post-narrowing PAT spec
+// (ADR-0011 point 5 ②). No Actions permission is involved.
+type WorkflowRevisionFetcher interface {
+	FetchLastCommitTime(ctx context.Context, owner, repo, path, ref string) (time.Time, error)
 }
 
 // IdentityParams carries everything CheckIdentity needs to evaluate ADR-0011
@@ -55,6 +70,11 @@ type IdentityParams struct {
 
 	// c-2 — recent loop-PR authorship.
 	PRLister PullRequestLister
+	// RevisionFetcher reports when the PR-creation workflow file was last
+	// changed on the protected branch — c-2's freshness anchor (a bot PR is
+	// only evidence about the revision that is on main *now* if it was
+	// created after that revision went live).
+	RevisionFetcher WorkflowRevisionFetcher
 	// ExpectedActor is the App bot login every loop-created PR must carry
 	// once PR creation has moved into the workflow (e.g. "mechanu[bot]").
 	ExpectedActor string
@@ -120,20 +140,50 @@ func checkPRCreationWorkflow(ctx context.Context, p IdentityParams) (reason stri
 
 // checkLoopPRAuthor is leg c-2: among the repo's recentLoopPRWindow most
 // recent PRs there must be at least one that satisfies the loop-PR
-// eligibility predicate ADR-0011 point 4(f) already fixed — head repo ==
-// base repo AND author == ExpectedActor. Before the transition every loop PR
-// is authored by the human account and is indistinguishable from a
-// human-created PR, so "no such PR observed" is exactly the pre-transition
-// state and is unmet by definition (ADR-0011 point 10: 전환 전이면 미충족).
-// A fork-origin PR never counts even if bot-authored (see
-// PullRequestSummary). API errors, an empty PR list, and a blank expected
-// actor are all "cannot judge" and therefore unmet.
+// eligibility predicate — head repo == base repo (ADR-0011 point 4(f)) AND
+// author == ExpectedActor AND created after the PR-creation workflow's
+// current revision went live.
+//
+// The freshness clause closes a false-green class (codex adversarial-review
+// [high]): author + same-repo alone has no causal link to the workflow
+// revision c-1 sees. A legitimate, human-approved workflow rewrite that
+// breaks PR creation would otherwise keep check (c) green on a stale
+// bot PR — created under a revision that no longer exists — until that PR
+// falls out of the window. A PR created after the current revision is the
+// only kind that is evidence about the mechanism actually on main now. This
+// is a filter on which PR qualifies as "the recent loop-created PR" — the
+// axis issue #49's 미정 사항 delegates ("조회 엔드포인트·범위·정렬·필터") —
+// and it only ever narrows what can go green, so it is strictly more
+// fail-closed, not an ADR fork. Evidence sources are unchanged: the workflow
+// file (Contents API) and recent PRs (Pull requests API); the revision time
+// comes from the same Contents-read permission via the commits endpoint.
+//
+// Before the transition every loop PR is authored by the human account, so
+// "no such PR observed" is exactly the pre-transition state and is unmet by
+// definition (ADR-0011 point 10: 전환 전이면 미충족). A missing dependency, an
+// API error, an empty PR list, a blank expected actor, and any ambiguity
+// about the revision time or a PR's creation time are all "cannot judge" and
+// therefore unmet (이슈 #49 미정 사항: 식별 모호·데이터 부족·판정 불가 → 미충족).
 func checkLoopPRAuthor(ctx context.Context, p IdentityParams) (reason string, ok bool) {
 	if p.PRLister == nil {
 		return "loop PR 작성자 검증 불가: PR lister가 설정되지 않음", false
 	}
+	if p.RevisionFetcher == nil {
+		return "loop PR 작성자 검증 불가: workflow revision fetcher가 설정되지 않음", false
+	}
 	if p.ExpectedActor == "" {
 		return "loop PR 작성자 검증 불가: 기대 actor가 설정되지 않음", false
+	}
+	if p.WorkflowPath == "" {
+		return "loop PR 작성자 검증 불가: workflow 경로가 설정되지 않음", false
+	}
+
+	revisionAt, err := p.RevisionFetcher.FetchLastCommitTime(ctx, p.Owner, p.Repo, p.WorkflowPath, p.Branch)
+	if err != nil {
+		return fmt.Sprintf("현재 PR-생성 workflow 리비전 시각 확인 불가: %v", err), false
+	}
+	if revisionAt.IsZero() {
+		return "현재 PR-생성 workflow 리비전 시각을 판정할 수 없음(빈/파싱 불가 타임스탬프)", false
 	}
 
 	prs, err := p.PRLister.ListRecentPullRequests(ctx, p.Owner, p.Repo, recentLoopPRWindow)
@@ -145,12 +195,16 @@ func checkLoopPRAuthor(ctx context.Context, p IdentityParams) (reason string, ok
 	}
 
 	for _, pr := range prs {
-		if pr.SameRepo && pr.Author != "" && strings.EqualFold(pr.Author, p.ExpectedActor) {
+		// created_at strictly after the revision instant: equal timestamps
+		// are ambiguous (second-granularity; a PR cannot be produced by a
+		// revision that went live at the very same second) → 미충족.
+		if pr.SameRepo && pr.Author != "" && strings.EqualFold(pr.Author, p.ExpectedActor) &&
+			!pr.CreatedAt.IsZero() && pr.CreatedAt.After(revisionAt) {
 			return "", true
 		}
 	}
 	return fmt.Sprintf(
-		"최근 %d개 PR 중 %s 작성 same-repo PR이 관측되지 않음 — PR 생성이 아직 workflow로 전환되지 않음(전환 전)",
-		len(prs), p.ExpectedActor,
+		"최근 %d개 PR 중 현재 workflow 리비전(%s 이후) 생성된 %s 작성 same-repo PR이 관측되지 않음 — PR 생성이 아직 현재 workflow로 전환되지 않음(전환 전이거나 낡은 증거)",
+		len(prs), revisionAt.UTC().Format(time.RFC3339), p.ExpectedActor,
 	), false
 }

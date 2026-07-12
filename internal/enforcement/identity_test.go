@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // --- fakes ---
@@ -33,25 +34,53 @@ func (f fakePRLister) ListRecentPullRequests(context.Context, string, string, in
 	return f.prs, f.err
 }
 
-// sameRepoPRs builds same-repo PullRequestSummary entries for the given
-// author logins — the common fixture shape (loop PRs are same-repo by
-// construction).
-func sameRepoPRs(authors ...string) []PullRequestSummary {
+// fakeRevisionFetcher is a stub WorkflowRevisionFetcher for exercising c-2's
+// freshness predicate without a network round trip.
+type fakeRevisionFetcher struct {
+	at  time.Time
+	err error
+}
+
+func (f fakeRevisionFetcher) FetchLastCommitTime(context.Context, string, string, string, string) (time.Time, error) {
+	return f.at, f.err
+}
+
+// parseTestTime parses an RFC3339 timestamp for test fixtures.
+func parseTestTime(t *testing.T, s string) time.Time {
+	t.Helper()
+	parsed, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		t.Fatalf("parseTestTime(%q): %v", s, err)
+	}
+	return parsed
+}
+
+// testRevisionTime is a default "current workflow revision went live" instant
+// used by fixtures; testPRTime is comfortably after it so the common-path
+// bot PR is freshness-eligible.
+func testRevisionTime(t *testing.T) time.Time { return parseTestTime(t, "2026-07-01T00:00:00Z") }
+func testPRTime(t *testing.T) time.Time       { return parseTestTime(t, "2026-07-05T00:00:00Z") }
+
+// sameRepoPRs builds same-repo, freshness-eligible PullRequestSummary entries
+// for the given author logins — the common fixture shape (loop PRs are
+// same-repo by construction and created after the current workflow revision).
+func sameRepoPRs(t *testing.T, authors ...string) []PullRequestSummary {
 	prs := make([]PullRequestSummary, 0, len(authors))
 	for _, a := range authors {
-		prs = append(prs, PullRequestSummary{Author: a, SameRepo: true})
+		prs = append(prs, PullRequestSummary{Author: a, SameRepo: true, CreatedAt: testPRTime(t)})
 	}
 	return prs
 }
 
-func metIdentityParams() IdentityParams {
+func metIdentityParams(t *testing.T) IdentityParams {
 	return IdentityParams{
 		WorkflowFetcher: fakeFileFetcher{content: "name: pr-creation\non: repository_dispatch\n"},
 		Owner:           "chnu-kim",
 		Repo:            "toss-trade-bot",
 		Branch:          "main",
 		WorkflowPath:    ".github/workflows/pr-creation.yml",
-		PRLister:        fakePRLister{prs: sameRepoPRs("mechanu[bot]", "chnu-kim")},
+		RevisionFetcher: fakeRevisionFetcher{at: testRevisionTime(t)},
+		PRLister:        fakePRLister{prs: sameRepoPRs(t, "mechanu[bot]", "chnu-kim")},
 		ExpectedActor:   "mechanu[bot]",
 	}
 }
@@ -59,7 +88,7 @@ func metIdentityParams() IdentityParams {
 // --- composite: check (c) = c-1 AND c-2 ---
 
 func TestCheckIdentity_BothLegsMet(t *testing.T) {
-	got := CheckIdentity(context.Background(), metIdentityParams())
+	got := CheckIdentity(context.Background(), metIdentityParams(t))
 	if !got.Satisfied {
 		t.Fatalf("CheckIdentity() = %+v, want Satisfied=true when c-1 and c-2 are both met", got)
 	}
@@ -71,8 +100,8 @@ func TestCheckIdentity_BothLegsMet(t *testing.T) {
 func TestCheckIdentity_C1MetC2UnmetIsUnmet(t *testing.T) {
 	// Workflow exists on main, but no mechanu[bot]-authored PR has ever been
 	// observed (pre-transition) — one leg alone must never satisfy check (c).
-	p := metIdentityParams()
-	p.PRLister = fakePRLister{prs: sameRepoPRs("chnu-kim", "chnu-kim")}
+	p := metIdentityParams(t)
+	p.PRLister = fakePRLister{prs: sameRepoPRs(t, "chnu-kim", "chnu-kim")}
 	got := CheckIdentity(context.Background(), p)
 	if got.Satisfied {
 		t.Fatal("c-1 met + c-2 unmet must not satisfy check (c)")
@@ -85,7 +114,7 @@ func TestCheckIdentity_C1MetC2UnmetIsUnmet(t *testing.T) {
 func TestCheckIdentity_C1UnmetC2MetIsUnmet(t *testing.T) {
 	// A mechanu[bot]-authored PR is observed, but the PR-creation workflow is
 	// not confirmed on main — the other one-leg combination must also be unmet.
-	p := metIdentityParams()
+	p := metIdentityParams(t)
 	p.WorkflowFetcher = fakeFileFetcher{err: errors.New("status 404")}
 	got := CheckIdentity(context.Background(), p)
 	if got.Satisfied {
@@ -97,7 +126,7 @@ func TestCheckIdentity_C1UnmetC2MetIsUnmet(t *testing.T) {
 }
 
 func TestCheckIdentity_BothLegsUnmetReportsBothReasons(t *testing.T) {
-	p := metIdentityParams()
+	p := metIdentityParams(t)
 	p.WorkflowFetcher = fakeFileFetcher{err: errors.New("status 404")}
 	p.PRLister = fakePRLister{err: errors.New("network unreachable")}
 	got := CheckIdentity(context.Background(), p)
@@ -112,7 +141,7 @@ func TestCheckIdentity_BothLegsUnmetReportsBothReasons(t *testing.T) {
 // --- c-1: PR-creation workflow existence on the protected branch ---
 
 func TestCheckIdentity_C1NilFetcherFailsClosed(t *testing.T) {
-	p := metIdentityParams()
+	p := metIdentityParams(t)
 	p.WorkflowFetcher = nil
 	got := CheckIdentity(context.Background(), p)
 	if got.Satisfied {
@@ -124,7 +153,7 @@ func TestCheckIdentity_C1NilFetcherFailsClosed(t *testing.T) {
 }
 
 func TestCheckIdentity_C1EmptyWorkflowPathFailsClosed(t *testing.T) {
-	p := metIdentityParams()
+	p := metIdentityParams(t)
 	p.WorkflowPath = ""
 	got := CheckIdentity(context.Background(), p)
 	if got.Satisfied {
@@ -135,7 +164,7 @@ func TestCheckIdentity_C1EmptyWorkflowPathFailsClosed(t *testing.T) {
 func TestCheckIdentity_C1EmptyWorkflowContentFailsClosed(t *testing.T) {
 	// A zero-byte/whitespace-only file at the workflow path is not evidence
 	// that a PR-creation workflow exists — no evidence is never satisfied.
-	p := metIdentityParams()
+	p := metIdentityParams(t)
 	p.WorkflowFetcher = fakeFileFetcher{content: "   \n"}
 	got := CheckIdentity(context.Background(), p)
 	if got.Satisfied {
@@ -151,7 +180,7 @@ func TestCheckIdentity_C1EmptyWorkflowContentFailsClosed(t *testing.T) {
 func c1ParamsWithServer(t *testing.T, handler http.HandlerFunc) (IdentityParams, *httptest.Server) {
 	t.Helper()
 	srv := httptest.NewServer(handler)
-	p := metIdentityParams()
+	p := metIdentityParams(t)
 	p.WorkflowFetcher = newTestGitHubClient(srv.URL, "test-token")
 	return p, srv
 }
@@ -220,7 +249,7 @@ func TestCheckIdentity_C1DirectoryResponseFailsClosed(t *testing.T) {
 // --- c-2: recent loop-PR author == expected actor ---
 
 func TestCheckIdentity_C2NilListerFailsClosed(t *testing.T) {
-	p := metIdentityParams()
+	p := metIdentityParams(t)
 	p.PRLister = nil
 	got := CheckIdentity(context.Background(), p)
 	if got.Satisfied {
@@ -232,8 +261,8 @@ func TestCheckIdentity_C2PreTransitionNoBotPRFailsClosed(t *testing.T) {
 	// The repo's current, real state: every observed PR is authored by the
 	// human account — the transition has not happened, so check (c) must be
 	// unmet (ADR-0011 point 10: 전환 전이면 미충족).
-	p := metIdentityParams()
-	p.PRLister = fakePRLister{prs: sameRepoPRs("chnu-kim", "chnu-kim", "chnu-kim")}
+	p := metIdentityParams(t)
+	p.PRLister = fakePRLister{prs: sameRepoPRs(t, "chnu-kim", "chnu-kim", "chnu-kim")}
 	got := CheckIdentity(context.Background(), p)
 	if got.Satisfied {
 		t.Fatal("pre-transition state (no mechanu[bot]-authored PR) must fail-closed")
@@ -244,7 +273,7 @@ func TestCheckIdentity_C2PreTransitionNoBotPRFailsClosed(t *testing.T) {
 }
 
 func TestCheckIdentity_C2APIErrorFailsClosed(t *testing.T) {
-	p := metIdentityParams()
+	p := metIdentityParams(t)
 	p.PRLister = fakePRLister{err: errors.New("status 500")}
 	got := CheckIdentity(context.Background(), p)
 	if got.Satisfied {
@@ -258,7 +287,7 @@ func TestCheckIdentity_C2APIErrorFailsClosed(t *testing.T) {
 func TestCheckIdentity_C2EmptyPRListFailsClosed(t *testing.T) {
 	// Zero PRs observed = no data to judge authorship — unverifiable is
 	// never satisfied.
-	p := metIdentityParams()
+	p := metIdentityParams(t)
 	p.PRLister = fakePRLister{prs: []PullRequestSummary{}}
 	got := CheckIdentity(context.Background(), p)
 	if got.Satisfied {
@@ -269,12 +298,134 @@ func TestCheckIdentity_C2EmptyPRListFailsClosed(t *testing.T) {
 func TestCheckIdentity_C2EmptyExpectedActorFailsClosed(t *testing.T) {
 	// A blank expected actor must never accidentally match a blank author
 	// entry (e.g. a PR whose user object was null).
-	p := metIdentityParams()
+	p := metIdentityParams(t)
 	p.ExpectedActor = ""
-	p.PRLister = fakePRLister{prs: sameRepoPRs("")}
+	p.PRLister = fakePRLister{prs: sameRepoPRs(t, "")}
 	got := CheckIdentity(context.Background(), p)
 	if got.Satisfied {
 		t.Fatal("empty expected actor must fail-closed, not match empty author entries")
+	}
+}
+
+func TestCheckIdentity_C2StaleBotPROlderThanCurrentWorkflowRevisionDoesNotCount(t *testing.T) {
+	// codex adversarial-review [high] no-ship on this PR (2nd round): c-2's
+	// evidence had no causal link to the workflow revision c-1 sees. main's
+	// pr-creation.yml was last changed at T2, but the only bot-authored PR
+	// was created at T1 < T2 — that PR is evidence about a workflow revision
+	// that no longer exists. A legitimate, human-approved workflow rewrite
+	// that breaks PR creation would leave check (c) green on this stale
+	// evidence until the old PR falls out of the window: a false "enforcement
+	// live" verdict produced by NORMAL operation, not by an attack. ADR-0009
+	// point 8 demands live evidence; 식별 모호는 미충족(이슈 #49 미정 사항).
+	p := metIdentityParams(t)
+	p.RevisionFetcher = fakeRevisionFetcher{at: parseTestTime(t, "2026-07-10T00:00:00Z")} // T2
+	p.PRLister = fakePRLister{prs: []PullRequestSummary{
+		{Author: "mechanu[bot]", SameRepo: true, CreatedAt: parseTestTime(t, "2026-07-01T00:00:00Z")}, // T1 < T2
+		{Author: "chnu-kim", SameRepo: true, CreatedAt: parseTestTime(t, "2026-07-11T00:00:00Z")},
+	}}
+	got := CheckIdentity(context.Background(), p)
+	if got.Satisfied {
+		t.Fatal("a bot PR created BEFORE the current pr-creation.yml revision is stale evidence and must not satisfy c-2")
+	}
+	if !strings.Contains(got.Reason, "c-2") {
+		t.Fatalf("Reason = %q, want the failing leg identified", got.Reason)
+	}
+}
+
+func TestCheckIdentity_C2FreshBotPRAfterWorkflowRevisionCounts(t *testing.T) {
+	// The positive half of the freshness predicate: a bot PR created AFTER
+	// the current workflow revision went live is evidence about the revision
+	// that is actually on main right now.
+	p := metIdentityParams(t)
+	p.RevisionFetcher = fakeRevisionFetcher{at: parseTestTime(t, "2026-07-10T00:00:00Z")}
+	p.PRLister = fakePRLister{prs: []PullRequestSummary{
+		{Author: "mechanu[bot]", SameRepo: true, CreatedAt: parseTestTime(t, "2026-07-11T00:00:00Z")},
+	}}
+	got := CheckIdentity(context.Background(), p)
+	if !got.Satisfied {
+		t.Fatalf("CheckIdentity() = %+v, want Satisfied=true for a bot PR created after the current workflow revision", got)
+	}
+}
+
+func TestCheckIdentity_C2StaleAndFreshMixedCountsTheFreshOne(t *testing.T) {
+	// The window may hold both: an old bot PR from a previous revision and a
+	// new one from the current revision. The fresh one satisfies c-2.
+	p := metIdentityParams(t)
+	p.RevisionFetcher = fakeRevisionFetcher{at: parseTestTime(t, "2026-07-10T00:00:00Z")}
+	p.PRLister = fakePRLister{prs: []PullRequestSummary{
+		{Author: "mechanu[bot]", SameRepo: true, CreatedAt: parseTestTime(t, "2026-07-11T00:00:00Z")}, // fresh
+		{Author: "chnu-kim", SameRepo: true, CreatedAt: parseTestTime(t, "2026-07-05T00:00:00Z")},
+		{Author: "mechanu[bot]", SameRepo: true, CreatedAt: parseTestTime(t, "2026-07-01T00:00:00Z")}, // stale
+	}}
+	got := CheckIdentity(context.Background(), p)
+	if !got.Satisfied {
+		t.Fatalf("CheckIdentity() = %+v, want Satisfied=true when a fresh bot PR is present alongside a stale one", got)
+	}
+}
+
+func TestCheckIdentity_C2PRCreatedAtSameInstantAsRevisionDoesNotCount(t *testing.T) {
+	// Boundary: created_at == revision time is ambiguous (a PR cannot have
+	// been created by a revision that went live at the very same instant, and
+	// GitHub timestamps are second-granularity). 식별 모호 → 미충족.
+	at := parseTestTime(t, "2026-07-10T00:00:00Z")
+	p := metIdentityParams(t)
+	p.RevisionFetcher = fakeRevisionFetcher{at: at}
+	p.PRLister = fakePRLister{prs: []PullRequestSummary{
+		{Author: "mechanu[bot]", SameRepo: true, CreatedAt: at},
+	}}
+	got := CheckIdentity(context.Background(), p)
+	if got.Satisfied {
+		t.Fatal("a bot PR created at the exact revision instant is ambiguous evidence and must fail-closed")
+	}
+}
+
+func TestCheckIdentity_C2MissingPRCreatedAtDoesNotCount(t *testing.T) {
+	// An unparseable/absent created_at leaves the zero time — such a PR can
+	// never be freshness-eligible.
+	p := metIdentityParams(t)
+	p.RevisionFetcher = fakeRevisionFetcher{at: parseTestTime(t, "2026-07-10T00:00:00Z")}
+	p.PRLister = fakePRLister{prs: []PullRequestSummary{
+		{Author: "mechanu[bot]", SameRepo: true}, // zero CreatedAt
+	}}
+	got := CheckIdentity(context.Background(), p)
+	if got.Satisfied {
+		t.Fatal("a bot PR with no parseable created_at must fail-closed")
+	}
+}
+
+func TestCheckIdentity_C2RevisionFetchFailuresFailClosed(t *testing.T) {
+	// Every way the workflow-revision lookup can fail to produce a usable
+	// timestamp must be unmet — never fail-open onto the old
+	// author-only predicate.
+	fresh := []PullRequestSummary{
+		{Author: "mechanu[bot]", SameRepo: true, CreatedAt: parseTestTime(t, "2026-07-11T00:00:00Z")},
+	}
+	cases := map[string]fakeRevisionFetcher{
+		"lookup error (404/non-200/network/empty commit list)": {err: errors.New("status 404")},
+		"zero timestamp (unparseable commit date)":             {at: time.Time{}},
+	}
+	for name, rf := range cases {
+		t.Run(name, func(t *testing.T) {
+			p := metIdentityParams(t)
+			p.RevisionFetcher = rf
+			p.PRLister = fakePRLister{prs: fresh}
+			got := CheckIdentity(context.Background(), p)
+			if got.Satisfied {
+				t.Fatal("an unusable workflow-revision timestamp must fail-closed, even with an otherwise-eligible bot PR")
+			}
+			if !strings.Contains(got.Reason, "c-2") {
+				t.Fatalf("Reason = %q, want the failing leg identified", got.Reason)
+			}
+		})
+	}
+}
+
+func TestCheckIdentity_C2NilRevisionFetcherFailsClosed(t *testing.T) {
+	p := metIdentityParams(t)
+	p.RevisionFetcher = nil
+	got := CheckIdentity(context.Background(), p)
+	if got.Satisfied {
+		t.Fatal("nil revision fetcher must fail-closed")
 	}
 }
 
@@ -287,7 +438,7 @@ func TestCheckIdentity_C2ForkBotPRDoesNotCount(t *testing.T) {
 	// eligibility predicate is exactly "head repo == base repo AND author ==
 	// mechanu[bot]". A bot-authored PR that fails the same-repo half is not
 	// loop-authorship evidence.
-	p := metIdentityParams()
+	p := metIdentityParams(t)
 	p.PRLister = fakePRLister{prs: []PullRequestSummary{
 		{Author: "mechanu[bot]", SameRepo: false}, // fork — must not count
 		{Author: "chnu-kim", SameRepo: true},

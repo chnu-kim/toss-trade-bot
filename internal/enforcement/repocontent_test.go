@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestGitHubClient_FetchFileContent_DecodesFromProtectedBranch(t *testing.T) {
@@ -175,5 +176,99 @@ func TestGitHubClient_FetchFileContent_PathIsEscapedAndJoinedWithSlash(t *testin
 	}
 	if !strings.Contains(gotPath, "docs/adr/") {
 		t.Fatalf("expected nested path segments preserved, got %q", gotPath)
+	}
+}
+
+// --- FetchLastCommitTime (c-2 freshness anchor) ---
+
+func TestGitHubClient_FetchLastCommitTime_ReadsCommitterDate(t *testing.T) {
+	var gotMethod, gotPath, gotQuery, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		// author.date backdated (as a rebase would), committer.date is the
+		// real landing time on the branch — we must read the latter.
+		_, _ = w.Write([]byte(`[
+			{"commit": {"author": {"date": "2020-01-01T00:00:00Z"},
+			            "committer": {"date": "2026-07-10T12:00:00Z"}}}
+		]`))
+	}))
+	defer srv.Close()
+
+	c := newTestGitHubClient(srv.URL, "test-token")
+	got, err := c.FetchLastCommitTime(context.Background(), "chnu-kim", "toss-trade-bot", ".github/workflows/pr-creation.yml", "main")
+	if err != nil {
+		t.Fatalf("FetchLastCommitTime: %v", err)
+	}
+	if want := "2026-07-10T12:00:00Z"; got.UTC().Format("2006-01-02T15:04:05Z") != want {
+		t.Fatalf("time = %s, want committer date %s", got.UTC().Format(time.RFC3339), want)
+	}
+
+	// Read-only GET on the commits endpoint: Contents: read only (ADR-0011
+	// point 5 ②), no Actions permission.
+	if gotMethod != http.MethodGet {
+		t.Fatalf("method = %q, want GET (read-only)", gotMethod)
+	}
+	if gotPath != "/repos/chnu-kim/toss-trade-bot/commits" {
+		t.Fatalf("request path = %q", gotPath)
+	}
+	for _, param := range []string{"path=.github%2Fworkflows%2Fpr-creation.yml", "sha=main", "per_page=1"} {
+		if !strings.Contains(gotQuery, param) {
+			t.Fatalf("query = %q, want it to contain %q", gotQuery, param)
+		}
+	}
+	if gotAuth != "Bearer test-token" {
+		t.Fatalf("Authorization = %q, want Bearer test-token", gotAuth)
+	}
+}
+
+func TestGitHubClient_FetchLastCommitTime_EmptyHistoryIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	c := newTestGitHubClient(srv.URL, "test-token")
+	if _, err := c.FetchLastCommitTime(context.Background(), "chnu-kim", "toss-trade-bot", ".github/workflows/pr-creation.yml", "main"); err == nil {
+		t.Fatal("an empty commit list (no history) must return an error, not a zero time treated as valid")
+	}
+}
+
+func TestGitHubClient_FetchLastCommitTime_NonOKStatusIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	c := newTestGitHubClient(srv.URL, "test-token")
+	if _, err := c.FetchLastCommitTime(context.Background(), "chnu-kim", "toss-trade-bot", ".github/workflows/pr-creation.yml", "main"); err == nil {
+		t.Fatal("non-200 must return an error")
+	}
+}
+
+func TestGitHubClient_FetchLastCommitTime_UnparseableDateIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"commit": {"committer": {"date": "not-a-timestamp"}}}]`))
+	}))
+	defer srv.Close()
+
+	c := newTestGitHubClient(srv.URL, "test-token")
+	if _, err := c.FetchLastCommitTime(context.Background(), "chnu-kim", "toss-trade-bot", ".github/workflows/pr-creation.yml", "main"); err == nil {
+		t.Fatal("an unparseable committer date must return an error")
+	}
+}
+
+func TestGitHubClient_FetchLastCommitTime_NetworkErrorIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	srv.Close()
+
+	c := newTestGitHubClient(srv.URL, "test-token")
+	if _, err := c.FetchLastCommitTime(context.Background(), "chnu-kim", "toss-trade-bot", ".github/workflows/pr-creation.yml", "main"); err == nil {
+		t.Fatal("network error must return an error")
 	}
 }

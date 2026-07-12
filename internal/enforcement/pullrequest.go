@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"time"
 )
 
 // ListRecentPullRequests returns summaries (author login + same-repo flag) of
@@ -53,8 +54,9 @@ func (c *GitHubClient) ListRecentPullRequests(ctx context.Context, owner, repo s
 		User *struct {
 			Login string `json:"login"`
 		} `json:"user"`
-		Head *repoRef `json:"head"`
-		Base *repoRef `json:"base"`
+		Head      *repoRef `json:"head"`
+		Base      *repoRef `json:"base"`
+		CreatedAt string   `json:"created_at"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
 		return nil, fmt.Errorf("enforcement: decode pull request list: %w", err)
@@ -69,6 +71,12 @@ func (c *GitHubClient) ListRecentPullRequests(ctx context.Context, owner, repo s
 		if pr.Head != nil && pr.Head.Repo != nil && pr.Base != nil && pr.Base.Repo != nil &&
 			pr.Head.Repo.ID != 0 && pr.Head.Repo.ID == pr.Base.Repo.ID {
 			s.SameRepo = true
+		}
+		// An absent/unparseable created_at leaves CreatedAt zero, which can
+		// never satisfy the freshness predicate — per-PR fail-closed rather
+		// than failing the whole list.
+		if t, err := time.Parse(time.RFC3339, pr.CreatedAt); err == nil {
+			s.CreatedAt = t
 		}
 		summaries = append(summaries, s)
 	}

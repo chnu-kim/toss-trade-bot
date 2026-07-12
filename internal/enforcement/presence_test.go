@@ -25,7 +25,7 @@ func (panickyFileFetcher) FetchFileContent(context.Context, string, string, stri
 	panic("bug inside check (c) implementation")
 }
 
-func validParams() Params {
+func validParams(t *testing.T) Params {
 	return Params{
 		CodeownersContent:      validCodeowners,
 		Owner:                  "chnu-kim",
@@ -34,13 +34,14 @@ func validParams() Params {
 		BranchChecker:          fakeBranchProtectionChecker{result: metResult(CheckNameBranchProtection)},
 		WorkflowFetcher:        fakeFileFetcher{content: "name: pr-creation\non: repository_dispatch\n"},
 		PRCreationWorkflowPath: ".github/workflows/pr-creation.yml",
-		PRLister:               fakePRLister{prs: sameRepoPRs("mechanu[bot]", "chnu-kim")},
+		PRLister:               fakePRLister{prs: sameRepoPRs(t, "mechanu[bot]", "chnu-kim")},
+		RevisionFetcher:        fakeRevisionFetcher{at: testRevisionTime(t)},
 		ExpectedActor:          "mechanu[bot]",
 	}
 }
 
 func TestRun_AllThreeSatisfied(t *testing.T) {
-	got := Run(context.Background(), validParams())
+	got := Run(context.Background(), validParams(t))
 	if !got.Satisfied {
 		t.Fatalf("Run() = %+v, want Satisfied=true", got)
 	}
@@ -53,7 +54,7 @@ func TestRun_AllThreeSatisfied(t *testing.T) {
 }
 
 func TestRun_CodeownersUnmetCollapsesWhole(t *testing.T) {
-	p := validParams()
+	p := validParams(t)
 	p.CodeownersContent = "" // (a) fails
 	got := Run(context.Background(), p)
 	if got.Satisfied {
@@ -63,7 +64,7 @@ func TestRun_CodeownersUnmetCollapsesWhole(t *testing.T) {
 }
 
 func TestRun_BranchProtectionUnmetCollapsesWhole(t *testing.T) {
-	p := validParams()
+	p := validParams(t)
 	p.BranchChecker = fakeBranchProtectionChecker{
 		result: unmetResult(CheckNameBranchProtection, "require_code_owner_reviews off"),
 	}
@@ -75,9 +76,9 @@ func TestRun_BranchProtectionUnmetCollapsesWhole(t *testing.T) {
 }
 
 func TestRun_IdentityUnmetCollapsesWhole(t *testing.T) {
-	p := validParams()
+	p := validParams(t)
 	// c-2 unmet: every observed PR still authored by the human account.
-	p.PRLister = fakePRLister{prs: sameRepoPRs("chnu-kim")}
+	p.PRLister = fakePRLister{prs: sameRepoPRs(t, "chnu-kim")}
 	got := Run(context.Background(), p)
 	if got.Satisfied {
 		t.Fatal("unmet (c) identity must collapse the whole Result to false")
@@ -93,8 +94,8 @@ func TestRun_PreTransitionStateFailsClosed(t *testing.T) {
 	// handed to the workflow. The overall presence-check verdict must be
 	// fail-closed: this issue implements detection, it does not switch
 	// autonomy on.
-	p := validParams()
-	p.PRLister = fakePRLister{prs: sameRepoPRs("chnu-kim", "chnu-kim", "chnu-kim")}
+	p := validParams(t)
+	p.PRLister = fakePRLister{prs: sameRepoPRs(t, "chnu-kim", "chnu-kim", "chnu-kim")}
 	got := Run(context.Background(), p)
 	if got.Satisfied {
 		t.Fatal("pre-transition repo state must leave the presence-check unmet (fail-closed)")
@@ -106,7 +107,7 @@ func TestRun_PreTransitionStateFailsClosed(t *testing.T) {
 }
 
 func TestRun_IdentityListerErrorFailsClosed(t *testing.T) {
-	p := validParams()
+	p := validParams(t)
 	p.PRLister = fakePRLister{err: errors.New("network unreachable")}
 	got := Run(context.Background(), p)
 	if got.Satisfied {
@@ -119,7 +120,7 @@ func TestRun_PanicInsideCheckDegradesToUnmet(t *testing.T) {
 	// criterion): a panic inside one check implementation must not crash the
 	// process — it degrades that check to unmet, and the other pillars still
 	// run and report.
-	p := validParams()
+	p := validParams(t)
 	p.WorkflowFetcher = panickyFileFetcher{}
 	got := Run(context.Background(), p) // must not panic
 	if got.Satisfied {

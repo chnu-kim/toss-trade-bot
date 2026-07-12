@@ -31,9 +31,11 @@ type Params struct {
 	PRCreationWorkflowPath string
 
 	// (c-2) — recent loop-PR author must be ExpectedActor (e.g.
-	// "mechanu[bot]").
-	PRLister      PullRequestLister
-	ExpectedActor string
+	// "mechanu[bot]"), for a PR created after the current PR-creation
+	// workflow revision (RevisionFetcher anchors that freshness).
+	PRLister        PullRequestLister
+	RevisionFetcher WorkflowRevisionFetcher
+	ExpectedActor   string
 }
 
 // Run evaluates all three ADR-0009 point 8 presence-check pillars and
@@ -58,6 +60,7 @@ func Run(ctx context.Context, p Params) Result {
 				WorkflowFetcher: p.WorkflowFetcher,
 				WorkflowPath:    p.PRCreationWorkflowPath,
 				PRLister:        p.PRLister,
+				RevisionFetcher: p.RevisionFetcher,
 				ExpectedActor:   p.ExpectedActor,
 				Owner:           p.Owner,
 				Repo:            p.Repo,
