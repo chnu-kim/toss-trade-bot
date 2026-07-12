@@ -7,24 +7,35 @@ import (
 )
 
 // Params wires everything Run needs to answer the three ADR-0009 point 8
-// pillars. BranchChecker and IdentityResolver are interfaces so callers (and
-// tests) can inject fakes; cmd/presence-check is responsible for wiring real
-// implementations with the right credentials — notably (b) and (c)
-// deliberately use *different* credentials (an admin-capable token for branch
-// protection reads vs. the App's own JWT for identity), because the App
-// intentionally lacks Administration permission (ADR-0009 point 6) and so
-// cannot itself answer (b).
+// pillars. BranchChecker, WorkflowFetcher and PRLister are interfaces so
+// callers (and tests) can inject fakes; cmd/presence-check is responsible for
+// wiring real implementations with the right credentials. Note (b) may need a
+// different credential than (a)/(c): reading branch protection requires
+// Administration: read (fine-grained), which plain content/PR read tokens
+// lack — while (a) and both (c) legs are ordinary Contents/Pull-requests
+// reads (ADR-0011 point 10: c-1/c-2 are verifiable with a plain read token;
+// no App credential is involved anywhere).
 type Params struct {
 	// (a) — raw content of .github/CODEOWNERS.
 	CodeownersContent string
 
-	// (b) — branch protection lookup target and checker.
+	// Shared lookup target for (b) and (c). Branch is the protected branch
+	// (b) queries protection for and (c-1) reads the workflow from.
 	Owner, Repo, Branch string
-	BranchChecker       BranchProtectionChecker
 
-	// (c) — identity resolver and the actor it must resolve to.
-	IdentityResolver ActorResolver
-	ExpectedActor    string
+	// (b) — branch protection checker.
+	BranchChecker BranchProtectionChecker
+
+	// (c-1) — PR-creation workflow existence on the protected branch.
+	WorkflowFetcher        FileContentFetcher
+	PRCreationWorkflowPath string
+
+	// (c-2) — recent loop-PR author must be ExpectedActor (e.g.
+	// "mechanu[bot]"), for a PR created after the current PR-creation
+	// workflow revision (RevisionFetcher anchors that freshness).
+	PRLister        PullRequestLister
+	RevisionFetcher WorkflowRevisionFetcher
+	ExpectedActor   string
 }
 
 // Run evaluates all three ADR-0009 point 8 presence-check pillars and
@@ -45,7 +56,16 @@ func Run(ctx context.Context, p Params) Result {
 			return p.BranchChecker.CheckBranchProtection(ctx, p.Owner, p.Repo, p.Branch)
 		}),
 		runCheck(CheckNameIdentity, func() CheckResult {
-			return CheckIdentity(ctx, p.IdentityResolver, p.ExpectedActor)
+			return CheckIdentity(ctx, IdentityParams{
+				WorkflowFetcher: p.WorkflowFetcher,
+				WorkflowPath:    p.PRCreationWorkflowPath,
+				PRLister:        p.PRLister,
+				RevisionFetcher: p.RevisionFetcher,
+				ExpectedActor:   p.ExpectedActor,
+				Owner:           p.Owner,
+				Repo:            p.Repo,
+				Branch:          p.Branch,
+			})
 		}),
 	}
 

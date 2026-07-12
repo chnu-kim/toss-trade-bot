@@ -33,6 +33,13 @@ const RequiredOwner = "@chnu-kim"
 var sacredRequiredPaths = []string{
 	".github/workflows/ci.yml",
 	".github/workflows/verdict-gate.yml",
+	// The PR-creation workflow (#47, ADR-0011 point 3): presence-check check
+	// (c-1) verifies this file EXISTS on main, so check (a) must verify it
+	// stays CODEOWNERS-protected — twin-artifact coupling for issue #49. It
+	// is covered by the /.github/workflows/ directory rule; listing the real
+	// file catches a later, narrower entry stripping exactly it
+	// (last-match-wins), same as ci.yml/verdict-gate.yml above.
+	".github/workflows/pr-creation.yml",
 	".github/CODEOWNERS",
 	"docs/adr/0004-kill-switch-submit-guard.md",
 	"docs/adr/0007-dev-time-autonomy-boundary.md",

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestGitHubClient_FetchFileContent_DecodesFromProtectedBranch(t *testing.T) {
@@ -175,5 +176,191 @@ func TestGitHubClient_FetchFileContent_PathIsEscapedAndJoinedWithSlash(t *testin
 	}
 	if !strings.Contains(gotPath, "docs/adr/") {
 		t.Fatalf("expected nested path segments preserved, got %q", gotPath)
+	}
+}
+
+// --- FetchWorkflowRevisionLiveTime (c-2 freshness anchor) ---
+
+const testWorkflowPath = ".github/workflows/pr-creation.yml"
+
+// revisionServer wires a two-hop mock: the commits endpoint returns the given
+// file-touching SHA, and the commits/{sha}/pulls endpoint returns the given
+// raw JSON array body. It records the paths/queries hit so tests can assert
+// the read-only contract.
+func revisionServer(t *testing.T, sha, pullsBody string) (*httptest.Server, *[]string) {
+	t.Helper()
+	var hits []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %q, want GET (read-only)", r.Method)
+		}
+		hits = append(hits, r.URL.Path+"?"+r.URL.RawQuery)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pulls"):
+			_, _ = w.Write([]byte(pullsBody))
+		case strings.HasSuffix(r.URL.Path, "/commits"):
+			_, _ = w.Write([]byte(`[{"sha": "` + sha + `"}]`))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	return srv, &hits
+}
+
+func TestGitHubClient_FetchWorkflowRevisionLiveTime_UsesMergedAtNotCommitDate(t *testing.T) {
+	// The merge-commit backdating scenario (codex adversarial-review [high]):
+	// the file-touching commit could carry an old committer date, but the PR
+	// that published it to main merged at 2026-07-10T12:00:00Z — that
+	// GitHub-set merged_at is the true live-on-main boundary.
+	pulls := `[{"merged_at": "2026-07-10T12:00:00Z", "base": {"ref": "main"}}]`
+	srv, hits := revisionServer(t, "abc123", pulls)
+	defer srv.Close()
+
+	c := newTestGitHubClient(srv.URL, "test-token")
+	got, err := c.FetchWorkflowRevisionLiveTime(context.Background(), "chnu-kim", "toss-trade-bot", testWorkflowPath, "main")
+	if err != nil {
+		t.Fatalf("FetchWorkflowRevisionLiveTime: %v", err)
+	}
+	if want := "2026-07-10T12:00:00Z"; got.UTC().Format(time.RFC3339) != want {
+		t.Fatalf("time = %s, want merged_at %s", got.UTC().Format(time.RFC3339), want)
+	}
+
+	// Two read-only hops: commits (Contents: read) then commits/{sha}/pulls
+	// (Pull requests: read). ADR-0011 point 5 ②.
+	if len(*hits) != 2 {
+		t.Fatalf("hits = %v, want exactly 2 (commits, then pulls)", *hits)
+	}
+	if !strings.Contains((*hits)[0], "/repos/chnu-kim/toss-trade-bot/commits?") ||
+		!strings.Contains((*hits)[0], "path=.github%2Fworkflows%2Fpr-creation.yml") ||
+		!strings.Contains((*hits)[0], "sha=main") {
+		t.Fatalf("first hit = %q, want the commits lookup", (*hits)[0])
+	}
+	if !strings.Contains((*hits)[1], "/repos/chnu-kim/toss-trade-bot/commits/abc123/pulls") {
+		t.Fatalf("second hit = %q, want the commit's pulls lookup", (*hits)[1])
+	}
+}
+
+func TestGitHubClient_FetchWorkflowRevisionLiveTime_LatestMergedAtWins(t *testing.T) {
+	// Several qualifying merged PRs → the latest merged_at (most conservative
+	// publication boundary) is used.
+	pulls := `[
+		{"merged_at": "2026-07-05T00:00:00Z", "base": {"ref": "main"}},
+		{"merged_at": "2026-07-10T00:00:00Z", "base": {"ref": "main"}}
+	]`
+	srv, _ := revisionServer(t, "abc123", pulls)
+	defer srv.Close()
+
+	c := newTestGitHubClient(srv.URL, "test-token")
+	got, err := c.FetchWorkflowRevisionLiveTime(context.Background(), "chnu-kim", "toss-trade-bot", testWorkflowPath, "main")
+	if err != nil {
+		t.Fatalf("FetchWorkflowRevisionLiveTime: %v", err)
+	}
+	if want := "2026-07-10T00:00:00Z"; got.UTC().Format(time.RFC3339) != want {
+		t.Fatalf("time = %s, want the latest merged_at %s", got.UTC().Format(time.RFC3339), want)
+	}
+}
+
+func TestGitHubClient_FetchWorkflowRevisionLiveTime_IgnoresOtherBaseAndUnmerged(t *testing.T) {
+	// A PR merged into some other branch, and an unmerged PR, both mentioning
+	// the commit — neither published the revision to main, so both are
+	// ignored and the qualifying one (main) is used.
+	pulls := `[
+		{"merged_at": "2026-07-20T00:00:00Z", "base": {"ref": "develop"}},
+		{"merged_at": null, "base": {"ref": "main"}},
+		{"merged_at": "2026-07-09T00:00:00Z", "base": {"ref": "main"}}
+	]`
+	srv, _ := revisionServer(t, "abc123", pulls)
+	defer srv.Close()
+
+	c := newTestGitHubClient(srv.URL, "test-token")
+	got, err := c.FetchWorkflowRevisionLiveTime(context.Background(), "chnu-kim", "toss-trade-bot", testWorkflowPath, "main")
+	if err != nil {
+		t.Fatalf("FetchWorkflowRevisionLiveTime: %v", err)
+	}
+	if want := "2026-07-09T00:00:00Z"; got.UTC().Format(time.RFC3339) != want {
+		t.Fatalf("time = %s, want the main-targeting merged PR's merged_at %s", got.UTC().Format(time.RFC3339), want)
+	}
+}
+
+func TestGitHubClient_FetchWorkflowRevisionLiveTime_NoMergedPRTargetingRefIsError(t *testing.T) {
+	// A commit with no merged PR that targets main (e.g. a direct push, or
+	// only unmerged/other-base PRs) cannot prove branch-publication time →
+	// error → the caller fails closed.
+	pulls := `[
+		{"merged_at": null, "base": {"ref": "main"}},
+		{"merged_at": "2026-07-20T00:00:00Z", "base": {"ref": "develop"}}
+	]`
+	srv, _ := revisionServer(t, "abc123", pulls)
+	defer srv.Close()
+
+	c := newTestGitHubClient(srv.URL, "test-token")
+	if _, err := c.FetchWorkflowRevisionLiveTime(context.Background(), "chnu-kim", "toss-trade-bot", testWorkflowPath, "main"); err == nil {
+		t.Fatal("no merged PR targeting the ref must return an error, not a zero time treated as valid")
+	}
+}
+
+func TestGitHubClient_FetchWorkflowRevisionLiveTime_EmptyCommitHistoryIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`)) // commits endpoint: no history
+	}))
+	defer srv.Close()
+
+	c := newTestGitHubClient(srv.URL, "test-token")
+	if _, err := c.FetchWorkflowRevisionLiveTime(context.Background(), "chnu-kim", "toss-trade-bot", testWorkflowPath, "main"); err == nil {
+		t.Fatal("an empty commit history must return an error")
+	}
+}
+
+func TestGitHubClient_FetchWorkflowRevisionLiveTime_CommitsNonOKIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	c := newTestGitHubClient(srv.URL, "test-token")
+	if _, err := c.FetchWorkflowRevisionLiveTime(context.Background(), "chnu-kim", "toss-trade-bot", testWorkflowPath, "main"); err == nil {
+		t.Fatal("non-200 on the commits hop must return an error")
+	}
+}
+
+func TestGitHubClient_FetchWorkflowRevisionLiveTime_PullsNonOKIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/pulls") {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		_, _ = w.Write([]byte(`[{"sha": "abc123"}]`))
+	}))
+	defer srv.Close()
+
+	c := newTestGitHubClient(srv.URL, "test-token")
+	if _, err := c.FetchWorkflowRevisionLiveTime(context.Background(), "chnu-kim", "toss-trade-bot", testWorkflowPath, "main"); err == nil {
+		t.Fatal("non-200 on the pulls hop must return an error")
+	}
+}
+
+func TestGitHubClient_FetchWorkflowRevisionLiveTime_UnparseableMergedAtIsError(t *testing.T) {
+	// The only PR is main-targeting and "merged" but its merged_at does not
+	// parse — ambiguous, so it does not count, leaving no qualifying PR.
+	pulls := `[{"merged_at": "not-a-timestamp", "base": {"ref": "main"}}]`
+	srv, _ := revisionServer(t, "abc123", pulls)
+	defer srv.Close()
+
+	c := newTestGitHubClient(srv.URL, "test-token")
+	if _, err := c.FetchWorkflowRevisionLiveTime(context.Background(), "chnu-kim", "toss-trade-bot", testWorkflowPath, "main"); err == nil {
+		t.Fatal("an unparseable merged_at must not be trusted; with no other qualifying PR this must error")
+	}
+}
+
+func TestGitHubClient_FetchWorkflowRevisionLiveTime_NetworkErrorIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	srv.Close()
+
+	c := newTestGitHubClient(srv.URL, "test-token")
+	if _, err := c.FetchWorkflowRevisionLiveTime(context.Background(), "chnu-kim", "toss-trade-bot", testWorkflowPath, "main"); err == nil {
+		t.Fatal("network error must return an error")
 	}
 }

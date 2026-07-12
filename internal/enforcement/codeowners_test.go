@@ -306,6 +306,34 @@ func TestCheckCodeowners_NarrowerCarveOutOnOneGateFileNotCaught(t *testing.T) {
 	}
 }
 
+func TestCheckCodeowners_PRCreationWorkflowCarveOutCaught(t *testing.T) {
+	// Twin-artifact rule for issue #49: presence-check check (c-1) verifies
+	// that .github/workflows/pr-creation.yml EXISTS on main, so check (a)
+	// must verify it stays CODEOWNERS-protected — the same file being
+	// verifiable but strippable would let a later, narrower ownerless entry
+	// silently remove code-owner review from the one workflow that authors
+	// loop PRs (ADR-0011 point 3: the PR-creation workflow definition is
+	// main-pinned and gate-defining). The directory rule still matching is
+	// not enough: GitHub resolves last-match-wins entirely.
+	content := `/.github/workflows/ @chnu-kim
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+/docs/adr/0011-*.md @chnu-kim
+/.github/workflows/pr-creation.yml
+/internal/gate/ @chnu-kim
+/cmd/verdict-gate/ @chnu-kim
+/configs/gate/ @chnu-kim
+/.github/CODEOWNERS @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if got.Satisfied {
+		t.Fatal("a narrower ownerless entry stripping protection from pr-creation.yml specifically must not satisfy the check, even though the directory pattern still looks protective")
+	}
+}
+
 func TestCheckCodeowners_ADRWorkflowsDoubleStarNotationAlsoMatches(t *testing.T) {
 	// The ADR text itself writes ".github/workflows/**" while the real file
 	// uses "/.github/workflows/" — the check must tolerate either notation.

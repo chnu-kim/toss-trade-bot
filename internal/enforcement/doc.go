@@ -13,9 +13,13 @@
 //     owner (internal/enforcement.CheckCodeowners).
 //   - (b) main's branch protection actually requires a CODEOWNERS review
 //     (internal/enforcement.(*GitHubClient).CheckBranchProtection).
-//   - (c) the identity the loop would author commits/PRs as has genuinely
-//     flipped from the human reviewer to the GitHub App
-//     (internal/enforcement.CheckIdentity).
+//   - (c) the loop's PR-authoring identity has genuinely moved to the GitHub
+//     App, proven by read-only observation (ADR-0011 point 10): (c-1) the
+//     PR-creation workflow exists on the protected branch AND (c-2) a recent
+//     loop-created PR is actually authored by the App's bot identity
+//     (internal/enforcement.CheckIdentity). Key/credential possession is
+//     explicitly NOT identity evidence — the earlier App-JWT GET /app probe
+//     was withdrawn as a semantic false positive.
 //
 // This package never treats "could not verify" as "verified true". A network
 // error, a non-200 response, a malformed payload, or a missing dependency all
