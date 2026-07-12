@@ -483,6 +483,71 @@ func TestTokenManager_SlowRefreshServesStalePromptly(t *testing.T) {
 	close(block) // let the detached refresh finish so it does not leak
 }
 
+// TestTokenManager_SlowRefreshStaleExpiresDuringBudget guards the budget-timeout
+// path when the stale token hard-expires *while* the caller is waiting out the
+// refresh budget. At that point there is nothing safe to serve, so the caller
+// must wait for the (still-running) refresh to finish and use its result — and
+// must read that result only after the flight completes. Reading fl.token/fl.err
+// before <-fl.done is a data race (the flight writes them without the manager
+// lock) and returns an empty token; -race and the early-return assertion here
+// both catch it.
+func TestTokenManager_SlowRefreshStaleExpiresDuringBudget(t *testing.T) {
+	release := make(chan struct{})
+	var calls int32
+	m := newTokenManager(func(ctx context.Context) (string, time.Duration, error) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			return "tok-1", time.Hour, nil // seed
+		}
+		<-release // refresh is slow
+		return "tok-2", time.Hour, nil
+	})
+	clock := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	m.now = clock.now
+	m.refreshBudget = 50 * time.Millisecond
+
+	if _, err := m.get(context.Background()); err != nil {
+		t.Fatalf("seed get: %v", err)
+	}
+	clock.advance(time.Hour - 2*time.Minute) // into the stale window (still valid)
+
+	got := make(chan result, 1)
+	go func() {
+		tok, err := m.get(context.Background())
+		got <- result{tok, err}
+	}()
+
+	// Let the caller enter the budget wait, then push the clock past hard expiry
+	// so that when the budget fires the stale token is gone.
+	time.Sleep(10 * time.Millisecond)
+	clock.advance(5 * time.Minute)
+
+	// With no usable token, the caller must wait for the slow refresh, not
+	// return early with an empty token read from an in-flight issuance.
+	select {
+	case r := <-got:
+		t.Fatalf("get returned %+v before the slow refresh finished; with no usable token it must wait", r)
+	case <-time.After(200 * time.Millisecond): // well past the 50ms budget
+	}
+
+	close(release)
+	select {
+	case r := <-got:
+		if r.err != nil {
+			t.Fatalf("get after refresh: %v", r.err)
+		}
+		if r.tok != "tok-2" {
+			t.Fatalf("token = %q, want fresh tok-2", r.tok)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("get did not return after the refresh completed")
+	}
+}
+
+type result struct {
+	tok string
+	err error
+}
+
 // TestTokenManager_TerminalRefreshFailureFailsFastInStaleWindow is the
 // review's P2: a refresh that fails with a terminal (non-transient) auth error
 // — revoked/rotated credentials, malformed response — must fail fast rather

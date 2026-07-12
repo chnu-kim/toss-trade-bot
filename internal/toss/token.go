@@ -202,19 +202,28 @@ func (m *tokenManager) getStaleLocked(ctx context.Context) (string, error) {
 	select {
 	case <-ctx.Done():
 		return "", ctx.Err()
-	case <-timer.C:
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		if m.stale() {
-			return m.token, nil
-		}
-		if fl.err != nil {
-			return "", fl.err
-		}
-		return fl.token, nil
 	case <-fl.done:
+	case <-timer.C:
+		// Budget elapsed with the refresh still running. If the token is still
+		// stale-but-valid, serve it and leave the refresh detached. If it has
+		// hard-expired in the meantime there is nothing safe to serve, so wait
+		// for the refresh — we must NOT read fl.token/fl.err here, the flight
+		// writes them without the lock and only <-fl.done establishes the edge.
+		m.mu.Lock()
+		stillStale := m.stale()
+		token := m.token
+		m.mu.Unlock()
+		if stillStale {
+			return token, nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-fl.done:
+		}
 	}
 
+	// fl.done is closed here: reading fl.token/fl.err is safe.
 	if fl.err == nil {
 		return fl.token, nil
 	}
