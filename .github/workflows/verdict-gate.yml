@@ -296,6 +296,17 @@ jobs:
           # (e)(iv) requires the legs to review, and
           # gate.ParseUnifiedDiff keys only on diff/---/+++/@@ lines,
           # which both formats share.)
+          # Base-tip resolution notes (codex:review P2 on #54, held with
+          # empirical grounding): (1) ref names containing "/" resolve
+          # fine unencoded on the commits endpoint — verified live against
+          # a real "release/8.0" branch (GitHub matches the ref greedily);
+          # (2) `gh pr view`'s baseRefOid was considered and rejected as
+          # the key — it is a stale snapshot, not the live base tip
+          # (verified live: a months-old open PR's baseRefOid differs from
+          # its base branch's current tip), and a stale base pollutes the
+          # three-dot compare with already-merged base commits; (3) a base
+          # ref that fails to resolve for any reason fails closed right
+          # below (no verdict = merge blocked), never an incorrect verdict.
           base_sha=$(gh api "repos/$REPO/commits/$BASE_REF" --jq '.sha')
           if [ -z "$base_sha" ] || [ "$base_sha" = "null" ]; then
             echo "::error::could not resolve base ref '$BASE_REF' to a commit SHA — failing closed."
