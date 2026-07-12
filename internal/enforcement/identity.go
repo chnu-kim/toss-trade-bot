@@ -49,14 +49,24 @@ type PullRequestLister interface {
 	ListRecentPullRequests(ctx context.Context, owner, repo string, limit int) ([]PullRequestSummary, error)
 }
 
-// WorkflowRevisionFetcher is the c-2 freshness seam: it reports when the file
-// at path on ref was last changed (the commit that produced the revision now
-// live on the protected branch). *GitHubClient.FetchLastCommitTime satisfies
-// it via GET /repos/{owner}/{repo}/commits?path=...&sha=ref&per_page=1 —
-// requiring only Contents: read, within the post-narrowing PAT spec
-// (ADR-0011 point 5 ②). No Actions permission is involved.
+// WorkflowRevisionFetcher is the c-2 freshness seam: it reports when the
+// current revision of the file at path became **live on ref** — i.e. the
+// moment that revision became reachable from the protected branch's tip, not
+// when its commit was authored/committed.
+//
+// *GitHubClient.FetchWorkflowRevisionLiveTime satisfies it by resolving the
+// PR that introduced the file's current revision and returning that PR's
+// merged_at (a GitHub-authoritative branch-publication timestamp, unlike a
+// commit's committer.date which a rebase/cherry-pick/merge-commit can make
+// predate publication — codex adversarial-review [high]). It uses only the
+// two evidence sources ADR-0011 point 10 named (the workflow file via the
+// Contents/commits API, and PRs via the PR API), read-only, within the
+// post-narrowing PAT spec (Contents: read + Pull requests: read, point 5 ②).
+// Any inability to prove the live time (no history, no merged PR that
+// published the revision, unparseable timestamp) is a zero time / error the
+// caller treats as unmet — never fail-open.
 type WorkflowRevisionFetcher interface {
-	FetchLastCommitTime(ctx context.Context, owner, repo, path, ref string) (time.Time, error)
+	FetchWorkflowRevisionLiveTime(ctx context.Context, owner, repo, path, ref string) (time.Time, error)
 }
 
 // IdentityParams carries everything CheckIdentity needs to evaluate ADR-0011
@@ -70,10 +80,10 @@ type IdentityParams struct {
 
 	// c-2 — recent loop-PR authorship.
 	PRLister PullRequestLister
-	// RevisionFetcher reports when the PR-creation workflow file was last
-	// changed on the protected branch — c-2's freshness anchor (a bot PR is
-	// only evidence about the revision that is on main *now* if it was
-	// created after that revision went live).
+	// RevisionFetcher reports when the PR-creation workflow file's current
+	// revision became live on the protected branch — c-2's freshness anchor
+	// (a bot PR is only evidence about the revision that is on main *now* if
+	// it was created after that revision went live).
 	RevisionFetcher WorkflowRevisionFetcher
 	// ExpectedActor is the App bot login every loop-created PR must carry
 	// once PR creation has moved into the workflow (e.g. "mechanu[bot]").
@@ -155,8 +165,9 @@ func checkPRCreationWorkflow(ctx context.Context, p IdentityParams) (reason stri
 // axis issue #49's 미정 사항 delegates ("조회 엔드포인트·범위·정렬·필터") —
 // and it only ever narrows what can go green, so it is strictly more
 // fail-closed, not an ADR fork. Evidence sources are unchanged: the workflow
-// file (Contents API) and recent PRs (Pull requests API); the revision time
-// comes from the same Contents-read permission via the commits endpoint.
+// file (Contents API) and recent PRs (Pull requests API); the revision-live time
+// comes from the introducing PR's merged_at (Pull requests: read),
+// resolved via the commits endpoint (Contents: read).
 //
 // Before the transition every loop PR is authored by the human account, so
 // "no such PR observed" is exactly the pre-transition state and is unmet by
@@ -178,12 +189,12 @@ func checkLoopPRAuthor(ctx context.Context, p IdentityParams) (reason string, ok
 		return "loop PR 작성자 검증 불가: workflow 경로가 설정되지 않음", false
 	}
 
-	revisionAt, err := p.RevisionFetcher.FetchLastCommitTime(ctx, p.Owner, p.Repo, p.WorkflowPath, p.Branch)
+	revisionAt, err := p.RevisionFetcher.FetchWorkflowRevisionLiveTime(ctx, p.Owner, p.Repo, p.WorkflowPath, p.Branch)
 	if err != nil {
-		return fmt.Sprintf("현재 PR-생성 workflow 리비전 시각 확인 불가: %v", err), false
+		return fmt.Sprintf("현재 PR-생성 workflow 리비전이 live가 된 시각 확인 불가: %v", err), false
 	}
 	if revisionAt.IsZero() {
-		return "현재 PR-생성 workflow 리비전 시각을 판정할 수 없음(빈/파싱 불가 타임스탬프)", false
+		return "현재 PR-생성 workflow 리비전이 live가 된 시각을 판정할 수 없음(리비전 도입 PR의 merged_at 확인 불가)", false
 	}
 
 	prs, err := p.PRLister.ListRecentPullRequests(ctx, p.Owner, p.Repo, recentLoopPRWindow)

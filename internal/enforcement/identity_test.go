@@ -41,7 +41,7 @@ type fakeRevisionFetcher struct {
 	err error
 }
 
-func (f fakeRevisionFetcher) FetchLastCommitTime(context.Context, string, string, string, string) (time.Time, error) {
+func (f fakeRevisionFetcher) FetchWorkflowRevisionLiveTime(context.Context, string, string, string, string) (time.Time, error) {
 	return f.at, f.err
 }
 
