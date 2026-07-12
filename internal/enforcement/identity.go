@@ -159,20 +159,41 @@ func checkPRCreationWorkflow(ctx context.Context, p IdentityParams) (reason stri
 // author == ExpectedActor AND created after the PR-creation workflow's
 // current revision went live.
 //
-// The freshness clause closes a false-green class (codex adversarial-review
+// The freshness clause narrows a false-green class (codex adversarial-review
 // [high]): author + same-repo alone has no causal link to the workflow
 // revision c-1 sees. A legitimate, human-approved workflow rewrite that
 // breaks PR creation would otherwise keep check (c) green on a stale
 // bot PR — created under a revision that no longer exists — until that PR
-// falls out of the window. A PR created after the current revision is the
-// only kind that is evidence about the mechanism actually on main now. This
-// is a filter on which PR qualifies as "the recent loop-created PR" — the
-// axis issue #49's 미정 사항 delegates ("조회 엔드포인트·범위·정렬·필터") —
+// falls out of the window. Requiring created_at after the current revision's
+// merged_at removes the whole "old bot PR under a superseded revision" class.
+// This is a filter on which PR qualifies as "the recent loop-created PR" —
+// the axis issue #49's 미정 사항 delegates ("조회 엔드포인트·범위·정렬·필터") —
 // and it only ever narrows what can go green, so it is strictly more
 // fail-closed, not an ADR fork. Evidence sources are unchanged: the workflow
 // file (Contents API) and recent PRs (Pull requests API); the revision-live time
 // comes from the introducing PR's merged_at (Pull requests: read),
 // resolved via the commits endpoint (Contents: read).
+//
+// 정직한 한계 (mirroring ADR-0011 point 4(e)(v)'s honest-limitation pattern —
+// (i)~(iv)는 완화이지 보증이 아니다): this freshness test is a
+// **defense-in-depth proxy, not a causal proof** that the PR was produced by
+// the current revision. created_at is when the PR was *opened*, whereas the
+// repository_dispatch run that opens it fixed its definition at *dispatch*
+// time. So an in-flight straggler — a run started under revision R1 that
+// reaches its "open PR" step only after a human-approved R2 (which breaks PR
+// creation) merges — opens a PR with created_at > R2's merged_at and is
+// briefly miscounted as R2-fresh, keeping check (c) green until that single
+// straggler leaves the window. This is a non-adversarial, non-forgeable, self-
+// limiting race (nobody controls the concurrent merge; pr-creation.yml's
+// `concurrency: pr-creation` only serialises create-loop-pr runs among
+// themselves, not against an R2 merge), and created_at is the best
+// fail-closed proxy obtainable from GitHub PR fields. A stronger *causal*
+// binding — tying the eligible PR to the revision via its head commit or the
+// originating workflow_run — is NOT decided by ADR-0011 point 10 (which named
+// only the workflow file and recent-PR-author as evidence sources); adopting
+// one would be an architecture fork requiring /architect, the same booking as
+// the SHA-stamped-PR-output-contract option this issue declined. Residual:
+// the transient straggler false-green is booked here, not closed.
 //
 // Before the transition every loop PR is authored by the human account, so
 // "no such PR observed" is exactly the pre-transition state and is unmet by
