@@ -15,12 +15,15 @@ import (
 // token always has a usable validity window.
 const defaultLeeway = 5 * time.Minute
 
-// defaultHoldoff is how long a terminal issuance failure is negative-cached.
-// Terminal failures (bad credentials, malformed token response) do not heal by
-// retrying, but an unattended polling loop keeps calling get(); without the
-// holdoff every call would hit the rate-limited AUTH endpoint — and each
-// server-side issuance invalidates the previous token (the ADR-0001 herd).
-// Transient failures are NOT held off: acquireToken's backoff paces those.
+// defaultHoldoff is how long an issuance failure suppresses further attempts.
+// An unattended polling loop keeps calling get(); without the holdoff every
+// call would hit the rate-limited AUTH endpoint — and each server-side
+// issuance invalidates the previous token (the ADR-0001 herd). What the
+// holdoff may short-circuit depends on the failure and cache state (see the
+// holdoff branch in get): stale-token serving is always held, cached-error
+// serving only for terminal failures (bad credentials, malformed response),
+// while transient failures without a usable token are genuinely retried so
+// acquireToken's backoff keeps meaning something.
 const defaultHoldoff = 5 * time.Second
 
 // issueFunc mints a fresh access token, returning the token string and its
@@ -99,18 +102,29 @@ func (m *tokenManager) get(ctx context.Context) (string, error) {
 		return token, nil
 	}
 
-	// Terminal-failure holdoff: don't re-hit the token endpoint for every
-	// call while the last failure cannot have healed yet. Serve the stale
-	// token if the server still accepts it, else the cached error.
+	// Failure holdoff: don't re-hit the rate-limited AUTH endpoint on every
+	// call right after an issuance failure.
+	//   - A stale-but-valid token is served directly — crucial for pacing,
+	//     because the stale fallback turns refresh failures into successes
+	//     and thereby bypasses acquireToken's backoff entirely; without this
+	//     hold every API call during an auth outage would fire its own
+	//     issuance attempt for the whole leeway window.
+	//   - A terminal failure with no usable token returns the cached error
+	//     (retrying cannot heal bad credentials or a malformed response).
+	//   - A transient failure with no usable token falls through to a real
+	//     attempt: the caller's backoff paces those, and short-circuiting
+	//     them would turn acquireToken's retries into no-ops.
 	if m.inflight == nil && m.lastErr != nil && m.now().Before(m.holdUntil) {
 		if m.stale() {
 			token := m.token
 			m.mu.Unlock()
 			return token, nil
 		}
-		err := m.lastErr
-		m.mu.Unlock()
-		return "", err
+		if !isTransient(m.lastErr) {
+			err := m.lastErr
+			m.mu.Unlock()
+			return "", err
+		}
 	}
 
 	fl := m.inflight
@@ -182,10 +196,11 @@ func (m *tokenManager) finishLocked(fl *issuance) {
 		m.inflight = nil
 	}
 	if fl.err != nil {
-		if !isTransient(fl.err) {
-			m.lastErr = fl.err
-			m.holdUntil = m.now().Add(m.holdoff)
-		}
+		// Every failure arms the holdoff; get() decides what it may
+		// short-circuit (see the holdoff branch there): stale serving is
+		// always held, cached-error serving only for terminal failures.
+		m.lastErr = fl.err
+		m.holdUntil = m.now().Add(m.holdoff)
 		return
 	}
 	// Clamp the effective leeway to half the ttl: a ttl at or below the

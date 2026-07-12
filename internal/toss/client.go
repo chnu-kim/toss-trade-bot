@@ -107,6 +107,12 @@ func ValidateBaseURL(raw string) error {
 	}
 	switch u.Scheme {
 	case "https":
+		// A host-less URL ("https://", "https:///path") would pass a
+		// scheme-only check, boot fine, and then fail on the first request —
+		// defeating the fail-fast contract of this validator.
+		if u.Hostname() == "" {
+			return fmt.Errorf("toss: base URL %s has no host", u.Redacted())
+		}
 		return nil
 	case "http":
 		if isLoopbackHost(u.Hostname()) {

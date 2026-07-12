@@ -30,6 +30,9 @@ func TestValidateBaseURL(t *testing.T) {
 		{"ftp scheme", "ftp://example.test", true},
 		{"empty", "", true},
 		{"whitespace", "   ", true},
+		{"https without host", "https://", true},
+		{"https path only", "https:///foo", true},
+		{"http without host", "http://", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -294,6 +297,56 @@ func TestClient_ServesCachedTokenWhenRefreshFails(t *testing.T) {
 	clock.advance(3 * time.Minute)
 	if _, err := c.Get(context.Background(), "/api/v1/ping"); err == nil {
 		t.Fatal("Get past hard expiry = nil error, want failure (server rejects the token)")
+	}
+}
+
+// TestClient_StaleWindowRefreshFailuresArePaced guards the AUTH endpoint from
+// an unpaced hammer: the stale fallback makes get() return success, so
+// acquireToken's backoff never paces refresh attempts — without a holdoff,
+// every API call during a token-endpoint outage would fire its own issuance
+// attempt for the whole leeway window.
+func TestClient_StaleWindowRefreshFailuresArePaced(t *testing.T) {
+	var issues int32
+	var failToken atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth2/token":
+			atomic.AddInt32(&issues, 1)
+			if failToken.Load() {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			tokenJSON(t, w, "tok-1", 3600)
+		case "/api/v1/ping":
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv)
+	clock := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	c.tokens.now = clock.now
+
+	resp, err := c.Get(context.Background(), "/api/v1/ping")
+	if err != nil {
+		t.Fatalf("first Get: %v", err)
+	}
+	drainClose(resp)
+
+	failToken.Store(true)
+	clock.advance(3600*time.Second - 2*time.Minute) // inside the leeway window
+
+	for i := 0; i < 5; i++ {
+		resp, err := c.Get(context.Background(), "/api/v1/ping")
+		if err != nil {
+			t.Fatalf("Get #%d in stale window: %v", i, err)
+		}
+		drainClose(resp)
+	}
+	// 1 initial issuance + exactly 1 failed refresh attempt for the whole
+	// burst; the remaining calls serve the stale token from the holdoff.
+	if n := atomic.LoadInt32(&issues); n != 2 {
+		t.Fatalf("token endpoint hit %d times across 5 stale-window Gets, want 2 (refresh attempts must be paced)", n)
 	}
 }
 

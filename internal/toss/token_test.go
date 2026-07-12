@@ -236,6 +236,47 @@ func TestTokenManager_ServesStaleTokenUntilHardExpiry(t *testing.T) {
 	}
 }
 
+func TestTokenManager_StaleWindowTransientFailuresArePaced(t *testing.T) {
+	var calls int32
+	m := newTokenManager(func(ctx context.Context) (string, time.Duration, error) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			return "tok-1", time.Hour, nil
+		}
+		return "", 0, &transientError{err: errors.New("token endpoint down")}
+	})
+	clock := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	m.now = clock.now
+
+	if _, err := m.get(context.Background()); err != nil {
+		t.Fatalf("first get: %v", err)
+	}
+	clock.advance(time.Hour - 2*time.Minute) // stale-but-valid window
+
+	// The fallback serves these as successes, so the caller's backoff never
+	// paces them — the manager itself must hold off repeat refresh attempts.
+	for i := 0; i < 5; i++ {
+		tok, err := m.get(context.Background())
+		if err != nil {
+			t.Fatalf("get #%d: %v", i, err)
+		}
+		if tok != "tok-1" {
+			t.Fatalf("get #%d token = %q, want stale tok-1", i, tok)
+		}
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("issue called %d times across 5 stale-window gets, want 2 (1 initial + 1 paced refresh attempt)", got)
+	}
+
+	// After the holdoff the manager genuinely retries.
+	clock.advance(m.holdoff + time.Second)
+	if _, err := m.get(context.Background()); err != nil {
+		t.Fatalf("get after holdoff: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 3 {
+		t.Fatalf("issue called %d times after holdoff elapsed, want 3", got)
+	}
+}
+
 func TestTokenManager_InvalidatedTokenIsNeverServedAsFallback(t *testing.T) {
 	var calls int32
 	m := newTokenManager(func(ctx context.Context) (string, time.Duration, error) {
