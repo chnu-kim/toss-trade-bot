@@ -2,6 +2,7 @@ package killswitch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -525,19 +526,43 @@ func (g *Guard) ClearSymbol(symbol string) {
 	g.mu.Unlock()
 }
 
+// errClearRaced reports that a trip landed while ClearGlobalHalt was in
+// flight; the clear keeps the fresher halt and the operator must review and
+// retry.
+var errClearRaced = errors.New("killswitch: clear aborted, a trip raced the clear — review and retry")
+
 // ClearGlobalHalt is the ONLY path that releases the global halt (explicit
-// human reset — ADR-0004 point 6). It is fail-closed end to end: if boot
-// recovery had failed it first reloads the persisted counters (refusing to
-// resume while the store still fails), then durably clears the halt, and
-// only then flips the mirror. If any trip lands concurrently the clear
-// aborts with an error instead of wiping the fresher halt — retry after
-// reviewing. Escalation counters are NOT reset: if the root cause persists,
-// the next failure report re-trips.
+// human reset — ADR-0004 point 6). It is fail-closed end to end:
+//
+//   - A clear on an un-halted guard is a no-op, so a spurious clear cannot
+//     race a fresh trip's durable write.
+//   - If boot recovery had failed it first reloads the persisted counters,
+//     refusing to resume while the store still fails.
+//   - The durable clear is conditional: it runs inside one store transaction
+//     and re-checks the trip generation first. The store's single write
+//     connection serializes that transaction against every TripHalt, so a
+//     trip that already raced ahead aborts the clear before it touches the
+//     store (no wiping a fresher persisted halt — codex P1 on PR #57).
+//   - The durable flag is dropped up front, so a trip that lands after the
+//     clear committed coalesces into the mirror halt WITH a re-persist plan:
+//     its TripHalt queues behind the clear transaction and restores the
+//     durable halt; the mirror flip below then aborts on the generation
+//     check. Either ordering leaves store and mirror blocking.
+//
+// Escalation counters are NOT reset: if the root cause persists, the next
+// failure report re-trips.
 func (g *Guard) ClearGlobalHalt(ctx context.Context) error {
-	g.mu.RLock()
+	g.mu.Lock()
+	if !g.halted {
+		g.mu.Unlock()
+		return nil
+	}
 	needReload := g.recoveryFailed
 	genBefore := g.gen
-	g.mu.RUnlock()
+	// Force any racing trip to plan a re-persist of the halt it coalesces
+	// into (haltLocked re-persists when the halt is not known durable).
+	g.haltDurable = false
+	g.mu.Unlock()
 
 	var tokenN, orderN int64
 	if needReload {
@@ -552,15 +577,34 @@ func (g *Guard) ClearGlobalHalt(ctx context.Context) error {
 		tokenN, orderN = tc.Value, oc.Value
 	}
 
-	if err := g.st.ClearHalt(ctx); err != nil {
+	err := g.st.Atomically(ctx, func(tx store.Tx) error {
+		// Conditional clear: abort before writing if any trip invalidated
+		// the state the operator observed. Taking g.mu inside the write
+		// transaction is safe because no code path holds g.mu while waiting
+		// on the write connection (mirror phases release the lock before
+		// any store I/O).
+		g.mu.RLock()
+		genNow := g.gen
+		g.mu.RUnlock()
+		if genNow != genBefore {
+			return errClearRaced
+		}
+		return tx.ClearHalt(ctx)
+	})
+	switch {
+	case errors.Is(err, errClearRaced):
+		return errClearRaced
+	case err != nil:
 		return fmt.Errorf("killswitch: durable clear failed, staying halted: %w", err)
 	}
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.gen != genBefore {
-		// A trip raced this clear; keep the fresher halt (fail-closed).
-		return fmt.Errorf("killswitch: clear aborted, state changed concurrently — review and retry")
+		// A trip landed between the commit and here: keep the fresher halt.
+		// Its re-persist (planned because haltDurable was dropped above)
+		// restores the durable state right behind the cleared row.
+		return errClearRaced
 	}
 	if needReload {
 		g.tokenFailures, g.orderFailures = tokenN, orderN
