@@ -673,11 +673,14 @@ var errClearRaced = errors.New("killswitch: clear aborted, a trip raced the clea
 //     connection serializes that transaction against every TripHalt, so a
 //     trip that already raced ahead aborts the clear before it touches the
 //     store (no wiping a fresher persisted halt — codex P1 on PR #57).
-//   - The durable flag is dropped up front, so a trip that lands after the
-//     clear committed coalesces into the mirror halt WITH a re-persist plan:
-//     its TripHalt queues behind the clear transaction and restores the
-//     durable halt; the mirror flip below then aborts on the generation
-//     check. Either ordering leaves store and mirror blocking.
+//   - If a trip lands AFTER the in-tx check but before the commit, the clear
+//     commits (store cleared) yet the mirror stays halted. The clear then
+//     re-persists the halt itself before returning errClearRaced — it does
+//     NOT rely on the racing event to restore durability, because a
+//     below-threshold per-symbol trip bumps the generation with an empty
+//     plan and never re-persists. This guarantees the invariant "mirror
+//     halted ⇒ store at least as halted" for every kind of racing event
+//     (orchestrator adversarial panel finding on PR #57).
 //
 // Escalation counters are NOT reset: if the root cause persists, the next
 // failure report re-trips.
@@ -756,20 +759,47 @@ func (g *Guard) ClearGlobalHalt(ctx context.Context) error {
 	}
 
 	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.gen != genBefore {
-		// A trip landed between the commit and here: keep the fresher halt.
-		// Its re-persist (planned because haltDurable was dropped above)
-		// restores the durable state right behind the cleared row.
+	raced := g.gen != genBefore
+	if needReload && (g.tokenFail.epoch != tokenEpochBefore || g.orderFail.epoch != orderEpochBefore) {
+		// A failure report raced the recovery reload; assigning the stale
+		// snapshot would erase it from the live mirror.
+		raced = true
+	}
+	if raced {
+		// The store was ALREADY durably cleared by the transaction above, but
+		// a racing event kept the mirror halted. That event may not re-persist
+		// the halt: a below-threshold per-symbol Trip bumps the generation
+		// with an EMPTY plan (no TripHalt), and a below-threshold failure
+		// report writes only its counter. Relying on the racing event to
+		// restore durability (the old design) left the store cleared while the
+		// mirror stayed halted — a restart would then boot UNHALTED and allow
+		// live orders (ADR-0004 point 4 restart-bypass / ADR-0007 violation;
+		// caught by the orchestrator's adversarial panel).
+		//
+		// Restore the durable halt ourselves so the invariant "mirror halted
+		// ⇒ store at least as halted" holds unconditionally. The mirror kept
+		// the original reason (first-reason-wins in haltLocked), so re-persist
+		// that. auth=1 committed by the clear tx is harmless while halt=1 (the
+		// halted branch in New dominates the auth check).
+		reason := g.haltReason
+		g.haltDurable = false
+		g.haltSeq++
+		seq := g.haltSeq
+		g.mu.Unlock()
+
+		if perr := g.st.Atomically(ctx, func(tx store.Tx) error {
+			return tx.TripHalt(ctx, reason)
+		}); perr != nil {
+			// Even the restore write failed. The mirror stays halted
+			// (fail-closed); surface a compound error so the operator knows
+			// durability is uncertain and must be re-established before relying
+			// on a restart.
+			return fmt.Errorf("%w; durable halt restore failed, mirror stays halted: %v", errClearRaced, perr)
+		}
+		g.markHaltDurable(seq)
 		return errClearRaced
 	}
 	if needReload {
-		if g.tokenFail.epoch != tokenEpochBefore || g.orderFail.epoch != orderEpochBefore {
-			// A failure report raced the recovery reload; assigning the
-			// stale snapshot would erase it from the live mirror. Keep the
-			// halt and let the operator retry with a fresh snapshot.
-			return errClearRaced
-		}
 		g.tokenFail = failureCounter{count: tokenN, epoch: g.tokenFail.epoch + 1}
 		g.orderFail = failureCounter{count: orderN, epoch: g.orderFail.epoch + 1}
 		g.recoveryFailed = false
@@ -777,6 +807,7 @@ func (g *Guard) ClearGlobalHalt(ctx context.Context) error {
 	g.halted = false
 	g.haltReason = ""
 	g.haltDurable = false
+	g.mu.Unlock()
 	return nil
 }
 

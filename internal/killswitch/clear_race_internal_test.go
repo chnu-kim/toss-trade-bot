@@ -139,10 +139,25 @@ func (tx hookedTx) ClearHalt(ctx context.Context) error {
 }
 
 func runClearRace(t *testing.T, point hookPoint) {
-	runClearRaceWith(t, point, nil)
+	runClearRaceOpts(t, clearRaceOpts{point: point})
 }
 
-func runClearRaceWith(t *testing.T, point hookPoint, beforeRace func(g *Guard)) {
+// clearRaceOpts parametrizes the clear/trip race harness so the durable-halt
+// invariant can be checked against every kind of racing event, not just the
+// global trip that happens to re-persist.
+type clearRaceOpts struct {
+	point hookPoint
+	// action is the racing event fired inside the clear window. Nil defaults
+	// to a global Trip. It must bump the guard generation so the clear's
+	// post-commit recheck detects the race.
+	action func(g *Guard) error
+	// config for the guard under test (thresholds). Zero value is fine.
+	config Config
+	// beforeRace runs right before the racing action fires.
+	beforeRace func(g *Guard)
+}
+
+func runClearRaceOpts(t *testing.T, opts clearRaceOpts) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "store.db")
 	db, err := store.Open(path)
@@ -157,8 +172,8 @@ func runClearRaceWith(t *testing.T, point hookPoint, beforeRace func(g *Guard)) 
 	}()
 
 	authorizeForTest(t, ctx, db)
-	rs := &raceStore{Store: db, tb: t, ctx: ctx, point: point}
-	g := New(ctx, rs, nil, Config{})
+	rs := &raceStore{Store: db, tb: t, ctx: ctx, point: opts.point}
+	g := New(ctx, rs, nil, opts.config)
 	rs.g = g
 	g.MarkReplayComplete()
 
@@ -166,9 +181,11 @@ func runClearRaceWith(t *testing.T, point hookPoint, beforeRace func(g *Guard)) 
 		t.Fatalf("Trip: %v", err)
 	}
 
-	// The clear races a fresh global trip: it must abort instead of resuming.
-	if beforeRace != nil {
-		rs.beforeRace = func() { beforeRace(g) }
+	if opts.beforeRace != nil {
+		rs.beforeRace = func() { opts.beforeRace(g) }
+	}
+	if opts.action != nil {
+		rs.action = func() error { return opts.action(g) }
 	}
 	rs.armed = true
 	if err := g.ClearGlobalHalt(ctx); err == nil {
@@ -176,14 +193,15 @@ func runClearRaceWith(t *testing.T, point hookPoint, beforeRace func(g *Guard)) 
 	}
 	rs.tripDone.Wait()
 	if rs.tripErr != nil {
-		t.Fatalf("racing Trip: %v", rs.tripErr)
+		t.Fatalf("racing action: %v", rs.tripErr)
 	}
 	if halted, _ := g.Halted(); !halted {
 		t.Fatal("mirror must stay halted after a raced clear")
 	}
 
-	// The core invariant: the durable halt survived the raced clear, so a
-	// restart still boots halted (restart is not a bypass).
+	// The core invariant: whenever the mirror stays halted, the store is at
+	// least as halted — so a restart still boots halted (restart is not a
+	// bypass), independent of whether the racing event re-persisted.
 	if err := db.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -200,11 +218,16 @@ func runClearRaceWith(t *testing.T, point hookPoint, beforeRace func(g *Guard)) 
 	if !haltState.Halted {
 		t.Fatal("durable halt was lost across the raced clear: restart would boot unhalted (fail-open)")
 	}
-	g2 := New(ctx, db2, nil, Config{})
+	g2 := New(ctx, db2, nil, opts.config)
 	g2.MarkReplayComplete()
 	if d := g2.CanSubmit("AAPL"); d.Allowed {
 		t.Fatal("guard rebooted after a raced clear must stay blocked")
 	}
+}
+
+// backward-compatible wrapper used by the round-3 stale-mark test.
+func runClearRaceWith(t *testing.T, point hookPoint, beforeRace func(g *Guard)) {
+	runClearRaceOpts(t, clearRaceOpts{point: point, beforeRace: beforeRace})
 }
 
 func TestClearRacingTripInsideClearWriteKeepsDurableHalt(t *testing.T) {
@@ -213,6 +236,70 @@ func TestClearRacingTripInsideClearWriteKeepsDurableHalt(t *testing.T) {
 
 func TestClearRacingTripBeforeClearTxKeepsDurableHalt(t *testing.T) {
 	runClearRace(t, hookBeforeClearTx)
+}
+
+// TestClearRaceInvariantAcrossTripKinds is the regression for the CRITICAL
+// fail-open found by the orchestrator's adversarial panel: the clear's
+// durable-halt restore must NOT depend on the racing event re-persisting.
+// A below-threshold per-symbol Trip bumps the generation (invalidating the
+// clear's post-commit check) but returns an empty persist plan, so the
+// previous design left the store cleared while the mirror stayed halted — a
+// restart would boot UNHALTED and allow live orders (ADR-0004 point 4 /
+// ADR-0007 violation). The invariant "mirror halted ⇒ store at least as
+// halted" must hold for every kind of racing event, at every interleave
+// point, so this enumerates them.
+func TestClearRaceInvariantAcrossTripKinds(t *testing.T) {
+	kinds := []struct {
+		name   string
+		config Config
+		action func(g *Guard) error
+	}{
+		{
+			// The original covered case: a global trip that DOES re-persist.
+			name: "global-trip",
+			action: func(g *Guard) error {
+				return g.Trip(context.Background(), Global(), "raced global", time.Now())
+			},
+		},
+		{
+			// The CRITICAL uncovered case: a below-threshold symbol trip
+			// bumps gen but returns an empty plan (no re-persist).
+			name:   "below-threshold-symbol-trip",
+			config: Config{AmbiguousTripThreshold: 1000},
+			action: func(g *Guard) error {
+				return g.Trip(context.Background(), Symbol("TSLA"), "ambiguous submit", time.Now())
+			},
+		},
+		{
+			// A below-threshold order-failure report: writes only its counter,
+			// no TripHalt, yet bumps... actually it does not bump gen unless it
+			// crosses the threshold, so it cannot invalidate a non-recovery
+			// clear. Included as a threshold-crossing variant below instead.
+			name:   "threshold-crossing-order-failure",
+			config: Config{OrderFailureThreshold: 1},
+			action: func(g *Guard) error {
+				return g.ReportOrderFailure(context.Background(), time.Now())
+			},
+		},
+	}
+	points := []struct {
+		name string
+		p    hookPoint
+	}{
+		{"inside-clear-write", hookInsideClearWrite},
+		{"before-clear-tx", hookBeforeClearTx},
+	}
+	for _, k := range kinds {
+		for _, pt := range points {
+			t.Run(k.name+"/"+pt.name, func(t *testing.T) {
+				runClearRaceOpts(t, clearRaceOpts{
+					point:  pt.p,
+					action: k.action,
+					config: k.config,
+				})
+			})
+		}
+	}
 }
 
 // TestStalePersistMarkCannotDefeatClearRace covers codex P1 from round 3 on
