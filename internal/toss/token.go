@@ -15,16 +15,23 @@ import (
 // token always has a usable validity window.
 const defaultLeeway = 5 * time.Minute
 
-// defaultHoldoff is how long an issuance failure suppresses further attempts.
-// An unattended polling loop keeps calling get(); without the holdoff every
-// call would hit the rate-limited AUTH endpoint — and each server-side
-// issuance invalidates the previous token (the ADR-0001 herd). What the
-// holdoff may short-circuit depends on the failure and cache state (see the
-// holdoff branch in get): stale-token serving is always held, cached-error
-// serving only for terminal failures (bad credentials, malformed response),
-// while transient failures without a usable token are genuinely retried so
-// acquireToken's backoff keeps meaning something.
-const defaultHoldoff = 5 * time.Second
+// defaultHoldoff paces token issuance manager-wide after a failure: for its
+// duration, no caller starts a new issuance (the cached error or stale token is
+// served instead). It is the single gate that keeps a failure from fanning out
+// into an AUTH-endpoint storm.
+//
+// Why a manager-wide gate is necessary and not just per-caller backoff: the
+// stale-token fallback returns refresh failures to callers as *successes*,
+// which bypasses acquireToken's backoff entirely; and even without stale,
+// concurrent callers hitting a fast-failing issuer each complete their own
+// flight (the in-flight window is too short to coalesce them) and, per Toss,
+// each fresh issuance invalidates the previous token — the ADR-0001 herd.
+//
+// Why it equals backoffBase (the smallest retry step): a single caller that
+// genuinely backs off crosses the holdoff on its first retry and recovers from
+// a brief blip, while a concurrent burst — which does not wait between
+// attempts — stays inside one holdoff and is coalesced to a single issuance.
+const defaultHoldoff = backoffBase
 
 // issueFunc mints a fresh access token, returning the token string and its
 // lifetime. It is the single point of token issuance for a client.
@@ -88,12 +95,17 @@ func (m *tokenManager) setLogger(l *slog.Logger) {
 
 // get returns a valid token, minting one if the cache is empty or near expiry.
 //
-// Refresh is single-flight: the first caller past the cache check starts one
-// issuance goroutine and every caller — starter included — waits on it via
-// select, so a caller whose context expires abandons the wait instead of being
-// wedged behind an uninterruptible lock. The flight itself runs on a context
-// detached from any single caller (its outcome is shared state), bounded by
-// the HTTP client timeout.
+// Refresh is single-flight: the first eligible caller starts one issuance
+// goroutine and every caller — starter included — waits on it via select, so a
+// caller whose context expires abandons the wait instead of being wedged behind
+// an uninterruptible lock. The flight runs on a context detached from any single
+// caller (its outcome is shared state), bounded by the HTTP client timeout.
+//
+// Two gates guard the "start a NEW flight" path (joining an in-flight refresh is
+// never gated — that shares a result, it is not a fresh mint):
+//   - the failure holdoff, which paces issuance manager-wide (defect ②);
+//   - a cancellation check, so an already-dead caller never starts a detached
+//     flight that could invalidate a live request's token (defect ①).
 func (m *tokenManager) get(ctx context.Context) (string, error) {
 	m.mu.Lock()
 	if m.valid() {
@@ -102,35 +114,41 @@ func (m *tokenManager) get(ctx context.Context) (string, error) {
 		return token, nil
 	}
 
-	// Failure holdoff: don't re-hit the rate-limited AUTH endpoint on every
-	// call right after an issuance failure.
-	//   - A stale-but-valid token is served directly — crucial for pacing,
-	//     because the stale fallback turns refresh failures into successes
-	//     and thereby bypasses acquireToken's backoff entirely; without this
-	//     hold every API call during an auth outage would fire its own
-	//     issuance attempt for the whole leeway window.
-	//   - A terminal failure with no usable token returns the cached error
-	//     (retrying cannot heal bad credentials or a malformed response).
-	//   - A transient failure with no usable token falls through to a real
-	//     attempt: the caller's backoff paces those, and short-circuiting
-	//     them would turn acquireToken's retries into no-ops.
-	if m.inflight == nil && m.lastErr != nil && m.now().Before(m.holdUntil) {
-		if m.stale() {
-			token := m.token
-			m.mu.Unlock()
-			return token, nil
-		}
-		if !isTransient(m.lastErr) {
+	if m.inflight == nil {
+		// (a) Failure holdoff — the manager-wide pacing gate. For the holdoff
+		// window after any failure, do not start a new issuance:
+		//   - serve the stale-but-valid token if the server still accepts it
+		//     (the stale fallback returns failures as successes and so escapes
+		//     acquireToken's backoff — only this gate can pace it), else
+		//   - return the cached error. A caller that has genuinely backed off
+		//     crosses holdUntil and reaches a real attempt below; a no-wait
+		//     burst stays inside the window and is coalesced to one issuance.
+		if m.lastErr != nil && m.now().Before(m.holdUntil) {
+			if m.stale() {
+				token := m.token
+				m.mu.Unlock()
+				return token, nil
+			}
 			err := m.lastErr
 			m.mu.Unlock()
 			return "", err
 		}
-	}
 
-	fl := m.inflight
-	if fl == nil {
-		fl = m.startFlightLocked(ctx)
+		// (b) Cancellation gate — only on the new-flight path. startFlightLocked
+		// strips cancellation (context.WithoutCancel), so a caller whose context
+		// is already done must not start a flight: the detached issuance would
+		// outlive this corpse and could invalidate a token another live request
+		// is using (the ADR-0001 herd, triggered by a dead caller). A valid or
+		// stale token was already served above without minting; only a fresh
+		// mint is refused here.
+		if err := ctx.Err(); err != nil {
+			m.mu.Unlock()
+			return "", err
+		}
+
+		m.startFlightLocked(ctx)
 	}
+	fl := m.inflight
 	m.mu.Unlock()
 
 	select {
@@ -196,9 +214,10 @@ func (m *tokenManager) finishLocked(fl *issuance) {
 		m.inflight = nil
 	}
 	if fl.err != nil {
-		// Every failure arms the holdoff; get() decides what it may
-		// short-circuit (see the holdoff branch there): stale serving is
-		// always held, cached-error serving only for terminal failures.
+		// Every failure — transient or terminal — arms the holdoff: it is the
+		// manager-wide pacing gate (see get's gate (a)). Within the window the
+		// stale token or the cached error is served without a new issuance; a
+		// backed-off caller crosses the window and reaches a real retry.
 		m.lastErr = fl.err
 		m.holdUntil = m.now().Add(m.holdoff)
 		return

@@ -298,6 +298,16 @@ func TestClient_PostRetriesTokenAcquisitionButNotTheWrite(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestClient(t, srv)
+	// Model wall-clock advancing during backoff sleeps: the manager paces
+	// issuance retries by a holdoff, and a single caller's backed-off retry
+	// crosses that holdoff (whereas a no-wait concurrent burst is coalesced).
+	// A frozen clock (no-op sleep) would leave the retry inside the holdoff and
+	// never re-issue, which is exactly the pacing — so here the sleep advances
+	// the manager's clock, as real elapsed time would.
+	clock := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	c.tokens.now = clock.now
+	c.sleep = func(_ context.Context, d time.Duration) error { clock.advance(d); return nil }
+
 	resp, err := c.Post(context.Background(), "/api/v1/orders", strings.NewReader(`{}`))
 	if err != nil {
 		t.Fatalf("Post: %v", err)
