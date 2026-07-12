@@ -132,6 +132,13 @@ type Guard struct {
 	// persisted. TripTx never sets it (the caller's tx may still roll back);
 	// the only cost of a false negative is a redundant re-persist.
 	haltDurable bool
+	// haltSeq versions the durable-halt state. It bumps on every halt
+	// transition and whenever ClearGlobalHalt drops the durable flag, so a
+	// persist planned before either event cannot mark the halt durable
+	// afterwards — a stale mark landing inside a clear window would let a
+	// coalescing trip skip its re-persist and the clear wipe the only
+	// durable halt (codex P1, PR #57 round 3).
+	haltSeq uint64
 	// recoveryFailed marks that boot could not load halt/counter state.
 	// ClearGlobalHalt refuses to resume until it can reload that state.
 	recoveryFailed bool
@@ -308,6 +315,9 @@ type tripPlan struct {
 	persistReason string
 	// notifyReason non-empty => the notifier fires (new halted transition).
 	notifyReason string
+	// seq is the halt sequence the persist plan belongs to; the durable mark
+	// after a successful write is only valid while it is still current.
+	seq uint64
 }
 
 // haltLocked transitions the mirror to halted. Mirror first, durability
@@ -320,13 +330,14 @@ func (g *Guard) haltLocked(reason string) tripPlan {
 		if g.haltDurable {
 			return tripPlan{}
 		}
-		return tripPlan{persistReason: g.haltReason}
+		return tripPlan{persistReason: g.haltReason, seq: g.haltSeq}
 	}
 	g.halted = true
 	g.haltReason = reason
 	g.haltDurable = false
+	g.haltSeq++
 	g.gen++
-	return tripPlan{persistReason: reason, notifyReason: reason}
+	return tripPlan{persistReason: reason, notifyReason: reason, seq: g.haltSeq}
 }
 
 // applyTrip applies the in-memory effects of a trip and returns the
@@ -383,7 +394,7 @@ func (g *Guard) Trip(ctx context.Context, scope Scope, reason string, occurredAt
 			return tx.TripHalt(ctx, plan.persistReason)
 		})
 		if persistErr == nil {
-			g.markHaltDurable()
+			g.markHaltDurable(plan.seq)
 		}
 	}
 	if plan.notifyReason != "" {
@@ -515,7 +526,7 @@ func (g *Guard) reportFailure(ctx context.Context, tx store.Tx, name string, occ
 		return err
 	}
 	if tx == nil && plan.persistReason != "" {
-		g.markHaltDurable()
+		g.markHaltDurable(plan.seq)
 	}
 	if plan.notifyReason != "" {
 		g.notify(plan.notifyReason, occurredAt)
@@ -622,8 +633,11 @@ func (g *Guard) ClearGlobalHalt(ctx context.Context) error {
 	needReload := g.recoveryFailed
 	genBefore := g.gen
 	// Force any racing trip to plan a re-persist of the halt it coalesces
-	// into (haltLocked re-persists when the halt is not known durable).
+	// into (haltLocked re-persists when the halt is not known durable), and
+	// bump the halt sequence so an in-flight persist completing during this
+	// clear cannot resurrect the durable flag with a stale mark.
 	g.haltDurable = false
+	g.haltSeq++
 	g.mu.Unlock()
 
 	var tokenN, orderN int64
@@ -687,9 +701,13 @@ func (g *Guard) ClearGlobalHalt(ctx context.Context) error {
 	return nil
 }
 
-func (g *Guard) markHaltDurable() {
+// markHaltDurable records that the persist planned under halt sequence seq
+// committed. It is a no-op if the halt state moved on (new transition, or a
+// clear dropped the durable flag): a stale completion must not resurrect the
+// flag, or a coalescing trip during a clear would skip its re-persist.
+func (g *Guard) markHaltDurable(seq uint64) {
 	g.mu.Lock()
-	if g.halted {
+	if g.halted && g.haltSeq == seq {
 		g.haltDurable = true
 	}
 	g.mu.Unlock()

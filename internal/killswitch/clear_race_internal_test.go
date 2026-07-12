@@ -40,14 +40,17 @@ const (
 // the trip's in-memory phase is visible.
 type raceStore struct {
 	store.Store
-	tb       *testing.T
-	g        *Guard
-	ctx      context.Context
-	point    hookPoint
-	armed    bool // set (single-goroutine) right before ClearGlobalHalt
-	once     sync.Once
-	tripDone sync.WaitGroup
-	tripErr  error
+	tb    *testing.T
+	g     *Guard
+	ctx   context.Context
+	point hookPoint
+	armed bool // set (single-goroutine) right before ClearGlobalHalt
+	// beforeRace, when set, runs right before the racing trip fires —
+	// used to inject an event (e.g. a stale durable mark) into the window.
+	beforeRace func()
+	once       sync.Once
+	tripDone   sync.WaitGroup
+	tripErr    error
 }
 
 func (s *raceStore) fireRacingTrip() {
@@ -55,6 +58,9 @@ func (s *raceStore) fireRacingTrip() {
 		return
 	}
 	s.once.Do(func() {
+		if s.beforeRace != nil {
+			s.beforeRace()
+		}
 		s.g.mu.RLock()
 		genBefore := s.g.gen
 		s.g.mu.RUnlock()
@@ -113,6 +119,10 @@ func (tx hookedTx) ClearHalt(ctx context.Context) error {
 }
 
 func runClearRace(t *testing.T, point hookPoint) {
+	runClearRaceWith(t, point, nil)
+}
+
+func runClearRaceWith(t *testing.T, point hookPoint, beforeRace func(g *Guard)) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "store.db")
 	db, err := store.Open(path)
@@ -136,6 +146,9 @@ func runClearRace(t *testing.T, point hookPoint) {
 	}
 
 	// The clear races a fresh global trip: it must abort instead of resuming.
+	if beforeRace != nil {
+		rs.beforeRace = func() { beforeRace(g) }
+	}
 	rs.armed = true
 	if err := g.ClearGlobalHalt(ctx); err == nil {
 		t.Fatal("ClearGlobalHalt racing a trip must return an error")
@@ -179,4 +192,26 @@ func TestClearRacingTripInsideClearWriteKeepsDurableHalt(t *testing.T) {
 
 func TestClearRacingTripBeforeClearTxKeepsDurableHalt(t *testing.T) {
 	runClearRace(t, hookBeforeClearTx)
+}
+
+// TestStalePersistMarkCannotDefeatClearRace covers codex P1 from round 3 on
+// PR #57: a halt persist that was in flight when the clear started completes
+// DURING the clear window. Its durable mark must be rejected as stale —
+// if it resurrected haltDurable, the coalescing trip fired next would plan no
+// re-persist and the clear's commit would wipe the only durable halt, so a
+// restart would boot unhalted.
+func TestStalePersistMarkCannotDefeatClearRace(t *testing.T) {
+	var staleSeq uint64
+	captured := false
+	runClearRaceWith(t, hookInsideClearWrite, func(g *Guard) {
+		if !captured {
+			// Simulate the pre-clear persist completing now: it carries the
+			// halt sequence from before the clear bumped it.
+			g.mu.RLock()
+			staleSeq = g.haltSeq - 1
+			g.mu.RUnlock()
+			captured = true
+		}
+		g.markHaltDurable(staleSeq)
+	})
 }
