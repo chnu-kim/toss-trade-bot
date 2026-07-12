@@ -123,6 +123,26 @@ func TestSecret_FormattingIsRedacted(t *testing.T) {
 	}
 }
 
+// TestSecret_MismatchedVerbsAreRedacted guards fmt's bad-verb fallback: for a
+// verb the type does not support (e.g. %d on a string kind), fmt prints
+// "%!d(config.Secret=<raw>)" and, because it sets its internal erroring flag,
+// bypasses String()/GoString() entirely. Only fmt.Formatter covers every verb.
+func TestSecret_MismatchedVerbsAreRedacted(t *testing.T) {
+	s := Secret(rawSecret)
+	// The verbs are table-driven precisely because vet's printf check (rightly)
+	// rejects a constant mismatched format — but a runtime mistake or a format
+	// string built dynamically still reaches this path.
+	for _, verb := range []string{"%d", "%t", "%f", "%c", "%x"} {
+		if out := fmt.Sprintf(verb, s); strings.Contains(out, rawSecret) {
+			t.Fatalf("mismatched verb %s output %q leaks the raw secret", verb, out)
+		}
+		// Struct fields hit the same bad-verb fallback.
+		if out := fmt.Sprintf(verb, maskedConfig()); strings.Contains(out, rawSecret) {
+			t.Fatalf("mismatched verb %s on Config output %q leaks the raw secret", verb, out)
+		}
+	}
+}
+
 func TestConfig_FormattingIsRedacted(t *testing.T) {
 	cfg := maskedConfig()
 	err := fmt.Errorf("boot failed with cfg %+v", cfg)

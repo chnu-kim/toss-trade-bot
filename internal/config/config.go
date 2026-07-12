@@ -36,10 +36,23 @@ func (s Secret) redacted() string {
 	return redactedMarker
 }
 
-// String implements fmt.Stringer (%v, %+v, %s, %q, fmt.Sprint...).
+// Format implements fmt.Formatter, which covers EVERY verb — including
+// mismatched ones. Without it, a bad verb (e.g. %d on this string kind) makes
+// fmt fall back to its error format "%!d(config.Secret=<raw>)", and that path
+// sets fmt's internal erroring flag, bypassing String()/GoString() entirely.
+func (s Secret) Format(f fmt.State, verb rune) {
+	if verb == 'q' {
+		fmt.Fprintf(f, "%q", s.redacted())
+		return
+	}
+	fmt.Fprint(f, s.redacted())
+}
+
+// String implements fmt.Stringer for direct .String() calls and non-fmt
+// consumers (fmt itself resolves Format first).
 func (s Secret) String() string { return s.redacted() }
 
-// GoString implements fmt.GoStringer (%#v).
+// GoString implements fmt.GoStringer as belt-and-suspenders for %#v.
 func (s Secret) GoString() string { return s.redacted() }
 
 // LogValue implements slog.LogValuer, so slog never records the raw value.
