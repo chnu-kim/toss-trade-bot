@@ -140,9 +140,27 @@ type Guard struct {
 	// ambiguous-frequency escalation window. Memory-only: the reconciler
 	// re-injects trips (with original occurredAt) on restart, so stale
 	// entries age out naturally instead of re-escalating.
-	symbolTrips   []time.Time
-	orderFailures int64
-	tokenFailures int64
+	symbolTrips []time.Time
+	orderFail   failureCounter
+	tokenFail   failureCounter
+}
+
+// failureCounter is the in-process mirror of one reconstruction-resistant
+// escalation counter. epoch bumps on every accepted mutation so a durable
+// reset can detect that a failure raced it (failures win over resets — a
+// raced reset is abandoned rather than erasing streak progress).
+type failureCounter struct {
+	count int64
+	epoch uint64
+}
+
+// failureCounterRef resolves the mirror for a persisted counter name.
+// Callers hold g.mu; the returned pointer is a stable field address.
+func (g *Guard) failureCounterRef(name string) *failureCounter {
+	if name == CounterOrderFailures {
+		return &g.orderFail
+	}
+	return &g.tokenFail
 }
 
 // New loads persisted state and returns a usable Guard. It never fails open:
@@ -187,10 +205,10 @@ func New(ctx context.Context, st store.Store, notifier Notifier, cfg Config) *Gu
 
 	for _, c := range []struct {
 		name string
-		dst  *int64
+		dst  *failureCounter
 	}{
-		{CounterTokenRefreshFailures, &g.tokenFailures},
-		{CounterOrderFailures, &g.orderFailures},
+		{CounterTokenRefreshFailures, &g.tokenFail},
+		{CounterOrderFailures, &g.orderFail},
 	} {
 		rec, err := st.Counter(ctx, c.name)
 		if err != nil {
@@ -203,7 +221,7 @@ func New(ctx context.Context, st store.Store, notifier Notifier, cfg Config) *Gu
 			}
 			continue
 		}
-		*c.dst = rec.Value
+		c.dst.count = rec.Value
 	}
 	g.mu.Unlock()
 
@@ -411,9 +429,10 @@ func (g *Guard) ReportOrderFailureTx(ctx context.Context, tx store.Tx, occurredA
 }
 
 // ReportOrderSuccess resets the consecutive order-failure streak. It never
-// clears a halt (no auto-resume — ADR-0004 point 6). A failed durable reset
-// is returned but not escalated: the stale persisted value errs on the
-// conservative side.
+// clears a halt (no auto-resume — ADR-0004 point 6). The reset is durable
+// before it is visible: if the durable write fails or a failure races the
+// reset, the streak is kept on both sides and an error is returned — always
+// the conservative direction.
 func (g *Guard) ReportOrderSuccess(ctx context.Context) error {
 	return g.resetFailures(ctx, CounterOrderFailures)
 }
@@ -436,15 +455,19 @@ func (g *Guard) reportFailure(ctx context.Context, tx store.Tx, name string, occ
 	var plan tripPlan
 	switch name {
 	case CounterOrderFailures:
-		g.orderFailures++
-		n = g.orderFailures
+		c := g.failureCounterRef(name)
+		c.count++
+		c.epoch++
+		n = c.count
 		if n >= int64(g.cfg.OrderFailureThreshold) {
 			plan = g.haltLocked(fmt.Sprintf(
 				"consecutive order failures: %d (threshold %d)", n, g.cfg.OrderFailureThreshold))
 		}
 	case CounterTokenRefreshFailures:
-		g.tokenFailures++
-		n = g.tokenFailures
+		c := g.failureCounterRef(name)
+		c.count++
+		c.epoch++
+		n = c.count
 		if n >= int64(g.cfg.TokenRefreshFailureThreshold) {
 			plan = g.haltLocked(fmt.Sprintf(
 				"consecutive token refresh failures: %d (threshold %d)", n, g.cfg.TokenRefreshFailureThreshold))
@@ -500,20 +523,59 @@ func (g *Guard) reportFailure(ctx context.Context, tx store.Tx, name string, occ
 	return nil
 }
 
+// errResetRaced reports that a failure was recorded while a counter reset
+// was in flight: the reset is abandoned and the streak kept (failures win —
+// erasing progress would delay escalation).
+var errResetRaced = errors.New("killswitch: counter reset abandoned, a failure raced the reset — streak kept")
+
+// resetFailures durably resets one failure streak, fail-safe in the
+// conservative direction (codex adversarial on PR #57):
+//
+//   - The mirror is zeroed only AFTER the durable reset committed, so a
+//     failed durable write never leaves the live guard undercounting.
+//   - The durable write re-checks the counter epoch inside the transaction;
+//     if a failure raced ahead, the reset aborts without touching the store.
+//     If a failure lands after the commit instead, its own read-modify-write
+//     persist runs behind the reset on the single write connection, sees the
+//     committed zero, and re-persists the streak — so no interleaving leaves
+//     the durable counter behind the mirror.
 func (g *Guard) resetFailures(ctx context.Context, name string) error {
-	g.mu.Lock()
-	var prev int64
-	switch name {
-	case CounterOrderFailures:
-		prev, g.orderFailures = g.orderFailures, 0
-	case CounterTokenRefreshFailures:
-		prev, g.tokenFailures = g.tokenFailures, 0
-	}
-	g.mu.Unlock()
+	g.mu.RLock()
+	c := g.failureCounterRef(name)
+	prev := c.count
+	epochBefore := c.epoch
+	g.mu.RUnlock()
 	if prev == 0 {
 		return nil
 	}
-	return g.st.SetCounter(ctx, store.Counter{Name: name, UpdatedAt: g.now()})
+
+	err := g.st.Atomically(ctx, func(tx store.Tx) error {
+		g.mu.RLock()
+		raced := g.failureCounterRef(name).epoch != epochBefore
+		g.mu.RUnlock()
+		if raced {
+			return errResetRaced
+		}
+		return tx.SetCounter(ctx, store.Counter{Name: name, UpdatedAt: g.now()})
+	})
+	switch {
+	case errors.Is(err, errResetRaced):
+		return errResetRaced
+	case err != nil:
+		return fmt.Errorf("killswitch: durable counter reset failed, keeping streak: %w", err)
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	c = g.failureCounterRef(name)
+	if c.epoch != epochBefore {
+		// A failure raced between the commit and here; it re-persists its
+		// count against the committed zero, so both sides keep the streak.
+		return errResetRaced
+	}
+	c.count = 0
+	c.epoch++
+	return nil
 }
 
 // ClearSymbol removes one per-symbol block: the auto-clear path the
@@ -566,6 +628,14 @@ func (g *Guard) ClearGlobalHalt(ctx context.Context) error {
 
 	var tokenN, orderN int64
 	if needReload {
+		// The clear may only resume what it can read: if boot could not load
+		// the halt state, an unconditional clear here would wipe a durable
+		// halt the guard never observed (codex review round 2 on PR #57).
+		// The persisted state itself is what the operator's explicit clear
+		// resumes from, so a successful read is the gate.
+		if _, err := g.st.Halt(ctx); err != nil {
+			return fmt.Errorf("killswitch: clear refused, halt state still unreadable: %w", err)
+		}
 		tc, err := g.st.Counter(ctx, CounterTokenRefreshFailures)
 		if err != nil {
 			return fmt.Errorf("killswitch: clear refused, counter recovery still failing: %w", err)
@@ -607,7 +677,8 @@ func (g *Guard) ClearGlobalHalt(ctx context.Context) error {
 		return errClearRaced
 	}
 	if needReload {
-		g.tokenFailures, g.orderFailures = tokenN, orderN
+		g.tokenFail = failureCounter{count: tokenN, epoch: g.tokenFail.epoch + 1}
+		g.orderFail = failureCounter{count: orderN, epoch: g.orderFail.epoch + 1}
 		g.recoveryFailed = false
 	}
 	g.halted = false

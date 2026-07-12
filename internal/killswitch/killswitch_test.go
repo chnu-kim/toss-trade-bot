@@ -392,6 +392,62 @@ func TestOrderFailureConsecutiveThresholdAndResetOnSuccess(t *testing.T) {
 	}
 }
 
+func TestResetWriteFailureKeepsStreak(t *testing.T) {
+	// codex adversarial (PR #57 round 2): the mirror must not forget the
+	// failure streak before the durable reset committed — otherwise a failed
+	// reset leaves the live guard undercounting during exactly the
+	// degraded-store scenarios it must survive.
+	ctx := context.Background()
+	db := openStore(t)
+	flaky := &flakyStore{Store: db}
+	g := killswitch.New(ctx, flaky, nil, killswitch.Config{OrderFailureThreshold: 3})
+	g.MarkReplayComplete()
+	at := time.Now()
+
+	for i := 0; i < 2; i++ {
+		if err := g.ReportOrderFailure(ctx, at); err != nil {
+			t.Fatalf("ReportOrderFailure: %v", err)
+		}
+	}
+
+	flaky.failWrites = true
+	if err := g.ReportOrderSuccess(ctx); err == nil {
+		t.Fatal("ReportOrderSuccess must surface the durable reset failure")
+	}
+	flaky.failWrites = false
+
+	// The streak survived the failed reset: one more failure (not three)
+	// crosses the threshold.
+	mustAllow(t, g.CanSubmit("AAPL"))
+	if err := g.ReportOrderFailure(ctx, at); err != nil {
+		t.Fatalf("ReportOrderFailure: %v", err)
+	}
+	mustBlock(t, g.CanSubmit("AAPL"), "order failures")
+}
+
+func TestClearRefusesWhileHaltStateUnreadable(t *testing.T) {
+	// codex review (PR #57 round 2): after a boot halt-load failure, an
+	// explicit clear must not wipe durable halt state it never managed to
+	// read — the clear is allowed only once the halt state is readable again.
+	ctx := context.Background()
+	db := openStore(t)
+	flaky := &flakyStore{Store: db, failHaltLoad: true}
+	g := killswitch.New(ctx, flaky, nil, killswitch.Config{})
+	g.MarkReplayComplete()
+	mustBlock(t, g.CanSubmit("AAPL"), "")
+
+	if err := g.ClearGlobalHalt(ctx); err == nil {
+		t.Fatal("ClearGlobalHalt must refuse while the halt state is still unreadable")
+	}
+	mustBlock(t, g.CanSubmit("AAPL"), "")
+
+	flaky.failHaltLoad = false
+	if err := g.ClearGlobalHalt(ctx); err != nil {
+		t.Fatalf("ClearGlobalHalt after recovery: %v", err)
+	}
+	mustAllow(t, g.CanSubmit("AAPL"))
+}
+
 // ---------------------------------------------------------------------------
 // Per-symbol blocks + ambiguous frequency escalation (ADR-0004 points 4, 7)
 // ---------------------------------------------------------------------------
