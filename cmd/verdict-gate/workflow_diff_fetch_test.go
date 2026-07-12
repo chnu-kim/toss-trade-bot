@@ -41,12 +41,62 @@ const (
 
 // fakeGH simulates GitHub mid-A→B→A-race. Mutable PR-number-keyed reads
 // return B content and log themselves to $FAKE_GH_STATE/mutable-reads.log;
-// SHA-keyed compare reads return the content of the requested SHA;
-// the head recheck reports A (branch already reset back).
+// SHA-keyed compare reads return the content of the requested SHAs; the
+// head recheck reports A (branch already reset back); the default-branch
+// read reports $FAKE_DEFAULT_BRANCH.
+//
+// Crucially (issue #54 additional ③), the compare *files* read returns raw
+// JSON and runs the workflow's OWN --jq expression against it via the real
+// jq binary — the fake does not hand back a pre-projected path list. So if
+// the workflow's jq stops extracting `previous_filename`, the #52
+// rename-path-hiding guard regresses and this reproduction goes RED instead
+// of false-green. The raw files JSON deliberately includes a renamed file
+// (filename + previous_filename) so previous_filename extraction is
+// observable in the output.
 const fakeGH = `#!/bin/sh
+# Capture the workflow's own --jq expression (if any) and run it, via the
+# real jq, against raw JSON — so a jq regression in the workflow is caught.
+jq_expr=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--jq" ]; then jq_expr="$a"; fi
+  prev="$a"
+done
 args="$*"
 count="${FAKE_FILES_COUNT:-2}"
+
+emit() { # $1 = raw JSON; apply the workflow's own --jq if it passed one
+  if [ -n "$jq_expr" ]; then printf '%s' "$1" | jq -r "$jq_expr"; else printf '%s' "$1"; fi
+}
+
+case "$count" in
+  0) files_raw='{"files":[]}' ;;
+  2) files_raw='{"files":[{"filename":"a-file.go"},{"filename":"a-new-path.go","previous_filename":"a-renamed-old-path.go"}]}' ;;
+  *) files_raw=$(jq -nc --argjson n "$count" '{files: [range($n) | {filename: ("f\(.).go")}]}') ;;
+esac
+
 case "$args" in
+  *"/compare/9999999999999999999999999999999999999999...1111111111111111111111111111111111111111"*)
+    case "$args" in
+      *"application/vnd.github.diff"*)
+        printf 'diff --git a/a-file.go b/a-file.go\nMARKER-DIFF-FOR-A\n' ;;
+      *)
+        emit "$files_raw" ;;
+    esac
+    ;;
+  *"/compare/"*)
+    echo "fake gh: compare keyed to unexpected SHAs (must be the recorded base tip 9999... + recorded head 1111...): $args" >&2
+    exit 64
+    ;;
+  *".default_branch"*)
+    printf '%s\n' "${FAKE_DEFAULT_BRANCH:-main}"
+    ;;
+  *"/commits/"*)
+    emit '{"sha":"9999999999999999999999999999999999999999"}'
+    ;;
+  *"pr view"*)
+    printf '1111111111111111111111111111111111111111\n'
+    ;;
   *"pr diff"*)
     printf '%s\n' "$args" >> "$FAKE_GH_STATE/mutable-reads.log"
     printf 'diff --git a/b-file.go b/b-file.go\nMARKER-DIFF-FOR-B\n'
@@ -54,29 +104,6 @@ case "$args" in
   *"/pulls/"*)
     printf '%s\n' "$args" >> "$FAKE_GH_STATE/mutable-reads.log"
     printf 'b-file.go\n'
-    ;;
-  *"/commits/main"*)
-    printf '9999999999999999999999999999999999999999\n'
-    ;;
-  *"/compare/9999999999999999999999999999999999999999...1111111111111111111111111111111111111111"*)
-    case "$args" in
-      *"application/vnd.github.diff"*)
-        printf 'diff --git a/a-file.go b/a-file.go\nMARKER-DIFF-FOR-A\n' ;;
-      *".files | length"*)
-        printf '%s\n' "$count" ;;
-      *".files[]"*)
-        if [ "$count" != "0" ]; then printf 'a-file.go\na-renamed-old-path.go\n'; fi ;;
-      *)
-        echo "fake gh: unhandled compare invocation: $args" >&2
-        exit 64 ;;
-    esac
-    ;;
-  *"/compare/"*)
-    echo "fake gh: compare keyed to unexpected SHAs (must be the recorded base tip + recorded head SHA): $args" >&2
-    exit 64
-    ;;
-  *"pr view"*)
-    printf '1111111111111111111111111111111111111111\n'
     ;;
   *)
     echo "fake gh: unexpected invocation: $args" >&2
@@ -154,11 +181,23 @@ func extractFetchStepRunBlock(t *testing.T) string {
 	return script
 }
 
+// fetchStepParams configures one execution of the extracted step body.
+type fetchStepParams struct {
+	filesCount    string // FAKE_FILES_COUNT
+	baseRef       string // BASE_REF (PR base branch name)
+	defaultBranch string // FAKE_DEFAULT_BRANCH (what the repo reports)
+}
+
+// defaultFetchParams is the happy path: 2 files, base ref == default branch.
+func defaultFetchParams() fetchStepParams {
+	return fetchStepParams{filesCount: "2", baseRef: "main", defaultBranch: "main"}
+}
+
 // runFetchStep executes the extracted step body in an isolated workspace
 // with the fake gh on PATH, returning the exit error (nil on success), the
 // workspace dir (where pr.diff / changed-paths.txt land), the fake-state
 // dir, and combined output.
-func runFetchStep(t *testing.T, filesCount string) (runErr error, workDir, stateDir, output string) {
+func runFetchStep(t *testing.T, p fetchStepParams) (runErr error, workDir, stateDir, output string) {
 	t.Helper()
 	script := extractFetchStepRunBlock(t)
 
@@ -177,9 +216,10 @@ func runFetchStep(t *testing.T, filesCount string) (runErr error, workDir, state
 		"REPO=x-owner/x-repo",
 		"PR_NUMBER=7",
 		"HEAD_SHA="+raceHeadSHA,
-		"BASE_REF=main",
+		"BASE_REF="+p.baseRef,
 		"FAKE_GH_STATE="+stateDir,
-		"FAKE_FILES_COUNT="+filesCount,
+		"FAKE_FILES_COUNT="+p.filesCount,
+		"FAKE_DEFAULT_BRANCH="+p.defaultBranch,
 	)
 	out, err := cmd.CombinedOutput()
 	return err, workDir, stateDir, string(out)
@@ -192,7 +232,7 @@ func runFetchStep(t *testing.T, filesCount string) (runErr error, workDir, state
 // i.e. the content of the SHA the verdict will be published against, not
 // the content the moving branch happened to point at.
 func TestVerdictGateWorkflow_DiffFetchStep_ABAHeadRace_ReviewsRecordedHeadShaContent(t *testing.T) {
-	runErr, workDir, stateDir, output := runFetchStep(t, "2")
+	runErr, workDir, stateDir, output := runFetchStep(t, defaultFetchParams())
 	if runErr != nil {
 		t.Fatalf("step body failed under the A→B→A simulation (it must succeed by fetching immutable SHA-keyed content): %v\noutput:\n%s", runErr, output)
 	}
@@ -213,9 +253,19 @@ func TestVerdictGateWorkflow_DiffFetchStep_ABAHeadRace_ReviewsRecordedHeadShaCon
 	if err != nil {
 		t.Fatalf("step did not produce changed-paths.txt: %v\noutput:\n%s", err, output)
 	}
-	want := "a-file.go\na-renamed-old-path.go\n"
+	// Produced by the workflow's OWN jq (.files[] | .filename,
+	// (.previous_filename // empty)) run against the fake's raw files JSON:
+	// a-file.go (no rename), then a-new-path.go + its previous name
+	// a-renamed-old-path.go. The renamed file's OLD path being present is
+	// the #52 path-hiding guard — if the workflow jq stops extracting
+	// previous_filename, a-renamed-old-path.go vanishes and this assertion
+	// fails (no longer false-green — issue #54 additional ③).
+	want := "a-file.go\na-new-path.go\na-renamed-old-path.go\n"
 	if string(changed) != want {
-		t.Errorf("changed-paths.txt must list A's files (including a rename's previous_filename), got:\n%q\nwant:\n%q", changed, want)
+		t.Errorf("changed-paths.txt must list A's files including a rename's previous_filename (#52 path-hiding guard), got:\n%q\nwant:\n%q", changed, want)
+	}
+	if !strings.Contains(string(changed), "a-renamed-old-path.go") {
+		t.Errorf("the renamed file's OLD path (previous_filename) is missing from changed-paths.txt — the workflow's jq is not extracting previous_filename, so a rename that moves a critical path into a non-critical one would evade risk classification (ADR-0008 point 5 / #52). Got:\n%q", changed)
 	}
 }
 
@@ -226,9 +276,32 @@ func TestVerdictGateWorkflow_DiffFetchStep_ABAHeadRace_ReviewsRecordedHeadShaCon
 // path from risk classification (ADR-0008 point 5). At the cap the step
 // must fail — no verdict at all instead of a verdict on a partial list.
 func TestVerdictGateWorkflow_DiffFetchStep_FailsClosedAtCompareFileCap(t *testing.T) {
-	runErr, _, _, output := runFetchStep(t, "300")
+	p := defaultFetchParams()
+	p.filesCount = "300"
+	runErr, _, _, output := runFetchStep(t, p)
 	if runErr == nil {
 		t.Fatalf("step succeeded with a compare file list at the 300-entry platform cap — it must fail closed on possible truncation (a hidden critical path would skip the N-of-2 regime). Output:\n%s", output)
+	}
+}
+
+// TestVerdictGateWorkflow_DiffFetchStep_FailsClosedOnNonDefaultBaseRef is the
+// reproduction for issue #54 additional ①: fix ②'s compare source added
+// base_ref as a mutable input to the risk-classification boundary. A base
+// ref that is not the repo default branch would make the three-dot compare
+// measure against the wrong base, producing a changed-paths set that is not
+// this PR's real contribution — the step must fail closed before fetching
+// (no verdict = merge blocked) rather than classify a mis-based path list.
+func TestVerdictGateWorkflow_DiffFetchStep_FailsClosedOnNonDefaultBaseRef(t *testing.T) {
+	p := defaultFetchParams()
+	p.baseRef = "release/1.0" // valid branch, but not the default branch
+	p.defaultBranch = "main"
+	runErr, workDir, _, output := runFetchStep(t, p)
+	if runErr == nil {
+		t.Fatalf("step succeeded with base_ref (%q) != default_branch (%q) — it must fail closed, since the compare and thus risk classification would be measured against a non-default base (issue #54 ①). Output:\n%s", p.baseRef, p.defaultBranch, output)
+	}
+	// It must fail closed BEFORE producing any diff/paths for classification.
+	if _, err := os.ReadFile(filepath.Join(workDir, "changed-paths.txt")); err == nil {
+		t.Errorf("changed-paths.txt was produced for a non-default base ref — the guard must reject before any mis-based path list reaches classification")
 	}
 }
 
@@ -237,7 +310,9 @@ func TestVerdictGateWorkflow_DiffFetchStep_FailsClosedAtCompareFileCap(t *testin
 // file list for a real PR most likely means the API call failed silently,
 // and must remain fail-closed rather than flowing into risk classification.
 func TestVerdictGateWorkflow_DiffFetchStep_FailsClosedOnEmptyFileList(t *testing.T) {
-	runErr, _, _, output := runFetchStep(t, "0")
+	p := defaultFetchParams()
+	p.filesCount = "0"
+	runErr, _, _, output := runFetchStep(t, p)
 	if runErr == nil {
 		t.Fatalf("step succeeded with an empty changed-file list — it must fail closed (silent API failure indistinguishable from a genuinely empty PR). Output:\n%s", output)
 	}

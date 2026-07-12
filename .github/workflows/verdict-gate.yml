@@ -296,17 +296,50 @@ jobs:
           # (e)(iv) requires the legs to review, and
           # gate.ParseUnifiedDiff keys only on diff/---/+++/@@ lines,
           # which both formats share.)
-          # Base-tip resolution notes (codex:review P2 on #54, held with
-          # empirical grounding): (1) ref names containing "/" resolve
-          # fine unencoded on the commits endpoint — verified live against
-          # a real "release/8.0" branch (GitHub matches the ref greedily);
-          # (2) `gh pr view`'s baseRefOid was considered and rejected as
-          # the key — it is a stale snapshot, not the live base tip
-          # (verified live: a months-old open PR's baseRefOid differs from
-          # its base branch's current tip), and a stale base pollutes the
-          # three-dot compare with already-merged base commits; (3) a base
-          # ref that fails to resolve for any reason fails closed right
-          # below (no verdict = merge blocked), never an incorrect verdict.
+          # Base ref must be the repo default branch (issue #54 additional
+          # ①, adversarial panel): fix ②'s compare source introduced a new
+          # mutable input, base_ref, into the risk-classification boundary
+          # (the changed-paths below are classify's ONLY input, and
+          # ADR-0008 point 5 makes that classification the security
+          # boundary between codex-single and N-of-2). A three-dot compare
+          # is a merge-base diff, so an unexpected base_ref would yield a
+          # changed-paths set that is not "this PR's contribution vs main"
+          # — an unvalidated input to a security boundary, which ADR-0008
+          # point 5's "when in doubt, critical" philosophy forbids. Resolve
+          # the default branch (metadata read — within the post-narrowing
+          # PAT spec) and fail closed on any mismatch. This guard also
+          # closes the codex:review P2 (base-ref resolution — see below):
+          # an unexpected base_ref is rejected here before it reaches the
+          # commits endpoint at all.
+          default_branch=$(gh api "repos/$REPO" --jq '.default_branch')
+          if [ -z "$default_branch" ] || [ "$default_branch" = "null" ]; then
+            echo "::error::could not resolve the repo default branch — failing closed."
+            exit 1
+          fi
+          if [ "$BASE_REF" != "$default_branch" ]; then
+            echo "::error::PR base ref '$BASE_REF' is not the repo default branch '$default_branch'. The base...head compare that risk classification derives from must be measured against the default branch. Failing closed (no verdict = merge blocked)."
+            exit 1
+          fi
+          # Base-tip resolution notes (codex:review P2 on #54 — REVISED:
+          # my first response held this as safe on a "/" test and was
+          # WRONG). (1) The commits endpoint does resolve "/"-containing
+          # refs unencoded, but "#" and "%XX" do NOT round-trip: `gh api`
+          # truncates everything after a literal "#" as a URL fragment
+          # (verified live: `.../commits/foo#bar` requests `.../commits/
+          # foo`) and passes "%XX" through to be percent-decoded server-
+          # side — both are valid git branch chars, so an unencoded
+          # base_ref with either could silently resolve to a DIFFERENT ref
+          # (a valid-but-wrong SHA the -z/null guard cannot catch: a
+          # silent fail-OPEN, not the fail-closed I claimed). This is now
+          # moot: the default-branch equality guard above rejects any
+          # base_ref != default_branch first, and the default branch
+          # (main) contains no "#"/"%", so the value reaching the commits
+          # endpoint below is always the literal, round-tripping default
+          # branch name. (2) `gh pr view`'s baseRefOid was rejected as the
+          # key — it is a stale creation-time snapshot, not the live base
+          # tip (verified live: a months-old open PR's baseRefOid differs
+          # from its base branch's current tip), which would pollute the
+          # three-dot compare with already-merged base commits.
           base_sha=$(gh api "repos/$REPO/commits/$BASE_REF" --jq '.sha')
           if [ -z "$base_sha" ] || [ "$base_sha" = "null" ]; then
             echo "::error::could not resolve base ref '$BASE_REF' to a commit SHA — failing closed."

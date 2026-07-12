@@ -227,3 +227,44 @@ func TestVerdictGateWorkflow_DiffFetchUsesImmutableCompareKeyedToRecordedSha(t *
 		t.Errorf("%s must fail closed when the compare file list reaches the 300-entry platform cap (possible truncation ⇒ possible unclassified critical path) — the -ge 300 guard is missing", workflowPath)
 	}
 }
+
+// TestVerdictGateWorkflow_DiffFetchValidatesBaseRefIsDefaultBranch is the
+// structural lint for issue #54 additional ① (adversarial panel): fix ②'s
+// compare source ($base_sha...$HEAD_SHA) introduced base_ref as a new
+// mutable input to the risk-classification boundary — the changed-paths a
+// three-dot compare produces are only "this PR's contribution vs main" when
+// base_ref is the default branch. ADR-0008 point 5 makes classification the
+// security boundary (codex-single vs N-of-2) and mandates "when in doubt,
+// critical", so an unvalidated base_ref reaching that boundary must be
+// rejected. The step must resolve the default branch from the API (not
+// hardcode "main") and fail closed on any mismatch before the compare
+// fetch. This guard also subsumes the codex:review P2 base-ref-resolution
+// concern (an unexpected base_ref with "#"/"%" is rejected here before it
+// can silently resolve to a wrong ref at the commits endpoint).
+func TestVerdictGateWorkflow_DiffFetchValidatesBaseRefIsDefaultBranch(t *testing.T) {
+	const workflowPath = "../../.github/workflows/verdict-gate.yml"
+	data, err := os.ReadFile(workflowPath)
+	if err != nil {
+		t.Fatalf("reading %s: %v", workflowPath, err)
+	}
+	content := string(data)
+
+	// Default branch must be read from the API, not hardcoded.
+	const defaultBranchRead = `gh api "repos/$REPO" --jq '.default_branch'`
+	if !strings.Contains(content, defaultBranchRead) {
+		t.Errorf("%s must resolve the repo default branch from the API (%s) to validate base_ref against it (issue #54 ①) — a hardcoded 'main' would silently pass a mis-based compare on a repo whose default branch is renamed", workflowPath, defaultBranchRead)
+	}
+	// The equality guard + fail-closed must be present.
+	const mismatchGuard = `if [ "$BASE_REF" != "$default_branch" ]; then`
+	if !strings.Contains(content, mismatchGuard) {
+		t.Errorf("%s must fail closed when base_ref != default_branch (%s is missing) — an unexpected base_ref feeds an unvalidated changed-paths set into the ADR-0008 point 5 risk-classification boundary", workflowPath, mismatchGuard)
+	}
+	// The guard must precede the compare fetch it protects (ordering: a
+	// guard after the base_sha resolution would not stop the mis-based
+	// compare from being built).
+	guardIdx := strings.Index(content, mismatchGuard)
+	baseShaIdx := strings.Index(content, `base_sha=$(gh api "repos/$REPO/commits/$BASE_REF"`)
+	if guardIdx < 0 || baseShaIdx < 0 || guardIdx > baseShaIdx {
+		t.Errorf("the base_ref==default_branch guard must appear before base_sha resolution in %s (guard idx %d, base_sha idx %d)", workflowPath, guardIdx, baseShaIdx)
+	}
+}
