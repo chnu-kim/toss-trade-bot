@@ -37,6 +37,12 @@
 //   - No auto-resume for the global halt (ADR-0004 point 6): only the
 //     explicit ClearGlobalHalt call resumes submission. Per-symbol blocks
 //     auto-clear via ClearSymbol when the reconciler resolves the ambiguity.
+//   - Initial authorization is a halt, not a separate mechanism (ADR-0007):
+//     a store that has never seen an explicit clear boots halted with
+//     ReasonAwaitingInitialAuthorization, so deploying is never the event
+//     that starts live trading — the human clear is. The authorization is
+//     recorded durably in the same transaction as the clear; losing the
+//     store (or its provenance) re-arms the initial halt.
 //   - Callers own atomic coupling (ADR-0005 point 3): when a halt trip or an
 //     order-failure report is part of one logical event with a journal write,
 //     the caller opens store.Atomically and uses TripTx /

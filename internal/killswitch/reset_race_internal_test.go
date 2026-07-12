@@ -96,6 +96,7 @@ func TestResetRacingFailureKeepsCounterProgress(t *testing.T) {
 	}
 	defer db.Close()
 
+	authorizeForTest(t, ctx, db)
 	rs := &resetRaceStore{Store: db, tb: t, ctx: ctx}
 	g := New(ctx, rs, nil, Config{OrderFailureThreshold: 5})
 	rs.g = g

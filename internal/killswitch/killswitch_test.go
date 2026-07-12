@@ -133,10 +133,23 @@ func openStoreAt(t *testing.T, path string) *store.DB {
 	return db
 }
 
+// authorizeStore performs the one-time human live-trading authorization
+// (ADR-0007) so tests exercise post-authorization behaviour. Fresh-boot
+// behaviour is covered by TestFreshStoreAwaitsInitialAuthorization.
+func authorizeStore(t *testing.T, st store.Store) {
+	t.Helper()
+	ctx := context.Background()
+	boot := killswitch.New(ctx, st, nil, killswitch.Config{})
+	if err := boot.ClearGlobalHalt(ctx); err != nil {
+		t.Fatalf("authorize store: %v", err)
+	}
+}
+
 func openStore(t *testing.T) *store.DB {
 	t.Helper()
 	db := openStoreAt(t, filepath.Join(t.TempDir(), "store.db"))
 	t.Cleanup(func() { _ = db.Close() })
+	authorizeStore(t, db)
 	return db
 }
 
@@ -226,6 +239,67 @@ func TestCounterLoadFailureFailsClosedAndClearRecovers(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Initial live-trading authorization (ADR-0007 points 3/4/7)
+// ---------------------------------------------------------------------------
+
+func TestFreshStoreAwaitsInitialAuthorization(t *testing.T) {
+	// Deploying is never the event that starts live trading: a store that
+	// has never seen an explicit clear boots halted with
+	// awaiting-initial-authorization (persisted, notified once). Only the
+	// human ClearGlobalHalt opens it, and that authorization is durable.
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "store.db")
+
+	db1 := openStoreAt(t, path)
+	spy := &spyNotifier{}
+	g1 := killswitch.New(ctx, db1, spy, killswitch.Config{})
+	g1.MarkReplayComplete()
+	mustBlock(t, g1.CanSubmit("AAPL"), killswitch.ReasonAwaitingInitialAuthorization)
+	if halted, reason := g1.Halted(); !halted || !strings.Contains(reason, killswitch.ReasonAwaitingInitialAuthorization) {
+		t.Fatalf("fresh store must boot awaiting authorization, got halted=%v reason=%q", halted, reason)
+	}
+	if spy.count() != 1 {
+		t.Fatalf("initial-authorization halt must notify exactly once, got %d", spy.count())
+	}
+	haltState, err := db1.Halt(ctx)
+	if err != nil {
+		t.Fatalf("Halt: %v", err)
+	}
+	if !haltState.Halted || haltState.Reason != killswitch.ReasonAwaitingInitialAuthorization {
+		t.Fatalf("awaiting halt must be persisted, got %+v", haltState)
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Reboot before the first clear: still awaiting, no re-notification.
+	db2 := openStoreAt(t, path)
+	spy2 := &spyNotifier{}
+	g2 := killswitch.New(ctx, db2, spy2, killswitch.Config{})
+	g2.MarkReplayComplete()
+	mustBlock(t, g2.CanSubmit("AAPL"), killswitch.ReasonAwaitingInitialAuthorization)
+	if spy2.count() != 0 {
+		t.Fatalf("re-booting into the persisted awaiting halt must not re-notify, got %d", spy2.count())
+	}
+
+	// The explicit human clear IS the authorization.
+	if err := g2.ClearGlobalHalt(ctx); err != nil {
+		t.Fatalf("ClearGlobalHalt: %v", err)
+	}
+	mustAllow(t, g2.CanSubmit("AAPL"))
+	if err := db2.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// The authorization survives restarts: later boots start unhalted.
+	db3 := openStoreAt(t, path)
+	defer db3.Close()
+	g3 := killswitch.New(ctx, db3, nil, killswitch.Config{})
+	g3.MarkReplayComplete()
+	mustAllow(t, g3.CanSubmit("AAPL"))
+}
+
+// ---------------------------------------------------------------------------
 // Global halt persistence across restart (ADR-0004 point 4)
 // ---------------------------------------------------------------------------
 
@@ -234,6 +308,7 @@ func TestGlobalHaltSurvivesRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.db")
 
 	db1 := openStoreAt(t, path)
+	authorizeStore(t, db1)
 	g1 := killswitch.New(ctx, db1, nil, killswitch.Config{})
 	g1.MarkReplayComplete()
 	if err := g1.Trip(ctx, killswitch.Global(), "manual: incident drill", time.Now()); err != nil {
@@ -260,6 +335,7 @@ func TestBootWithPersistedHaltDoesNotRenotify(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.db")
 
 	db1 := openStoreAt(t, path)
+	authorizeStore(t, db1)
 	spy1 := &spyNotifier{}
 	g1 := killswitch.New(ctx, db1, spy1, killswitch.Config{})
 	g1.MarkReplayComplete()
@@ -296,6 +372,7 @@ func TestTokenFailureEscalationSurvivesRestart(t *testing.T) {
 	cfg := killswitch.Config{TokenRefreshFailureThreshold: 3}
 
 	db1 := openStoreAt(t, path)
+	authorizeStore(t, db1)
 	g1 := killswitch.New(ctx, db1, nil, cfg)
 	g1.MarkReplayComplete()
 	at := time.Now()

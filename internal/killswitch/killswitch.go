@@ -17,7 +17,20 @@ const (
 	CounterTokenRefreshFailures = "killswitch.token-refresh-failures"
 	// CounterOrderFailures counts consecutive order failures.
 	CounterOrderFailures = "killswitch.order-failures"
+	// CounterLiveAuthorization is the durable provenance marker for the
+	// initial live-trading authorization (ADR-0007). It is written (value 1)
+	// in the same transaction as every successful ClearGlobalHalt — the
+	// human clear IS the authorization event — and read at boot: a store
+	// whose halt state is clear but that carries no authorization marker is
+	// either a fresh deployment or a store whose provenance was lost, and
+	// both must boot halted (ADR-0007 points 3/7).
+	CounterLiveAuthorization = "killswitch.live-authorization"
 )
+
+// ReasonAwaitingInitialAuthorization is the halt reason a never-authorized
+// (or provenance-lost) deployment boots with (ADR-0007 point 3). Only the
+// explicit human ClearGlobalHalt starts the first live trading.
+const ReasonAwaitingInitialAuthorization = "awaiting-initial-authorization"
 
 // Default escalation parameters. They are deliberately conservative starting
 // points; tune via Config (zero values fall back to these defaults).
@@ -173,7 +186,11 @@ func (g *Guard) failureCounterRef(name string) *failureCounter {
 // New loads persisted state and returns a usable Guard. It never fails open:
 // if the halt state or a persisted counter cannot be loaded, the returned
 // guard starts halted with a boot-recovery reason (ADR-0004 point 3) and only
-// ClearGlobalHalt — which re-checks the store — can resume it.
+// ClearGlobalHalt — which re-checks the store — can resume it. A store that
+// was never explicitly authorized for live trading (fresh deployment, or
+// provenance lost) boots halted with ReasonAwaitingInitialAuthorization
+// (ADR-0007 points 3/7); the first successful ClearGlobalHalt records the
+// authorization durably.
 //
 // The startup replay gate starts closed; call MarkReplayComplete after the
 // reconciler finished re-deriving per-symbol blocks from the journal.
@@ -194,6 +211,7 @@ func New(ctx context.Context, st store.Store, notifier Notifier, cfg Config) *Gu
 	var notifications []pending
 
 	g.mu.Lock()
+	var awaitingPlan tripPlan
 	halt, err := st.Halt(ctx)
 	switch {
 	case err != nil:
@@ -208,6 +226,28 @@ func New(ctx context.Context, st store.Store, notifier Notifier, cfg Config) *Gu
 		g.halted = true
 		g.haltReason = halt.Reason
 		g.haltDurable = true
+		g.haltSeq++
+	default:
+		// The halt state reads clear — but has live trading ever been
+		// explicitly authorized on this store? A fresh deployment and a
+		// store whose provenance was lost are both indistinguishable from
+		// "never authorized", and both must boot halted until the human
+		// clear (ADR-0007 points 3/7: absence of evidence is not safety).
+		auth, aerr := st.Counter(ctx, CounterLiveAuthorization)
+		switch {
+		case aerr != nil:
+			g.recoveryFailed = true
+			plan := g.haltLocked(fmt.Sprintf(
+				"boot recovery failed: counter %s load: %v", CounterLiveAuthorization, aerr))
+			if plan.notifyReason != "" {
+				notifications = append(notifications, pending{plan.notifyReason, g.now()})
+			}
+		case auth.Value == 0:
+			awaitingPlan = g.haltLocked(ReasonAwaitingInitialAuthorization)
+			if awaitingPlan.notifyReason != "" {
+				notifications = append(notifications, pending{awaitingPlan.notifyReason, g.now()})
+			}
+		}
 	}
 
 	for _, c := range []struct {
@@ -231,6 +271,18 @@ func New(ctx context.Context, st store.Store, notifier Notifier, cfg Config) *Gu
 		c.dst.count = rec.Value
 	}
 	g.mu.Unlock()
+
+	if awaitingPlan.persistReason != "" {
+		// Persist the awaiting-initial-authorization halt so a reboot before
+		// the first clear boots straight into it (ADR-0007 point 3). If the
+		// write fails the mirror is already halted (fail-closed) and stays
+		// non-durable — the next trip or boot re-derives it.
+		if err := st.Atomically(ctx, func(tx store.Tx) error {
+			return tx.TripHalt(ctx, awaitingPlan.persistReason)
+		}); err == nil {
+			g.markHaltDurable(awaitingPlan.seq)
+		}
+	}
 
 	for _, n := range notifications {
 		g.notify(n.reason, n.at)
@@ -326,6 +378,12 @@ type tripPlan struct {
 // keeps the first reason and plans nothing; if halted but not known durable
 // it plans a re-persist.
 func (g *Guard) haltLocked(reason string) tripPlan {
+	// Every halt-affecting event bumps the generation — including a
+	// threshold re-trip that merely coalesces into an existing halt.
+	// Without this, a threshold crossing during a ClearGlobalHalt window
+	// would not invalidate the clear and the guard could resume right over
+	// a fresh danger signal (codex P1, PR #57 round 4).
+	g.gen++
 	if g.halted {
 		if g.haltDurable {
 			return tripPlan{}
@@ -336,7 +394,6 @@ func (g *Guard) haltLocked(reason string) tripPlan {
 	g.haltReason = reason
 	g.haltDurable = false
 	g.haltSeq++
-	g.gen++
 	return tripPlan{persistReason: reason, notifyReason: reason, seq: g.haltSeq}
 }
 
@@ -632,6 +689,11 @@ func (g *Guard) ClearGlobalHalt(ctx context.Context) error {
 	}
 	needReload := g.recoveryFailed
 	genBefore := g.gen
+	// Counter epochs guard the recovery reload below: a below-threshold
+	// failure report does not bump gen, so without these a report racing the
+	// reload would be overwritten by the stale snapshot (codex P2, round 4).
+	tokenEpochBefore := g.tokenFail.epoch
+	orderEpochBefore := g.orderFail.epoch
 	// Force any racing trip to plan a re-persist of the halt it coalesces
 	// into (haltLocked re-persists when the halt is not known durable), and
 	// bump the halt sequence so an in-flight persist completing during this
@@ -673,7 +735,18 @@ func (g *Guard) ClearGlobalHalt(ctx context.Context) error {
 		if genNow != genBefore {
 			return errClearRaced
 		}
-		return tx.ClearHalt(ctx)
+		if err := tx.ClearHalt(ctx); err != nil {
+			return err
+		}
+		// Record the authorization in the same transaction (ADR-0007
+		// point 4): "explicitly cleared at least once" is the durable
+		// provenance that lets subsequent boots start unhalted. Every
+		// successful clear is a human authorization, so this is idempotent.
+		return tx.SetCounter(ctx, store.Counter{
+			Name:      CounterLiveAuthorization,
+			Value:     1,
+			UpdatedAt: g.now(),
+		})
 	})
 	switch {
 	case errors.Is(err, errClearRaced):
@@ -691,6 +764,12 @@ func (g *Guard) ClearGlobalHalt(ctx context.Context) error {
 		return errClearRaced
 	}
 	if needReload {
+		if g.tokenFail.epoch != tokenEpochBefore || g.orderFail.epoch != orderEpochBefore {
+			// A failure report raced the recovery reload; assigning the
+			// stale snapshot would erase it from the live mirror. Keep the
+			// halt and let the operator retry with a fresh snapshot.
+			return errClearRaced
+		}
 		g.tokenFail = failureCounter{count: tokenN, epoch: g.tokenFail.epoch + 1}
 		g.orderFail = failureCounter{count: orderN, epoch: g.orderFail.epoch + 1}
 		g.recoveryFailed = false
