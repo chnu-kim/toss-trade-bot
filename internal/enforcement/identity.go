@@ -37,6 +37,11 @@ type FileContentFetcher interface {
 type PullRequestSummary struct {
 	Author   string
 	SameRepo bool
+	// BaseRef is the branch this PR targets (base.ref). c-2 only counts PRs
+	// targeting the protected branch — a bot PR against some other branch
+	// (e.g. develop) is not evidence that the loop creates PRs against the
+	// protected branch (codex:review [P1] finding on this PR).
+	BaseRef string
 	// CreatedAt is when the PR was opened. The zero value means the API did
 	// not report a parseable creation time — such a PR can never be
 	// freshness-eligible (fail-closed), see checkLoopPRAuthor.
@@ -206,16 +211,20 @@ func checkLoopPRAuthor(ctx context.Context, p IdentityParams) (reason string, ok
 	}
 
 	for _, pr := range prs {
-		// created_at strictly after the revision instant: equal timestamps
+		// Eligible loop PR: same-repo (not a fork) AND targeting the
+		// protected branch (loop PRs target it; a PR against another branch
+		// is not evidence — codex:review [P1]) AND authored by ExpectedActor
+		// AND created strictly after the revision instant. Equal timestamps
 		// are ambiguous (second-granularity; a PR cannot be produced by a
 		// revision that went live at the very same second) → 미충족.
-		if pr.SameRepo && pr.Author != "" && strings.EqualFold(pr.Author, p.ExpectedActor) &&
+		if pr.SameRepo && pr.BaseRef == p.Branch &&
+			pr.Author != "" && strings.EqualFold(pr.Author, p.ExpectedActor) &&
 			!pr.CreatedAt.IsZero() && pr.CreatedAt.After(revisionAt) {
 			return "", true
 		}
 	}
 	return fmt.Sprintf(
-		"최근 %d개 PR 중 현재 workflow 리비전(%s 이후) 생성된 %s 작성 same-repo PR이 관측되지 않음 — PR 생성이 아직 현재 workflow로 전환되지 않음(전환 전이거나 낡은 증거)",
-		len(prs), revisionAt.UTC().Format(time.RFC3339), p.ExpectedActor,
+		"최근 %d개 PR 중 현재 workflow 리비전(%s 이후) 생성된 %s 작성 same-repo·%s-대상 PR이 관측되지 않음 — PR 생성이 아직 현재 workflow로 전환되지 않음(전환 전이거나 낡은 증거)",
+		len(prs), revisionAt.UTC().Format(time.RFC3339), p.ExpectedActor, p.Branch,
 	), false
 }

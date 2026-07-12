@@ -62,12 +62,13 @@ func testRevisionTime(t *testing.T) time.Time { return parseTestTime(t, "2026-07
 func testPRTime(t *testing.T) time.Time       { return parseTestTime(t, "2026-07-05T00:00:00Z") }
 
 // sameRepoPRs builds same-repo, freshness-eligible PullRequestSummary entries
-// for the given author logins — the common fixture shape (loop PRs are
-// same-repo by construction and created after the current workflow revision).
+// targeting the protected branch, for the given author logins — the common
+// fixture shape (loop PRs are same-repo, target main, and are created after
+// the current workflow revision).
 func sameRepoPRs(t *testing.T, authors ...string) []PullRequestSummary {
 	prs := make([]PullRequestSummary, 0, len(authors))
 	for _, a := range authors {
-		prs = append(prs, PullRequestSummary{Author: a, SameRepo: true, CreatedAt: testPRTime(t)})
+		prs = append(prs, PullRequestSummary{Author: a, SameRepo: true, BaseRef: "main", CreatedAt: testPRTime(t)})
 	}
 	return prs
 }
@@ -320,8 +321,8 @@ func TestCheckIdentity_C2StaleBotPROlderThanCurrentWorkflowRevisionDoesNotCount(
 	p := metIdentityParams(t)
 	p.RevisionFetcher = fakeRevisionFetcher{at: parseTestTime(t, "2026-07-10T00:00:00Z")} // T2
 	p.PRLister = fakePRLister{prs: []PullRequestSummary{
-		{Author: "mechanu[bot]", SameRepo: true, CreatedAt: parseTestTime(t, "2026-07-01T00:00:00Z")}, // T1 < T2
-		{Author: "chnu-kim", SameRepo: true, CreatedAt: parseTestTime(t, "2026-07-11T00:00:00Z")},
+		{Author: "mechanu[bot]", SameRepo: true, BaseRef: "main", CreatedAt: parseTestTime(t, "2026-07-01T00:00:00Z")}, // T1 < T2
+		{Author: "chnu-kim", SameRepo: true, BaseRef: "main", CreatedAt: parseTestTime(t, "2026-07-11T00:00:00Z")},
 	}}
 	got := CheckIdentity(context.Background(), p)
 	if got.Satisfied {
@@ -339,7 +340,7 @@ func TestCheckIdentity_C2FreshBotPRAfterWorkflowRevisionCounts(t *testing.T) {
 	p := metIdentityParams(t)
 	p.RevisionFetcher = fakeRevisionFetcher{at: parseTestTime(t, "2026-07-10T00:00:00Z")}
 	p.PRLister = fakePRLister{prs: []PullRequestSummary{
-		{Author: "mechanu[bot]", SameRepo: true, CreatedAt: parseTestTime(t, "2026-07-11T00:00:00Z")},
+		{Author: "mechanu[bot]", SameRepo: true, BaseRef: "main", CreatedAt: parseTestTime(t, "2026-07-11T00:00:00Z")},
 	}}
 	got := CheckIdentity(context.Background(), p)
 	if !got.Satisfied {
@@ -353,9 +354,9 @@ func TestCheckIdentity_C2StaleAndFreshMixedCountsTheFreshOne(t *testing.T) {
 	p := metIdentityParams(t)
 	p.RevisionFetcher = fakeRevisionFetcher{at: parseTestTime(t, "2026-07-10T00:00:00Z")}
 	p.PRLister = fakePRLister{prs: []PullRequestSummary{
-		{Author: "mechanu[bot]", SameRepo: true, CreatedAt: parseTestTime(t, "2026-07-11T00:00:00Z")}, // fresh
-		{Author: "chnu-kim", SameRepo: true, CreatedAt: parseTestTime(t, "2026-07-05T00:00:00Z")},
-		{Author: "mechanu[bot]", SameRepo: true, CreatedAt: parseTestTime(t, "2026-07-01T00:00:00Z")}, // stale
+		{Author: "mechanu[bot]", SameRepo: true, BaseRef: "main", CreatedAt: parseTestTime(t, "2026-07-11T00:00:00Z")}, // fresh
+		{Author: "chnu-kim", SameRepo: true, BaseRef: "main", CreatedAt: parseTestTime(t, "2026-07-05T00:00:00Z")},
+		{Author: "mechanu[bot]", SameRepo: true, BaseRef: "main", CreatedAt: parseTestTime(t, "2026-07-01T00:00:00Z")}, // stale
 	}}
 	got := CheckIdentity(context.Background(), p)
 	if !got.Satisfied {
@@ -371,7 +372,7 @@ func TestCheckIdentity_C2PRCreatedAtSameInstantAsRevisionDoesNotCount(t *testing
 	p := metIdentityParams(t)
 	p.RevisionFetcher = fakeRevisionFetcher{at: at}
 	p.PRLister = fakePRLister{prs: []PullRequestSummary{
-		{Author: "mechanu[bot]", SameRepo: true, CreatedAt: at},
+		{Author: "mechanu[bot]", SameRepo: true, BaseRef: "main", CreatedAt: at},
 	}}
 	got := CheckIdentity(context.Background(), p)
 	if got.Satisfied {
@@ -385,7 +386,7 @@ func TestCheckIdentity_C2MissingPRCreatedAtDoesNotCount(t *testing.T) {
 	p := metIdentityParams(t)
 	p.RevisionFetcher = fakeRevisionFetcher{at: parseTestTime(t, "2026-07-10T00:00:00Z")}
 	p.PRLister = fakePRLister{prs: []PullRequestSummary{
-		{Author: "mechanu[bot]", SameRepo: true}, // zero CreatedAt
+		{Author: "mechanu[bot]", SameRepo: true, BaseRef: "main"}, // zero CreatedAt
 	}}
 	got := CheckIdentity(context.Background(), p)
 	if got.Satisfied {
@@ -398,7 +399,7 @@ func TestCheckIdentity_C2RevisionFetchFailuresFailClosed(t *testing.T) {
 	// timestamp must be unmet — never fail-open onto the old
 	// author-only predicate.
 	fresh := []PullRequestSummary{
-		{Author: "mechanu[bot]", SameRepo: true, CreatedAt: parseTestTime(t, "2026-07-11T00:00:00Z")},
+		{Author: "mechanu[bot]", SameRepo: true, BaseRef: "main", CreatedAt: parseTestTime(t, "2026-07-11T00:00:00Z")},
 	}
 	cases := map[string]fakeRevisionFetcher{
 		"lookup error (404/non-200/network/empty commit list)": {err: errors.New("status 404")},
@@ -426,6 +427,25 @@ func TestCheckIdentity_C2NilRevisionFetcherFailsClosed(t *testing.T) {
 	got := CheckIdentity(context.Background(), p)
 	if got.Satisfied {
 		t.Fatal("nil revision fetcher must fail-closed")
+	}
+}
+
+func TestCheckIdentity_C2BotPRTargetingOtherBranchDoesNotCount(t *testing.T) {
+	// codex:review [P1] finding on this PR: the PR window is repo-wide, so a
+	// recent mechanu[bot] same-repo PR targeting a NON-protected branch (e.g.
+	// develop) must not be evidence that the loop creates PRs against the
+	// protected branch. Loop PRs target the protected branch by construction.
+	p := metIdentityParams(t)
+	p.PRLister = fakePRLister{prs: []PullRequestSummary{
+		{Author: "mechanu[bot]", SameRepo: true, BaseRef: "develop", CreatedAt: testPRTime(t)}, // wrong base
+		{Author: "chnu-kim", SameRepo: true, BaseRef: "main", CreatedAt: testPRTime(t)},
+	}}
+	got := CheckIdentity(context.Background(), p)
+	if got.Satisfied {
+		t.Fatal("a bot PR targeting a non-protected branch must not satisfy c-2")
+	}
+	if !strings.Contains(got.Reason, "c-2") {
+		t.Fatalf("Reason = %q, want the failing leg identified", got.Reason)
 	}
 }
 
@@ -462,17 +482,18 @@ func TestGitHubClient_ListRecentPullRequests(t *testing.T) {
 		gotQuery = r.URL.RawQuery
 		gotAuth = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
-		// #55: same-repo bot PR. #54: same-repo human PR. #53: null user,
-		// null head repo (deleted fork). #52: fork PR (different repo ids).
+		// #55: same-repo bot PR targeting main. #54: same-repo human PR
+		// targeting main. #53: null user, null head repo (deleted fork). #52:
+		// fork PR (different repo ids), targeting main.
 		_, _ = w.Write([]byte(`[
 			{"number": 55, "user": {"login": "mechanu[bot]"},
-			 "head": {"repo": {"id": 111}}, "base": {"repo": {"id": 111}}},
+			 "head": {"repo": {"id": 111}}, "base": {"ref": "main", "repo": {"id": 111}}},
 			{"number": 54, "user": {"login": "chnu-kim"},
-			 "head": {"repo": {"id": 111}}, "base": {"repo": {"id": 111}}},
+			 "head": {"repo": {"id": 111}}, "base": {"ref": "main", "repo": {"id": 111}}},
 			{"number": 53, "user": null,
-			 "head": {"repo": null}, "base": {"repo": {"id": 111}}},
+			 "head": {"repo": null}, "base": {"ref": "develop", "repo": {"id": 111}}},
 			{"number": 52, "user": {"login": "mechanu[bot]"},
-			 "head": {"repo": {"id": 999}}, "base": {"repo": {"id": 111}}}
+			 "head": {"repo": {"id": 999}}, "base": {"ref": "main", "repo": {"id": 111}}}
 		]`))
 	}))
 	defer srv.Close()
@@ -483,10 +504,10 @@ func TestGitHubClient_ListRecentPullRequests(t *testing.T) {
 		t.Fatalf("ListRecentPullRequests: %v", err)
 	}
 	want := []PullRequestSummary{
-		{Author: "mechanu[bot]", SameRepo: true},
-		{Author: "chnu-kim", SameRepo: true},
-		{Author: "", SameRepo: false},
-		{Author: "mechanu[bot]", SameRepo: false},
+		{Author: "mechanu[bot]", SameRepo: true, BaseRef: "main"},
+		{Author: "chnu-kim", SameRepo: true, BaseRef: "main"},
+		{Author: "", SameRepo: false, BaseRef: "develop"},
+		{Author: "mechanu[bot]", SameRepo: false, BaseRef: "main"},
 	}
 	if len(prs) != len(want) {
 		t.Fatalf("prs = %+v, want %+v", prs, want)

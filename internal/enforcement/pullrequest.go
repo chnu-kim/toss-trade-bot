@@ -26,7 +26,8 @@ import (
 // is honest) but can never match an expected actor. SameRepo is true only
 // when both head and base carry a usable (non-zero) repo id and they are
 // equal; a null/absent head repo (deleted fork) or missing ids classify as
-// NOT same-repo, never as evidence.
+// NOT same-repo, never as evidence. BaseRef carries the PR's target branch so
+// c-2 can require it equal the protected branch (codex:review [P1]).
 //
 // This is a read-only GET; the presence-check performs zero GitHub write
 // calls. Fine-grained token requirement: Pull requests: read — within the
@@ -46,6 +47,7 @@ func (c *GitHubClient) ListRecentPullRequests(ctx context.Context, owner, repo s
 	}
 
 	type repoRef struct {
+		Ref  string `json:"ref"`
 		Repo *struct {
 			ID int64 `json:"id"`
 		} `json:"repo"`
@@ -67,6 +69,9 @@ func (c *GitHubClient) ListRecentPullRequests(ctx context.Context, owner, repo s
 		var s PullRequestSummary
 		if pr.User != nil {
 			s.Author = pr.User.Login
+		}
+		if pr.Base != nil {
+			s.BaseRef = pr.Base.Ref
 		}
 		if pr.Head != nil && pr.Head.Repo != nil && pr.Base != nil && pr.Base.Repo != nil &&
 			pr.Head.Repo.ID != 0 && pr.Head.Repo.ID == pr.Base.Repo.ID {
