@@ -25,11 +25,23 @@ type FileContentFetcher interface {
 	FetchFileContent(ctx context.Context, owner, repo, path, ref string) (string, error)
 }
 
-// PullRequestAuthorLister is the c-2 seam: something that can report the
-// author logins of the repo's most recent pull requests (newest first).
-// *GitHubClient.ListRecentPullRequestAuthors satisfies it.
-type PullRequestAuthorLister interface {
-	ListRecentPullRequestAuthors(ctx context.Context, owner, repo string, limit int) ([]string, error)
+// PullRequestSummary is the c-2 evidence for one recent PR: who authored it,
+// and whether its head repository is the base repository itself. SameRepo
+// matters because ADR-0011 point 4(f)'s eligibility predicate for a loop PR
+// is "head repo == base repo AND author == mechanu[bot]" — loop PRs are
+// same-repo by construction (the PR-creation workflow creates them from a
+// branch pushed to this repo), so a fork-origin PR is not loop-authorship
+// evidence regardless of its author (codex adversarial-review finding on
+// this PR).
+type PullRequestSummary struct {
+	Author   string
+	SameRepo bool
+}
+
+// PullRequestLister is the c-2 seam: something that can report the repo's
+// most recent pull requests (newest first). *GitHubClient satisfies it.
+type PullRequestLister interface {
+	ListRecentPullRequests(ctx context.Context, owner, repo string, limit int) ([]PullRequestSummary, error)
 }
 
 // IdentityParams carries everything CheckIdentity needs to evaluate ADR-0011
@@ -42,7 +54,7 @@ type IdentityParams struct {
 	WorkflowPath string
 
 	// c-2 — recent loop-PR authorship.
-	AuthorLister PullRequestAuthorLister
+	PRLister PullRequestLister
 	// ExpectedActor is the App bot login every loop-created PR must carry
 	// once PR creation has moved into the workflow (e.g. "mechanu[bot]").
 	ExpectedActor string
@@ -107,35 +119,38 @@ func checkPRCreationWorkflow(ctx context.Context, p IdentityParams) (reason stri
 }
 
 // checkLoopPRAuthor is leg c-2: among the repo's recentLoopPRWindow most
-// recent PRs there must be at least one authored by ExpectedActor. Before the
-// transition every loop PR is authored by the human account and is
-// indistinguishable from a human-created PR, so "no bot-authored PR observed"
-// is exactly the pre-transition state and is unmet by definition (ADR-0011
-// point 10: 전환 전이면 미충족). API errors, an empty PR list, and a blank
-// expected actor are all "cannot judge" and therefore unmet.
+// recent PRs there must be at least one that satisfies the loop-PR
+// eligibility predicate ADR-0011 point 4(f) already fixed — head repo ==
+// base repo AND author == ExpectedActor. Before the transition every loop PR
+// is authored by the human account and is indistinguishable from a
+// human-created PR, so "no such PR observed" is exactly the pre-transition
+// state and is unmet by definition (ADR-0011 point 10: 전환 전이면 미충족).
+// A fork-origin PR never counts even if bot-authored (see
+// PullRequestSummary). API errors, an empty PR list, and a blank expected
+// actor are all "cannot judge" and therefore unmet.
 func checkLoopPRAuthor(ctx context.Context, p IdentityParams) (reason string, ok bool) {
-	if p.AuthorLister == nil {
+	if p.PRLister == nil {
 		return "loop PR 작성자 검증 불가: PR lister가 설정되지 않음", false
 	}
 	if p.ExpectedActor == "" {
 		return "loop PR 작성자 검증 불가: 기대 actor가 설정되지 않음", false
 	}
 
-	authors, err := p.AuthorLister.ListRecentPullRequestAuthors(ctx, p.Owner, p.Repo, recentLoopPRWindow)
+	prs, err := p.PRLister.ListRecentPullRequests(ctx, p.Owner, p.Repo, recentLoopPRWindow)
 	if err != nil {
 		return fmt.Sprintf("최근 PR 목록 조회 실패: %v", err), false
 	}
-	if len(authors) == 0 {
+	if len(prs) == 0 {
 		return "관측된 PR이 없음 — loop PR 작성 identity를 판정할 데이터 부족", false
 	}
 
-	for _, author := range authors {
-		if author != "" && strings.EqualFold(author, p.ExpectedActor) {
+	for _, pr := range prs {
+		if pr.SameRepo && pr.Author != "" && strings.EqualFold(pr.Author, p.ExpectedActor) {
 			return "", true
 		}
 	}
 	return fmt.Sprintf(
-		"최근 %d개 PR 중 %s 작성 PR이 관측되지 않음 — PR 생성이 아직 workflow로 전환되지 않음(전환 전)",
-		len(authors), p.ExpectedActor,
+		"최근 %d개 PR 중 %s 작성 same-repo PR이 관측되지 않음 — PR 생성이 아직 workflow로 전환되지 않음(전환 전)",
+		len(prs), p.ExpectedActor,
 	), false
 }

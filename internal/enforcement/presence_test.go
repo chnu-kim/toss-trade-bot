@@ -34,7 +34,7 @@ func validParams() Params {
 		BranchChecker:          fakeBranchProtectionChecker{result: metResult(CheckNameBranchProtection)},
 		WorkflowFetcher:        fakeFileFetcher{content: "name: pr-creation\non: repository_dispatch\n"},
 		PRCreationWorkflowPath: ".github/workflows/pr-creation.yml",
-		AuthorLister:           fakeAuthorLister{authors: []string{"mechanu[bot]", "chnu-kim"}},
+		PRLister:               fakePRLister{prs: sameRepoPRs("mechanu[bot]", "chnu-kim")},
 		ExpectedActor:          "mechanu[bot]",
 	}
 }
@@ -77,7 +77,7 @@ func TestRun_BranchProtectionUnmetCollapsesWhole(t *testing.T) {
 func TestRun_IdentityUnmetCollapsesWhole(t *testing.T) {
 	p := validParams()
 	// c-2 unmet: every observed PR still authored by the human account.
-	p.AuthorLister = fakeAuthorLister{authors: []string{"chnu-kim"}}
+	p.PRLister = fakePRLister{prs: sameRepoPRs("chnu-kim")}
 	got := Run(context.Background(), p)
 	if got.Satisfied {
 		t.Fatal("unmet (c) identity must collapse the whole Result to false")
@@ -94,7 +94,7 @@ func TestRun_PreTransitionStateFailsClosed(t *testing.T) {
 	// fail-closed: this issue implements detection, it does not switch
 	// autonomy on.
 	p := validParams()
-	p.AuthorLister = fakeAuthorLister{authors: []string{"chnu-kim", "chnu-kim", "chnu-kim"}}
+	p.PRLister = fakePRLister{prs: sameRepoPRs("chnu-kim", "chnu-kim", "chnu-kim")}
 	got := Run(context.Background(), p)
 	if got.Satisfied {
 		t.Fatal("pre-transition repo state must leave the presence-check unmet (fail-closed)")
@@ -107,7 +107,7 @@ func TestRun_PreTransitionStateFailsClosed(t *testing.T) {
 
 func TestRun_IdentityListerErrorFailsClosed(t *testing.T) {
 	p := validParams()
-	p.AuthorLister = fakeAuthorLister{err: errors.New("network unreachable")}
+	p.PRLister = fakePRLister{err: errors.New("network unreachable")}
 	got := Run(context.Background(), p)
 	if got.Satisfied {
 		t.Fatal("PR author lister error must fail-closed")
@@ -146,7 +146,7 @@ func TestRun_MissingDependenciesFailClosedWithoutPanic(t *testing.T) {
 		Owner:             "chnu-kim",
 		Repo:              "toss-trade-bot",
 		Branch:            "main",
-		// BranchChecker, WorkflowFetcher, AuthorLister left nil.
+		// BranchChecker, WorkflowFetcher, PRLister left nil.
 		PRCreationWorkflowPath: ".github/workflows/pr-creation.yml",
 		ExpectedActor:          "mechanu[bot]",
 	}

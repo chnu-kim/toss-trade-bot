@@ -8,8 +8,8 @@ import (
 	"net/url"
 )
 
-// ListRecentPullRequestAuthors returns the author logins of the repo's most
-// recently created pull requests, newest first, via
+// ListRecentPullRequests returns summaries (author login + same-repo flag) of
+// the repo's most recently created pull requests, newest first, via
 // GET /repos/{owner}/{repo}/pulls?state=all&sort=created&direction=desc.
 //
 // Query choices, pinned deliberately for check (c-2):
@@ -20,13 +20,17 @@ import (
 //     activity-based reordering (sort=updated) is avoided.
 //   - single page of limit results — bounded recency, no pagination walk.
 //
-// A PR whose user object is null (e.g. a deleted account) yields an empty
-// string entry: it stays in the window (the window size is honest) but can
-// never match an expected actor. This is a read-only GET; the presence-check
-// performs zero GitHub write calls. Fine-grained token requirement:
-// Pull requests: read — within the post-narrowing PAT spec (ADR-0011 point
-// 5 ②).
-func (c *GitHubClient) ListRecentPullRequestAuthors(ctx context.Context, owner, repo string, limit int) ([]string, error) {
+// Fail-closed field handling: a PR whose user object is null (e.g. a deleted
+// account) yields an empty Author — it stays in the window (the window size
+// is honest) but can never match an expected actor. SameRepo is true only
+// when both head and base carry a usable (non-zero) repo id and they are
+// equal; a null/absent head repo (deleted fork) or missing ids classify as
+// NOT same-repo, never as evidence.
+//
+// This is a read-only GET; the presence-check performs zero GitHub write
+// calls. Fine-grained token requirement: Pull requests: read — within the
+// post-narrowing PAT spec (ADR-0011 point 5 ②).
+func (c *GitHubClient) ListRecentPullRequests(ctx context.Context, owner, repo string, limit int) ([]PullRequestSummary, error) {
 	apiPath := fmt.Sprintf("/repos/%s/%s/pulls?state=all&sort=created&direction=desc&per_page=%d",
 		url.PathEscape(owner), url.PathEscape(repo), limit)
 
@@ -40,22 +44,33 @@ func (c *GitHubClient) ListRecentPullRequestAuthors(ctx context.Context, owner, 
 		return nil, fmt.Errorf("enforcement: list pull requests: status %d", resp.StatusCode)
 	}
 
+	type repoRef struct {
+		Repo *struct {
+			ID int64 `json:"id"`
+		} `json:"repo"`
+	}
 	var parsed []struct {
 		User *struct {
 			Login string `json:"login"`
 		} `json:"user"`
+		Head *repoRef `json:"head"`
+		Base *repoRef `json:"base"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
 		return nil, fmt.Errorf("enforcement: decode pull request list: %w", err)
 	}
 
-	authors := make([]string, 0, len(parsed))
+	summaries := make([]PullRequestSummary, 0, len(parsed))
 	for _, pr := range parsed {
-		if pr.User == nil {
-			authors = append(authors, "")
-			continue
+		var s PullRequestSummary
+		if pr.User != nil {
+			s.Author = pr.User.Login
 		}
-		authors = append(authors, pr.User.Login)
+		if pr.Head != nil && pr.Head.Repo != nil && pr.Base != nil && pr.Base.Repo != nil &&
+			pr.Head.Repo.ID != 0 && pr.Head.Repo.ID == pr.Base.Repo.ID {
+			s.SameRepo = true
+		}
+		summaries = append(summaries, s)
 	}
-	return authors, nil
+	return summaries, nil
 }

@@ -7,7 +7,7 @@ import (
 )
 
 // Params wires everything Run needs to answer the three ADR-0009 point 8
-// pillars. BranchChecker, WorkflowFetcher and AuthorLister are interfaces so
+// pillars. BranchChecker, WorkflowFetcher and PRLister are interfaces so
 // callers (and tests) can inject fakes; cmd/presence-check is responsible for
 // wiring real implementations with the right credentials. Note (b) may need a
 // different credential than (a)/(c): reading branch protection requires
@@ -32,7 +32,7 @@ type Params struct {
 
 	// (c-2) — recent loop-PR author must be ExpectedActor (e.g.
 	// "mechanu[bot]").
-	AuthorLister  PullRequestAuthorLister
+	PRLister      PullRequestLister
 	ExpectedActor string
 }
 
@@ -57,7 +57,7 @@ func Run(ctx context.Context, p Params) Result {
 			return CheckIdentity(ctx, IdentityParams{
 				WorkflowFetcher: p.WorkflowFetcher,
 				WorkflowPath:    p.PRCreationWorkflowPath,
-				AuthorLister:    p.AuthorLister,
+				PRLister:        p.PRLister,
 				ExpectedActor:   p.ExpectedActor,
 				Owner:           p.Owner,
 				Repo:            p.Repo,

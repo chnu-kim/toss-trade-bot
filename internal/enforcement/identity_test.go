@@ -22,15 +22,26 @@ func (f fakeFileFetcher) FetchFileContent(context.Context, string, string, strin
 	return f.content, f.err
 }
 
-// fakeAuthorLister is a stub PullRequestAuthorLister for exercising
-// CheckIdentity's c-2 leg without a network round trip.
-type fakeAuthorLister struct {
-	authors []string
-	err     error
+// fakePRLister is a stub PullRequestLister for exercising CheckIdentity's
+// c-2 leg without a network round trip.
+type fakePRLister struct {
+	prs []PullRequestSummary
+	err error
 }
 
-func (f fakeAuthorLister) ListRecentPullRequestAuthors(context.Context, string, string, int) ([]string, error) {
-	return f.authors, f.err
+func (f fakePRLister) ListRecentPullRequests(context.Context, string, string, int) ([]PullRequestSummary, error) {
+	return f.prs, f.err
+}
+
+// sameRepoPRs builds same-repo PullRequestSummary entries for the given
+// author logins — the common fixture shape (loop PRs are same-repo by
+// construction).
+func sameRepoPRs(authors ...string) []PullRequestSummary {
+	prs := make([]PullRequestSummary, 0, len(authors))
+	for _, a := range authors {
+		prs = append(prs, PullRequestSummary{Author: a, SameRepo: true})
+	}
+	return prs
 }
 
 func metIdentityParams() IdentityParams {
@@ -40,7 +51,7 @@ func metIdentityParams() IdentityParams {
 		Repo:            "toss-trade-bot",
 		Branch:          "main",
 		WorkflowPath:    ".github/workflows/pr-creation.yml",
-		AuthorLister:    fakeAuthorLister{authors: []string{"mechanu[bot]", "chnu-kim"}},
+		PRLister:        fakePRLister{prs: sameRepoPRs("mechanu[bot]", "chnu-kim")},
 		ExpectedActor:   "mechanu[bot]",
 	}
 }
@@ -61,7 +72,7 @@ func TestCheckIdentity_C1MetC2UnmetIsUnmet(t *testing.T) {
 	// Workflow exists on main, but no mechanu[bot]-authored PR has ever been
 	// observed (pre-transition) — one leg alone must never satisfy check (c).
 	p := metIdentityParams()
-	p.AuthorLister = fakeAuthorLister{authors: []string{"chnu-kim", "chnu-kim"}}
+	p.PRLister = fakePRLister{prs: sameRepoPRs("chnu-kim", "chnu-kim")}
 	got := CheckIdentity(context.Background(), p)
 	if got.Satisfied {
 		t.Fatal("c-1 met + c-2 unmet must not satisfy check (c)")
@@ -88,7 +99,7 @@ func TestCheckIdentity_C1UnmetC2MetIsUnmet(t *testing.T) {
 func TestCheckIdentity_BothLegsUnmetReportsBothReasons(t *testing.T) {
 	p := metIdentityParams()
 	p.WorkflowFetcher = fakeFileFetcher{err: errors.New("status 404")}
-	p.AuthorLister = fakeAuthorLister{err: errors.New("network unreachable")}
+	p.PRLister = fakePRLister{err: errors.New("network unreachable")}
 	got := CheckIdentity(context.Background(), p)
 	if got.Satisfied {
 		t.Fatal("both legs unmet must not satisfy check (c)")
@@ -210,7 +221,7 @@ func TestCheckIdentity_C1DirectoryResponseFailsClosed(t *testing.T) {
 
 func TestCheckIdentity_C2NilListerFailsClosed(t *testing.T) {
 	p := metIdentityParams()
-	p.AuthorLister = nil
+	p.PRLister = nil
 	got := CheckIdentity(context.Background(), p)
 	if got.Satisfied {
 		t.Fatal("nil author lister must fail-closed")
@@ -222,7 +233,7 @@ func TestCheckIdentity_C2PreTransitionNoBotPRFailsClosed(t *testing.T) {
 	// human account — the transition has not happened, so check (c) must be
 	// unmet (ADR-0011 point 10: 전환 전이면 미충족).
 	p := metIdentityParams()
-	p.AuthorLister = fakeAuthorLister{authors: []string{"chnu-kim", "chnu-kim", "chnu-kim"}}
+	p.PRLister = fakePRLister{prs: sameRepoPRs("chnu-kim", "chnu-kim", "chnu-kim")}
 	got := CheckIdentity(context.Background(), p)
 	if got.Satisfied {
 		t.Fatal("pre-transition state (no mechanu[bot]-authored PR) must fail-closed")
@@ -234,7 +245,7 @@ func TestCheckIdentity_C2PreTransitionNoBotPRFailsClosed(t *testing.T) {
 
 func TestCheckIdentity_C2APIErrorFailsClosed(t *testing.T) {
 	p := metIdentityParams()
-	p.AuthorLister = fakeAuthorLister{err: errors.New("status 500")}
+	p.PRLister = fakePRLister{err: errors.New("status 500")}
 	got := CheckIdentity(context.Background(), p)
 	if got.Satisfied {
 		t.Fatal("PR list API error must fail-closed")
@@ -248,7 +259,7 @@ func TestCheckIdentity_C2EmptyPRListFailsClosed(t *testing.T) {
 	// Zero PRs observed = no data to judge authorship — unverifiable is
 	// never satisfied.
 	p := metIdentityParams()
-	p.AuthorLister = fakeAuthorLister{authors: []string{}}
+	p.PRLister = fakePRLister{prs: []PullRequestSummary{}}
 	got := CheckIdentity(context.Background(), p)
 	if got.Satisfied {
 		t.Fatal("empty PR list must fail-closed")
@@ -260,16 +271,39 @@ func TestCheckIdentity_C2EmptyExpectedActorFailsClosed(t *testing.T) {
 	// entry (e.g. a PR whose user object was null).
 	p := metIdentityParams()
 	p.ExpectedActor = ""
-	p.AuthorLister = fakeAuthorLister{authors: []string{""}}
+	p.PRLister = fakePRLister{prs: sameRepoPRs("")}
 	got := CheckIdentity(context.Background(), p)
 	if got.Satisfied {
 		t.Fatal("empty expected actor must fail-closed, not match empty author entries")
 	}
 }
 
-// --- GitHubClient.ListRecentPullRequestAuthors ---
+func TestCheckIdentity_C2ForkBotPRDoesNotCount(t *testing.T) {
+	// codex adversarial-review finding on this PR: c-2 must not be satisfied
+	// by just any recent ExpectedActor-authored PR. The machine-checkable
+	// non-loop class is a PR whose head repo is not the base repo (fork) —
+	// loop PRs are same-repo by construction (the PR-creation workflow
+	// pushes/creates within this repo), and ADR-0011 point 4(f)'s Phase B
+	// eligibility predicate is exactly "head repo == base repo AND author ==
+	// mechanu[bot]". A bot-authored PR that fails the same-repo half is not
+	// loop-authorship evidence.
+	p := metIdentityParams()
+	p.PRLister = fakePRLister{prs: []PullRequestSummary{
+		{Author: "mechanu[bot]", SameRepo: false}, // fork — must not count
+		{Author: "chnu-kim", SameRepo: true},
+	}}
+	got := CheckIdentity(context.Background(), p)
+	if got.Satisfied {
+		t.Fatal("a fork-origin bot-authored PR must not satisfy c-2")
+	}
+	if !strings.Contains(got.Reason, "c-2") {
+		t.Fatalf("Reason = %q, want the failing leg identified", got.Reason)
+	}
+}
 
-func TestGitHubClient_ListRecentPullRequestAuthors(t *testing.T) {
+// --- GitHubClient.ListRecentPullRequests ---
+
+func TestGitHubClient_ListRecentPullRequests(t *testing.T) {
 	var gotMethod, gotPath, gotQuery, gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
@@ -277,26 +311,38 @@ func TestGitHubClient_ListRecentPullRequestAuthors(t *testing.T) {
 		gotQuery = r.URL.RawQuery
 		gotAuth = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
+		// #55: same-repo bot PR. #54: same-repo human PR. #53: null user,
+		// null head repo (deleted fork). #52: fork PR (different repo ids).
 		_, _ = w.Write([]byte(`[
-			{"number": 55, "user": {"login": "mechanu[bot]"}},
-			{"number": 54, "user": {"login": "chnu-kim"}},
-			{"number": 53, "user": null}
+			{"number": 55, "user": {"login": "mechanu[bot]"},
+			 "head": {"repo": {"id": 111}}, "base": {"repo": {"id": 111}}},
+			{"number": 54, "user": {"login": "chnu-kim"},
+			 "head": {"repo": {"id": 111}}, "base": {"repo": {"id": 111}}},
+			{"number": 53, "user": null,
+			 "head": {"repo": null}, "base": {"repo": {"id": 111}}},
+			{"number": 52, "user": {"login": "mechanu[bot]"},
+			 "head": {"repo": {"id": 999}}, "base": {"repo": {"id": 111}}}
 		]`))
 	}))
 	defer srv.Close()
 
 	c := newTestGitHubClient(srv.URL, "test-token")
-	authors, err := c.ListRecentPullRequestAuthors(context.Background(), "chnu-kim", "toss-trade-bot", 30)
+	prs, err := c.ListRecentPullRequests(context.Background(), "chnu-kim", "toss-trade-bot", 30)
 	if err != nil {
-		t.Fatalf("ListRecentPullRequestAuthors: %v", err)
+		t.Fatalf("ListRecentPullRequests: %v", err)
 	}
-	want := []string{"mechanu[bot]", "chnu-kim", ""}
-	if len(authors) != len(want) {
-		t.Fatalf("authors = %v, want %v", authors, want)
+	want := []PullRequestSummary{
+		{Author: "mechanu[bot]", SameRepo: true},
+		{Author: "chnu-kim", SameRepo: true},
+		{Author: "", SameRepo: false},
+		{Author: "mechanu[bot]", SameRepo: false},
+	}
+	if len(prs) != len(want) {
+		t.Fatalf("prs = %+v, want %+v", prs, want)
 	}
 	for i := range want {
-		if authors[i] != want[i] {
-			t.Fatalf("authors[%d] = %q, want %q", i, authors[i], want[i])
+		if prs[i] != want[i] {
+			t.Fatalf("prs[%d] = %+v, want %+v", i, prs[i], want[i])
 		}
 	}
 
@@ -320,19 +366,41 @@ func TestGitHubClient_ListRecentPullRequestAuthors(t *testing.T) {
 	}
 }
 
-func TestGitHubClient_ListRecentPullRequestAuthors_NonOKStatus(t *testing.T) {
+func TestGitHubClient_ListRecentPullRequests_MissingRepoIDsAreNotSameRepo(t *testing.T) {
+	// A response whose repo objects carry no usable id (0/absent) must not be
+	// classified as same-repo — zero==zero is not evidence (fail-closed).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[
+			{"number": 51, "user": {"login": "mechanu[bot]"},
+			 "head": {"repo": {}}, "base": {"repo": {}}}
+		]`))
+	}))
+	defer srv.Close()
+
+	c := newTestGitHubClient(srv.URL, "test-token")
+	prs, err := c.ListRecentPullRequests(context.Background(), "chnu-kim", "toss-trade-bot", 30)
+	if err != nil {
+		t.Fatalf("ListRecentPullRequests: %v", err)
+	}
+	if len(prs) != 1 || prs[0].SameRepo {
+		t.Fatalf("prs = %+v, want a single entry with SameRepo=false when repo ids are absent", prs)
+	}
+}
+
+func TestGitHubClient_ListRecentPullRequests_NonOKStatus(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 	}))
 	defer srv.Close()
 
 	c := newTestGitHubClient(srv.URL, "test-token")
-	if _, err := c.ListRecentPullRequestAuthors(context.Background(), "chnu-kim", "toss-trade-bot", 30); err == nil {
+	if _, err := c.ListRecentPullRequests(context.Background(), "chnu-kim", "toss-trade-bot", 30); err == nil {
 		t.Fatal("non-200 pulls response must return an error")
 	}
 }
 
-func TestGitHubClient_ListRecentPullRequestAuthors_MalformedBody(t *testing.T) {
+func TestGitHubClient_ListRecentPullRequests_MalformedBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"message": "not an array"}`))
@@ -340,7 +408,7 @@ func TestGitHubClient_ListRecentPullRequestAuthors_MalformedBody(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestGitHubClient(srv.URL, "test-token")
-	if _, err := c.ListRecentPullRequestAuthors(context.Background(), "chnu-kim", "toss-trade-bot", 30); err == nil {
+	if _, err := c.ListRecentPullRequests(context.Background(), "chnu-kim", "toss-trade-bot", 30); err == nil {
 		t.Fatal("malformed pulls response must return an error")
 	}
 }

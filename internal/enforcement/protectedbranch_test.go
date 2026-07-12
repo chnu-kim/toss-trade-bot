@@ -82,7 +82,7 @@ func TestProtectedBranchContentGovernsNotLocalDisk(t *testing.T) {
 		BranchChecker:          fakeBranchProtectionChecker{result: metResult(CheckNameBranchProtection)},
 		WorkflowFetcher:        fakeFileFetcher{content: "name: pr-creation\non: repository_dispatch\n"},
 		PRCreationWorkflowPath: ".github/workflows/pr-creation.yml",
-		AuthorLister:           fakeAuthorLister{authors: []string{"mechanu[bot]"}},
+		PRLister:               fakePRLister{prs: sameRepoPRs("mechanu[bot]")},
 		ExpectedActor:          "mechanu[bot]",
 	})
 
