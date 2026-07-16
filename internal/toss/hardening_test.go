@@ -129,6 +129,39 @@ func TestDecodeJSON_CapsBodySize(t *testing.T) {
 	}
 }
 
+func TestDecodeJSON_TrailingData(t *testing.T) {
+	type payload struct {
+		A string `json:"a"`
+	}
+	// Trailing whitespace (e.g. a final newline, which json.Encoder emits) is
+	// part of a well-formed response and must be accepted.
+	for _, body := range []string{`{"a":"ok"}`, "{\"a\":\"ok\"}\n", "{\"a\":\"ok\"}  \n\t"} {
+		var v payload
+		if err := DecodeJSON(strings.NewReader(body), &v); err != nil {
+			t.Fatalf("DecodeJSON(%q) = %v, want nil (trailing whitespace is allowed)", body, err)
+		}
+		if v.A != "ok" {
+			t.Fatalf("DecodeJSON(%q) decoded a=%q, want ok", body, v.A)
+		}
+	}
+
+	// A second value, or garbage, after the first value is a contract violation.
+	for _, body := range []string{`{"a":"ok"}{"a":"evil"}`, `{"a":"ok"} trailing`, `{"a":"ok"}42`} {
+		var v payload
+		if err := DecodeJSON(strings.NewReader(body), &v); err == nil {
+			t.Fatalf("DecodeJSON(%q) = nil, want error for trailing data", body)
+		}
+	}
+
+	// A small valid value followed by an oversized trailing blob must be
+	// rejected within the cap, not slip past because the first Decode succeeded.
+	huge := `{"a":"ok"}` + "\n" + `"` + strings.Repeat("x", 2<<20) + `"`
+	var v payload
+	if err := DecodeJSON(strings.NewReader(huge), &v); err == nil {
+		t.Fatal("DecodeJSON with oversized trailing = nil, want error")
+	}
+}
+
 func TestClient_OversizedTokenResponseRejected(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/oauth2/token" {
@@ -452,11 +485,12 @@ func TestIssueToken_DecodeErrorClassification(t *testing.T) {
 		body      string
 		transient bool
 	}{
-		{"truncated body (transport)", `{"access_token":"tok-1","exp`, true},
-		{"empty body (transport)", ``, true},
+		{"truncated body (transport glitch)", `{"access_token":"tok-1","exp`, true},
+		{"empty body (contract: no token)", ``, false},
 		{"expires_in type mismatch (schema)", `{"access_token":"tok-1","expires_in":"86400"}`, false},
 		{"malformed json (schema)", `{"access_token":"tok-1",,}`, false},
-		{"oversized body (contract)", `{"access_token":"` + strings.Repeat("x", 2<<20) + `"}`, false},
+		{"oversized single value (contract)", `{"access_token":"` + strings.Repeat("x", 2<<20) + `"}`, false},
+		{"valid value + oversized trailing (contract)", `{"access_token":"tok-1","expires_in":86400}` + "\n" + `"` + strings.Repeat("x", 2<<20) + `"`, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

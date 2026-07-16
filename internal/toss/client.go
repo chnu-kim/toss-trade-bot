@@ -330,19 +330,22 @@ func (c *Client) issueToken(ctx context.Context) (string, time.Duration, error) 
 		ExpiresIn   int64  `json:"expires_in"`
 	}
 	if err := DecodeJSON(resp.Body, &tr); err != nil {
-		// Classify by shape, not blanket-transient. Only a transport-shaped
-		// failure — EOF or a truncated body from a mid-response reset — is a
-		// recoverable network glitch worth a retry; classifying it transient
-		// lets GET retry and keeps it from poisoning terminalErr in the stale
-		// window (L-3). Schema/contract violations — a type mismatch
-		// (*json.UnmarshalTypeError), malformed JSON (*json.SyntaxError), or an
-		// oversized body over the 1 MiB cap — do NOT heal on retry, so they
-		// stay terminal: a bounded retry loop must not be spent on them, and in
-		// the stale window they must fail fast rather than mask a broken
-		// contract until hard expiry. (Semantic problems in a fully decoded
-		// body — missing access_token, bad expires_in below — are terminal for
-		// the same reason.)
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		// Classify by shape, not blanket-transient. Only io.ErrUnexpectedEOF —
+		// a body that started well then was cut off mid-value (a mid-response
+		// TCP reset / truncation) — is a recoverable network glitch worth a
+		// retry; classifying it transient lets GET retry and keeps it from
+		// poisoning terminalErr in the stale window (L-3).
+		//
+		// Everything else is a terminal contract violation that does not heal
+		// on retry, so a bounded retry loop must not be spent on it and, in the
+		// stale window, it must fail fast rather than mask a broken contract
+		// until hard expiry: an EMPTY body (bare io.EOF — the server sent no
+		// token at all, not a mid-stream cut), a type mismatch
+		// (*json.UnmarshalTypeError), malformed JSON (*json.SyntaxError),
+		// trailing data, or an oversized body over the 1 MiB cap. (Semantic
+		// problems in a fully decoded body — missing access_token, bad
+		// expires_in below — are terminal for the same reason.)
+		if errors.Is(err, io.ErrUnexpectedEOF) {
 			return "", 0, &transientError{err: fmt.Errorf("toss: decode token response: %w", err)}
 		}
 		return "", 0, fmt.Errorf("toss: decode token response: %w", err)
@@ -361,19 +364,44 @@ func (c *Client) issueToken(ctx context.Context) (string, time.Duration, error) 
 	return tr.AccessToken, time.Duration(tr.ExpiresIn) * time.Second, nil
 }
 
-// DecodeJSON decodes a single JSON value from r into v, reading at most
-// maxResponseBytes (1 MiB). An oversized body fails with a clear error instead
-// of growing the heap without bound — the OOM guard for every response decode
-// in this module (the account/market wrappers use it too).
+// DecodeJSON decodes exactly one JSON value from r into v, reading at most
+// maxResponseBytes (1 MiB). It is the OOM guard for every response decode in
+// this module (the account/market wrappers use it too): an oversized body
+// fails with a clear error instead of growing the heap without bound.
+//
+// It also requires the body to be a single value: trailing data after the
+// value (a second value, garbage, or an oversized blob) is rejected within the
+// same cap so the byte limit stays exhaustive — a small valid value cannot be
+// used to smuggle a huge trailing payload past the limit. (Go decodes the
+// trailing lazily and never buffers it whole, so this is contract hygiene, not
+// an OOM fix.) Trailing whitespace — e.g. the newline json.Encoder emits — is
+// allowed.
 func DecodeJSON(r io.Reader, v any) error {
 	lr := &io.LimitedReader{R: r, N: maxResponseBytes + 1}
-	if err := json.NewDecoder(lr).Decode(v); err != nil {
+	dec := json.NewDecoder(lr)
+	if err := dec.Decode(v); err != nil {
 		if lr.N <= 0 {
-			return fmt.Errorf("toss: response body exceeds %d bytes", maxResponseBytes)
+			return errResponseTooLarge()
 		}
 		return err
 	}
+	// dec.Token past the decoded value returns io.EOF once only whitespace
+	// remains; anything else (another token, malformed bytes, or a cap hit
+	// while reading an oversized trailing value) is a contract violation.
+	if _, err := dec.Token(); err != io.EOF {
+		if lr.N <= 0 {
+			return errResponseTooLarge()
+		}
+		if err != nil {
+			return err
+		}
+		return errors.New("toss: unexpected trailing data after JSON response")
+	}
 	return nil
+}
+
+func errResponseTooLarge() error {
+	return fmt.Errorf("toss: response body exceeds %d bytes", maxResponseBytes)
 }
 
 // decodeOAuthError reads the OAuth2 standard error envelope ({error,
