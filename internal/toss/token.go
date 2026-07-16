@@ -2,6 +2,7 @@ package toss
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -281,10 +282,19 @@ func (m *tokenManager) startFlightLocked(ctx context.Context) *issuance {
 			close(fl.done)
 		}()
 		fl.token, fl.ttl, fl.err = m.issue(ictx)
-		if fl.err == nil && fl.ttl <= 0 {
-			// Defense in depth: issueToken validates expires_in, but storing
-			// a non-positive ttl would make every subsequent get() reissue —
-			// exactly the thundering herd ADR-0001 forbids.
+		switch {
+		case fl.err != nil:
+			// keep the issuer's error
+		case fl.token == "":
+			// Defense in depth, symmetric with the ttl guard: an empty token
+			// would make valid()/stale() (which require token != "") false
+			// forever, so every get() would reissue (the ADR-0001 herd) and
+			// callers would send a bare "Bearer " header.
+			fl.token, fl.err = "", errors.New("toss: token issuer returned an empty token")
+		case fl.ttl <= 0:
+			// issueToken validates expires_in, but storing a non-positive ttl
+			// would make every subsequent get() reissue — the herd ADR-0001
+			// forbids.
 			fl.token, fl.err = "", fmt.Errorf("toss: token issuer returned non-positive ttl %s", fl.ttl)
 		}
 	}()

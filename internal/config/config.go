@@ -16,14 +16,16 @@ import (
 // DefaultBaseURL is the Toss Open API base URL.
 const DefaultBaseURL = "https://openapi.tossinvest.com"
 
-// redactedMarker replaces secret values on every formatting/serialization
-// surface. Leaking client_secret is equivalent to handing over the brokerage
-// account, so redaction is structural (a type), not a per-call convention.
+// redactedMarker replaces secret values on the formatting/serialization
+// surfaces that redaction can reach. Leaking client_secret is equivalent to
+// handing over the brokerage account, so redaction is structural (a type)
+// rather than a per-call convention — on every verb fmt lets a method see (see
+// the residual limit on Format).
 const redactedMarker = "[REDACTED]"
 
 // Secret is a credential value that must never appear in logs, error strings,
-// or serialized output. Every standard formatting and serialization surface
-// (fmt verbs, slog, encoding/json, encoding.TextMarshaler) emits a redaction
+// or serialized output. The standard formatting and serialization surfaces
+// (fmt verbs, slog, encoding/json, encoding.TextMarshaler) emit a redaction
 // marker instead of the value; call Reveal at the single point of use (client
 // wiring) to obtain the raw string. An empty secret renders empty so logs can
 // distinguish set vs unset without exposing anything.
@@ -36,10 +38,17 @@ func (s Secret) redacted() string {
 	return redactedMarker
 }
 
-// Format implements fmt.Formatter, which covers EVERY verb — including
-// mismatched ones. Without it, a bad verb (e.g. %d on this string kind) makes
-// fmt fall back to its error format "%!d(config.Secret=<raw>)", and that path
-// sets fmt's internal erroring flag, bypassing String()/GoString() entirely.
+// Format implements fmt.Formatter so that every verb fmt routes through a
+// method — %v/%+v/%s/%q and mismatched verbs like %d — is redacted. Without it,
+// a bad verb (e.g. %d on this string kind) hits fmt's error format
+// "%!d(config.Secret=<raw>)", whose internal erroring flag bypasses
+// String()/GoString().
+//
+// Residual limit (honest, not "every verb"): fmt special-cases %p and %T BEFORE
+// consulting any Formatter, so they escape this method. %T prints only the type
+// name (no value — safe), but %p on a Secret reflects the underlying string and
+// leaks it ("%!p(config.Secret=<raw>)"). %p is not a meaningful verb for a
+// string value; callers must not format secrets with %p.
 func (s Secret) Format(f fmt.State, verb rune) {
 	if verb == 'q' {
 		fmt.Fprintf(f, "%q", s.redacted())

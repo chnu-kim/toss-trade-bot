@@ -140,11 +140,34 @@ func (c *Client) SetLogger(l *slog.Logger) {
 	c.tokens.setLogger(l)
 }
 
-// String keeps the client printable (%v/%+v/%s) without exposing credentials.
-func (c *Client) String() string { return "toss.Client(" + c.baseURL + ")" }
+// Format, String and GoString use VALUE receivers on purpose: with pointer
+// receivers only *Client satisfies fmt.Stringer, so formatting a Client value
+// (logging `*client`, or embedding Client in a struct printed with %+v) would
+// fall back to reflection and dump the unexported clientSecret in plaintext —
+// leaking the brokerage credential (L-9). A value receiver protects both the
+// value and the pointer, and Format additionally covers mismatched verbs (%d,
+// %x, …) which would otherwise reach fmt's field-reflecting bad-verb path.
+//
+// Residual limit: fmt special-cases %p and %T before any Stringer/Formatter, so
+// %p on a Client value still reflects fields. %p is not a realistic logging
+// verb for a struct; do not rely on it being redacted.
+func (c Client) Format(f fmt.State, verb rune) {
+	if verb == 'v' && f.Flag('#') {
+		_, _ = io.WriteString(f, c.GoString())
+		return
+	}
+	if verb == 'q' {
+		fmt.Fprintf(f, "%q", c.String())
+		return
+	}
+	_, _ = io.WriteString(f, c.String())
+}
+
+// String keeps the client printable without exposing credentials.
+func (c Client) String() string { return "toss.Client(" + c.baseURL + ")" }
 
 // GoString keeps %#v from dumping unexported credential fields via reflection.
-func (c *Client) GoString() string { return c.String() }
+func (c Client) GoString() string { return c.String() }
 
 // RequestOption mutates an outgoing request before it is sent.
 type RequestOption func(*http.Request)
@@ -307,7 +330,13 @@ func (c *Client) issueToken(ctx context.Context) (string, time.Duration, error) 
 		ExpiresIn   int64  `json:"expires_in"`
 	}
 	if err := DecodeJSON(resp.Body, &tr); err != nil {
-		return "", 0, fmt.Errorf("toss: decode token response: %w", err)
+		// A decode/EOF failure on a 200 (mid-body TCP reset, truncated JSON) is
+		// a recoverable network glitch, not a credential failure — classify it
+		// transient so GET retries it and so, in the stale window, it does not
+		// poison terminalErr and defeat the L-3 stale fallback. (Semantic
+		// problems in a fully decoded body — missing access_token, bad
+		// expires_in below — remain terminal: those do not heal on retry.)
+		return "", 0, &transientError{err: fmt.Errorf("toss: decode token response: %w", err)}
 	}
 	if tr.AccessToken == "" {
 		return "", 0, errors.New("toss: token response missing access_token")

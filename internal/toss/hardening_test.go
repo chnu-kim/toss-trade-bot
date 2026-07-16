@@ -3,6 +3,7 @@ package toss
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -366,5 +367,74 @@ func TestClient_FormattingDoesNotLeakCredentials(t *testing.T) {
 		if strings.Contains(s, "leak-secret") {
 			t.Fatalf("formatted client %q leaks client_secret", s)
 		}
+	}
+}
+
+// TestClient_ValueFormattingDoesNotLeakCredentials guards the *value* (not just
+// *Client pointer) formatting path. A future call site logging `*client` by
+// value, or embedding a Client in a struct printed with %+v, would otherwise
+// fall back to reflection over the unexported clientSecret field — the exact
+// "one-line mistake" L-9 exists to prevent. (%p/%T are a documented residual:
+// fmt special-cases them before any Stringer/Formatter, so they escape masking;
+// they print a struct dump / type name and are not a realistic logging verb.)
+func TestClient_ValueFormattingDoesNotLeakCredentials(t *testing.T) {
+	c, err := NewClient("https://example.test", "leak-id", "leak-secret")
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	v := *c
+	type wrapper struct{ Client Client }
+	for _, s := range []string{
+		fmt.Sprintf("%v", v),
+		fmt.Sprintf("%+v", v),
+		fmt.Sprintf("%#v", v),
+		fmt.Sprintf("%s", v),
+		fmt.Sprintf("%q", v),
+		fmt.Sprintf("%d", v), // mismatched verb must still not reflect fields
+		fmt.Sprintf("%v", wrapper{v}),
+		fmt.Sprintf("%+v", wrapper{v}),
+	} {
+		if strings.Contains(s, "leak-secret") {
+			t.Fatalf("formatted Client value %q leaks client_secret", s)
+		}
+	}
+}
+
+// TestClient_TruncatedTokenBodyIsTransient: a 200 response whose body is
+// truncated (mid-body reset / partial JSON) is a recoverable network glitch,
+// not a credential failure. It must be classified transient so GET retries and
+// so, in the stale window, it does not poison terminalErr and defeat the L-3
+// stale fallback.
+func TestClient_TruncatedTokenBodyIsTransient(t *testing.T) {
+	var issues int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth2/token":
+			w.Header().Set("Content-Type", "application/json")
+			if atomic.AddInt32(&issues, 1) == 1 {
+				_, _ = io.WriteString(w, `{"access_token":"tok-1","exp`) // truncated
+				return
+			}
+			tokenJSON(t, w, "tok-1", 86400)
+		case "/api/v1/ping":
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv)
+	// Advance the manager clock during backoff so the paced retry crosses the
+	// holdoff (see TestClient_PostRetriesTokenAcquisitionButNotTheWrite).
+	clock := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	c.tokens.now = clock.now
+	c.sleep = func(_ context.Context, d time.Duration) error { clock.advance(d); return nil }
+
+	resp, err := c.Get(context.Background(), "/api/v1/ping")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	drainClose(resp)
+	if n := atomic.LoadInt32(&issues); n != 2 {
+		t.Fatalf("token issued %d times, want 2 (a truncated 200 body is transient and must be retried)", n)
 	}
 }

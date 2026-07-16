@@ -617,6 +617,28 @@ func TestTokenManager_NonPositiveTTLFromIssuerIsAnError(t *testing.T) {
 	}
 }
 
+// TestTokenManager_EmptyTokenFromIssuerIsAnError mirrors the non-positive-ttl
+// guard: an issuer returning an empty token with a positive ttl and no error
+// must be treated as a terminal failure. Caching an empty token would make
+// valid()/stale() (which require token != "") false forever, so every get()
+// would start a fresh flight (ADR-0001 herd) and callers would send a bare
+// "Bearer " header. The guard is defense-in-depth symmetric with the ttl guard.
+func TestTokenManager_EmptyTokenFromIssuerIsAnError(t *testing.T) {
+	var calls int32
+	m := newTokenManager(func(ctx context.Context) (string, time.Duration, error) {
+		atomic.AddInt32(&calls, 1)
+		return "", time.Hour, nil
+	})
+	if tok, err := m.get(context.Background()); err == nil {
+		t.Fatalf("get returned %q with nil error; an empty token must be a terminal error", tok)
+	}
+	// Terminal → negative-cached, not stormed.
+	_, _ = m.get(context.Background())
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("issuer called %d times, want 1 (empty-token failure must be negative-cached, not an issuance herd)", n)
+	}
+}
+
 func TestTokenManager_IssuePanicBecomesError(t *testing.T) {
 	var calls int32
 	m := newTokenManager(func(ctx context.Context) (string, time.Duration, error) {
