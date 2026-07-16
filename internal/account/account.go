@@ -2,7 +2,6 @@ package account
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -147,7 +146,9 @@ func fetch[T any](ctx context.Context, api getter, path string, opts ...toss.Req
 	var env struct {
 		Result T `json:"result"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+	// toss.DecodeJSON caps how many bytes are decoded so an oversized body
+	// cannot OOM the unattended process.
+	if err := toss.DecodeJSON(resp.Body, &env); err != nil {
 		return zero, fmt.Errorf("account: decode %s: %w", path, err)
 	}
 	return env.Result, nil
@@ -163,7 +164,7 @@ func decodeError(resp *http.Response) error {
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	_ = json.NewDecoder(resp.Body).Decode(&er)
+	_ = toss.DecodeJSON(resp.Body, &er)
 	if er.Error.Code != "" {
 		return fmt.Errorf("account: request failed: status %d: %s: %s", resp.StatusCode, er.Error.Code, er.Error.Message)
 	}

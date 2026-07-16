@@ -41,7 +41,12 @@ func main() {
 	// lands.
 	sup := runtime.NewSupervisor(logger)
 
-	client := toss.NewClient(cfg.BaseURL, cfg.ClientID, cfg.ClientSecret)
+	client, err := toss.NewClient(cfg.BaseURL, cfg.ClientID, cfg.ClientSecret.Reveal())
+	if err != nil {
+		logger.Error("failed to construct toss client", "err", err)
+		os.Exit(1)
+	}
+	client.SetLogger(logger)
 	_ = client // wired into the trading loop as strategy/order logic lands.
 
 	logger.Info("toss-trade-bot starting", "base_url", cfg.BaseURL)
