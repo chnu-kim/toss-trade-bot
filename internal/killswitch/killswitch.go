@@ -817,29 +817,47 @@ func (g *Guard) ClearGlobalHalt(ctx context.Context) error {
 		tokenN, orderN, baseline = tc.Value, oc.Value, er.Value
 	}
 
+	var clearedEpoch int64
 	err := g.st.Atomically(ctx, func(tx store.Tx) error {
-		// Durable fence: the durable epoch must still equal the baseline.
-		// Serialized on the single write connection against every TripHalt, so
-		// a global trip whose epoch bump committed since the baseline advances
-		// cur.Value and aborts here — before halt=0 is committed.
 		cur, err := tx.Counter(ctx, CounterHaltEpoch)
 		if err != nil {
 			return err
 		}
-		if cur.Value != baseline {
-			return errClearRaced
-		}
 		// Mirror fence (relative to the fixed baseline): a global trip bumps
 		// haltGen BEFORE its durable epoch commit, so haltGen != hgBefore
-		// means a trip applied (in flight or committed) even if its durable
-		// write has not landed yet. Taking g.mu inside the write transaction
-		// is safe: no path holds g.mu while waiting on the write connection.
+		// means a trip applied to the mirror since the clear started (in
+		// flight or committed). Because the single write connection serialized
+		// this transaction AFTER any TripTx, an in-flight caller trip has
+		// already committed or rolled back by now. Taking g.mu inside the
+		// write transaction is safe: no path holds g.mu while waiting on the
+		// write connection.
 		g.mu.RLock()
 		hg := g.haltGen
 		g.mu.RUnlock()
 		if hg != hgBefore {
 			return errClearRaced
 		}
+		// Durable fence, direction-aware (serialized on the single write
+		// connection against every TripHalt):
+		//   cur > baseline  — a global trip DURABLY committed since the
+		//                     baseline: a real race. Abort before halt=0.
+		//   cur < baseline  — the mirror ran ahead of the durable epoch: a
+		//                     TripTx (or failed-persist Trip) bumped haltGen
+		//                     but its epoch bump rolled back / never committed.
+		//                     That halt was never durably backed, so it is safe
+		//                     to clear; resync the mirror to the durable epoch
+		//                     post-commit (codex TripTx-rollback finding).
+		//   cur == baseline — steady, clear normally.
+		// The recovery path already resyncs its baseline from the durable
+		// epoch, so there any deviation is a race.
+		if needReload {
+			if cur.Value != baseline {
+				return errClearRaced
+			}
+		} else if cur.Value > baseline {
+			return errClearRaced
+		}
+		clearedEpoch = cur.Value
 		if err := tx.ClearHalt(ctx); err != nil {
 			return err
 		}
@@ -872,17 +890,20 @@ func (g *Guard) ClearGlobalHalt(ctx context.Context) error {
 	if needReload {
 		// Preserve any failure increment that raced the recovery reload
 		// (round 4 P2): only assign the reloaded snapshot when the counter
-		// epoch is unchanged. Resync the halt epoch mirror to the durable
-		// value we just fenced on.
+		// epoch is unchanged.
 		if g.tokenFail.epoch == tokenEpochBefore {
 			g.tokenFail = failureCounter{count: tokenN, epoch: g.tokenFail.epoch + 1}
 		}
 		if g.orderFail.epoch == orderEpochBefore {
 			g.orderFail = failureCounter{count: orderN, epoch: g.orderFail.epoch + 1}
 		}
-		g.haltGen = uint64(baseline)
 		g.recoveryFailed = false
 	}
+	// Resync the mirror halt epoch to the durable value we cleared against.
+	// For the steady path this is a no-op (clearedEpoch == hgBefore); for the
+	// rolled-back-TripTx skew it lowers haltGen from the phantom mirror value
+	// to the durable epoch, so the mirror and store agree again.
+	g.haltGen = uint64(clearedEpoch)
 	g.halted = false
 	g.haltReason = ""
 	return nil

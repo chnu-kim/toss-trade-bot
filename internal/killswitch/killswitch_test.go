@@ -816,6 +816,63 @@ func TestTripTxRollbackKeepsMirrorHalted(t *testing.T) {
 	mustBlock(t, g.CanSubmit("AAPL"), "") // mirror stays halted: fail-closed
 }
 
+func TestClearAfterTripTxRollbackSucceeds(t *testing.T) {
+	// codex review/adversarial on the redesign: TripTx bumps the in-memory
+	// haltGen (mirror-first) before the caller's transaction commits. If the
+	// caller ROLLS BACK, the durable halt epoch stays behind while the mirror
+	// ran ahead. The clear must not wedge on this skew: because the single
+	// write connection serialized this clear AFTER the rolled-back caller tx,
+	// a durable epoch BELOW the mirror baseline means the extra halt was never
+	// durably committed, so it is safe to clear and resync — not a race.
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "store.db")
+
+	db := openStoreAt(t, path)
+	authorizeStore(t, db)
+	g := killswitch.New(ctx, db, nil, killswitch.Config{})
+	g.MarkReplayComplete()
+
+	sentinel := errors.New("caller aborts")
+	err := db.Atomically(ctx, func(tx store.Tx) error {
+		if err := g.TripTx(ctx, tx, killswitch.Global(), "will roll back", time.Now()); err != nil {
+			return err
+		}
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected sentinel rollback error, got %v", err)
+	}
+	mustBlock(t, g.CanSubmit("AAPL"), "") // mirror halted after rollback (fail-closed)
+
+	// The operator must be able to clear the phantom halt (durable epoch is
+	// behind the mirror). Before the fix this returned errClearRaced forever.
+	if err := g.ClearGlobalHalt(ctx); err != nil {
+		t.Fatalf("ClearGlobalHalt after a rolled-back TripTx must succeed, got %v", err)
+	}
+	mustAllow(t, g.CanSubmit("AAPL"))
+	if halted, _ := g.Halted(); halted {
+		t.Fatal("guard must be un-halted after clearing the phantom halt")
+	}
+
+	// A subsequent real global trip must still persist + block, proving the
+	// resync left the epoch consistent (not stuck).
+	if err := g.Trip(ctx, killswitch.Global(), "real incident", time.Now()); err != nil {
+		t.Fatalf("Trip: %v", err)
+	}
+	mustBlock(t, g.CanSubmit("AAPL"), "real incident")
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// The real committed halt survives restart; the earlier rolled-back one
+	// was never durable, so the invariant "durably halted ⇒ boot halted" holds.
+	db2 := openStoreAt(t, path)
+	defer db2.Close()
+	g2 := killswitch.New(ctx, db2, nil, killswitch.Config{})
+	g2.MarkReplayComplete()
+	mustBlock(t, g2.CanSubmit("AAPL"), "real incident")
+}
+
 func TestReportOrderFailureTxJoinsCallerTransaction(t *testing.T) {
 	ctx := context.Background()
 	db := openStore(t)
