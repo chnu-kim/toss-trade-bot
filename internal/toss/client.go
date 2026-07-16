@@ -407,6 +407,14 @@ func DecodeJSON(r io.Reader, v any) error {
 		}
 		return errors.New("toss: unexpected trailing data after JSON response")
 	}
+	// Success path: the byte cap must hold here too. A value (plus any trailing
+	// whitespace) that consumed the whole limit is oversized even though it
+	// decoded cleanly and left nothing after it — without this check a
+	// cap-aligned value would slip past, since the failure/trailing branches
+	// above are the only other places lr.N is inspected.
+	if lr.N <= 0 {
+		return errResponseTooLarge()
+	}
 	return nil
 }
 

@@ -176,6 +176,38 @@ func TestDecodeJSON_TrailingData(t *testing.T) {
 	}
 }
 
+// TestDecodeJSON_ByteCapBoundary closes the byte-cap invariant on the SUCCESS
+// path: a value that decoded cleanly but consumed the whole limit must still be
+// rejected, not only a value whose decode happened to trip lr.N with an error.
+// A value of exactly maxResponseBytes bytes is accepted; maxResponseBytes+1 is
+// rejected.
+func TestDecodeJSON_ByteCapBoundary(t *testing.T) {
+	var s string
+
+	atCap := `"` + strings.Repeat("x", maxResponseBytes-2) + `"` // len == maxResponseBytes
+	if len(atCap) != maxResponseBytes {
+		t.Fatalf("atCap len = %d, want %d", len(atCap), maxResponseBytes)
+	}
+	if err := DecodeJSON(strings.NewReader(atCap), &s); err != nil {
+		t.Fatalf("value of exactly maxResponseBytes = %v, want accepted", err)
+	}
+
+	overCap := `"` + strings.Repeat("x", maxResponseBytes-1) + `"` // len == maxResponseBytes+1
+	if len(overCap) != maxResponseBytes+1 {
+		t.Fatalf("overCap len = %d, want %d", len(overCap), maxResponseBytes+1)
+	}
+	if err := DecodeJSON(strings.NewReader(overCap), &s); err == nil {
+		t.Fatal("value of maxResponseBytes+1 = nil, want oversized rejection")
+	} else if !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("error %q should report the size cap", err)
+	}
+
+	// A cap-aligned value followed by trailing bytes is also rejected.
+	if err := DecodeJSON(strings.NewReader(atCap+"x"), &s); err == nil {
+		t.Fatal("cap-aligned value + trailing = nil, want rejection")
+	}
+}
+
 func TestClient_OversizedTokenResponseRejected(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/oauth2/token" {
