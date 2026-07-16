@@ -11,7 +11,8 @@ import (
 )
 
 // Store counter names for the reconstruction-resistant escalation signals
-// (ADR-0004 point 7). Exported so operators and tests can inspect them.
+// (ADR-0004 point 7) and the durability fences. Exported so operators and
+// tests can inspect them.
 const (
 	// CounterTokenRefreshFailures counts consecutive token-refresh failures.
 	CounterTokenRefreshFailures = "killswitch.token-refresh-failures"
@@ -25,6 +26,17 @@ const (
 	// either a fresh deployment or a store whose provenance was lost, and
 	// both must boot halted (ADR-0007 points 3/7).
 	CounterLiveAuthorization = "killswitch.live-authorization"
+	// CounterHaltEpoch is the durable monotonic count of global-halt
+	// transitions. Every persisted global TripHalt bumps it in the SAME
+	// transaction; ClearGlobalHalt snapshots it and, inside its own clear
+	// transaction, only commits halt=0 if the durable epoch is unchanged —
+	// the write-connection serialization makes the "no global trip raced"
+	// check and the clear atomic (a conditional single transaction). This is
+	// what closes the clear/trip crash window without a two-transaction
+	// repair. Per-symbol trips do NOT bump it (they stay memory-only —
+	// ADR-0004 point 4), and CanSubmit never reads it (hot path stays on the
+	// mirror — ADR-0004 point 5).
+	CounterHaltEpoch = "killswitch.halt-epoch"
 )
 
 // ReasonAwaitingInitialAuthorization is the halt reason a never-authorized
@@ -134,26 +146,25 @@ type Guard struct {
 	now      func() time.Time
 
 	mu sync.RWMutex
-	// gen increments on every trip. An outstanding Decision from before any
-	// trip fails Reconfirm, even if the trip was cleared in between.
-	gen      uint64
+	// gen increments on EVERY trip (global or per-symbol). An outstanding
+	// Decision from before any trip fails Reconfirm — conservative TOCTOU
+	// containment (ADR-0004 point 1).
+	gen uint64
+	// haltGen increments only on a GLOBAL-halt transition (a global trip or a
+	// threshold escalation). It is the in-memory mirror of the durable
+	// CounterHaltEpoch and is the fence ClearGlobalHalt checks: because only
+	// global trips move it, a below-threshold per-symbol trip never makes a
+	// clear abort or leaves the store and mirror inconsistent. A global trip
+	// bumps haltGen (mirror) BEFORE its durable epoch commit, so
+	// haltGen != durable epoch means "a global trip is in flight".
+	haltGen  uint64
 	gateOpen bool
 	halted   bool
 	// haltReason is the mirror's halt reason (first trip wins in-process).
 	haltReason string
-	// haltDurable records whether the current mirror halt is known to be
-	// persisted. TripTx never sets it (the caller's tx may still roll back);
-	// the only cost of a false negative is a redundant re-persist.
-	haltDurable bool
-	// haltSeq versions the durable-halt state. It bumps on every halt
-	// transition and whenever ClearGlobalHalt drops the durable flag, so a
-	// persist planned before either event cannot mark the halt durable
-	// afterwards — a stale mark landing inside a clear window would let a
-	// coalescing trip skip its re-persist and the clear wipe the only
-	// durable halt (codex P1, PR #57 round 3).
-	haltSeq uint64
-	// recoveryFailed marks that boot could not load halt/counter state.
-	// ClearGlobalHalt refuses to resume until it can reload that state.
+	// recoveryFailed marks that boot could not load halt/epoch/counter state.
+	// The mirror is halted (fail-closed) but its haltGen may not match the
+	// durable epoch, so ClearGlobalHalt takes a resync path.
 	recoveryFailed bool
 	symbolBlocks   map[string]string
 	// symbolTrips holds occurredAt of recent symbol-scope trips for the
@@ -184,13 +195,13 @@ func (g *Guard) failureCounterRef(name string) *failureCounter {
 }
 
 // New loads persisted state and returns a usable Guard. It never fails open:
-// if the halt state or a persisted counter cannot be loaded, the returned
-// guard starts halted with a boot-recovery reason (ADR-0004 point 3) and only
-// ClearGlobalHalt — which re-checks the store — can resume it. A store that
-// was never explicitly authorized for live trading (fresh deployment, or
-// provenance lost) boots halted with ReasonAwaitingInitialAuthorization
-// (ADR-0007 points 3/7); the first successful ClearGlobalHalt records the
-// authorization durably.
+// if the halt state, the halt epoch, or a persisted counter cannot be loaded,
+// the returned guard starts halted with a boot-recovery reason (ADR-0004
+// point 3) and only ClearGlobalHalt — which re-reads and resyncs the store —
+// can resume it. A store that was never explicitly authorized for live
+// trading (fresh deployment, or provenance lost) boots halted with
+// ReasonAwaitingInitialAuthorization (ADR-0007 points 3/7); the first
+// successful ClearGlobalHalt records the authorization durably.
 //
 // The startup replay gate starts closed; call MarkReplayComplete after the
 // reconciler finished re-deriving per-symbol blocks from the journal.
@@ -209,42 +220,51 @@ func New(ctx context.Context, st store.Store, notifier Notifier, cfg Config) *Gu
 		at     time.Time
 	}
 	var notifications []pending
+	var awaitingPlan tripPlan
+	var awaiting bool
 
 	g.mu.Lock()
-	var awaitingPlan tripPlan
-	halt, err := st.Halt(ctx)
-	switch {
-	case err != nil:
+	// Initialise the in-memory halt-epoch mirror from durable truth first, so
+	// a booted-halted guard's haltGen matches the durable epoch and clears
+	// fence correctly.
+	epoch, eerr := st.Counter(ctx, CounterHaltEpoch)
+	if eerr != nil {
 		g.recoveryFailed = true
-		plan := g.haltLocked(fmt.Sprintf("boot recovery failed: halt state load: %v", err))
-		if plan.notifyReason != "" {
-			notifications = append(notifications, pending{plan.notifyReason, g.now()})
-		}
-	case halt.Halted:
-		// Booting into a previously persisted halt is not a new transition:
-		// it was notified when it tripped, so no re-notification here.
-		g.halted = true
-		g.haltReason = halt.Reason
-		g.haltDurable = true
-		g.haltSeq++
-	default:
-		// The halt state reads clear — but has live trading ever been
-		// explicitly authorized on this store? A fresh deployment and a
-		// store whose provenance was lost are both indistinguishable from
-		// "never authorized", and both must boot halted until the human
-		// clear (ADR-0007 points 3/7: absence of evidence is not safety).
-		auth, aerr := st.Counter(ctx, CounterLiveAuthorization)
+		g.haltMirrorFailClosedLocked(fmt.Sprintf("boot recovery failed: counter %s load: %v", CounterHaltEpoch, eerr))
+		notifications = append(notifications, pending{g.haltReason, g.now()})
+	} else {
+		g.haltGen = uint64(epoch.Value)
+	}
+
+	if !g.recoveryFailed {
+		halt, err := st.Halt(ctx)
 		switch {
-		case aerr != nil:
+		case err != nil:
 			g.recoveryFailed = true
-			plan := g.haltLocked(fmt.Sprintf(
-				"boot recovery failed: counter %s load: %v", CounterLiveAuthorization, aerr))
-			if plan.notifyReason != "" {
-				notifications = append(notifications, pending{plan.notifyReason, g.now()})
-			}
-		case auth.Value == 0:
-			awaitingPlan = g.haltLocked(ReasonAwaitingInitialAuthorization)
-			if awaitingPlan.notifyReason != "" {
+			g.haltMirrorFailClosedLocked(fmt.Sprintf("boot recovery failed: halt state load: %v", err))
+			notifications = append(notifications, pending{g.haltReason, g.now()})
+		case halt.Halted:
+			// Booting into a previously persisted halt is not a new transition:
+			// it was notified when it tripped. haltGen already equals the
+			// durable epoch (set above), so a clear fences correctly.
+			g.halted = true
+			g.haltReason = halt.Reason
+		default:
+			// The halt state reads clear — but has live trading ever been
+			// explicitly authorized on this store? A fresh deployment and a
+			// store whose provenance was lost are both indistinguishable from
+			// "never authorized", and both must boot halted until the human
+			// clear (ADR-0007 points 3/7: absence of evidence is not safety).
+			auth, aerr := st.Counter(ctx, CounterLiveAuthorization)
+			switch {
+			case aerr != nil:
+				g.recoveryFailed = true
+				g.haltMirrorFailClosedLocked(fmt.Sprintf(
+					"boot recovery failed: counter %s load: %v", CounterLiveAuthorization, aerr))
+				notifications = append(notifications, pending{g.haltReason, g.now()})
+			case auth.Value == 0:
+				awaitingPlan = g.haltLocked(ReasonAwaitingInitialAuthorization)
+				awaiting = true
 				notifications = append(notifications, pending{awaitingPlan.notifyReason, g.now()})
 			}
 		}
@@ -262,25 +282,30 @@ func New(ctx context.Context, st store.Store, notifier Notifier, cfg Config) *Gu
 			// Escalation progress could not be recovered: treat as halted,
 			// not as "no evidence" (ADR-0004 point 7).
 			g.recoveryFailed = true
-			plan := g.haltLocked(fmt.Sprintf("boot recovery failed: counter %s load: %v", c.name, err))
-			if plan.notifyReason != "" {
-				notifications = append(notifications, pending{plan.notifyReason, g.now()})
-			}
+			g.haltMirrorFailClosedLocked(fmt.Sprintf("boot recovery failed: counter %s load: %v", c.name, err))
+			notifications = append(notifications, pending{g.haltReason, g.now()})
 			continue
 		}
 		c.dst.count = rec.Value
 	}
 	g.mu.Unlock()
 
-	if awaitingPlan.persistReason != "" {
-		// Persist the awaiting-initial-authorization halt so a reboot before
-		// the first clear boots straight into it (ADR-0007 point 3). If the
-		// write fails the mirror is already halted (fail-closed) and stays
-		// non-durable — the next trip or boot re-derives it.
+	if awaiting {
+		// Persist the awaiting-initial-authorization halt AND its epoch so a
+		// reboot before the first clear boots straight into it (ADR-0007
+		// point 3) and the mirror haltGen matches the durable epoch. If the
+		// write fails the mirror is already halted (fail-closed); mark
+		// recoveryFailed so a later clear resyncs the epoch it could not
+		// persist.
 		if err := st.Atomically(ctx, func(tx store.Tx) error {
-			return tx.TripHalt(ctx, awaitingPlan.persistReason)
-		}); err == nil {
-			g.markHaltDurable(awaitingPlan.seq)
+			if err := tx.TripHalt(ctx, awaitingPlan.persistReason); err != nil {
+				return err
+			}
+			return bumpHaltEpoch(ctx, tx, awaitingPlan.haltGen)
+		}); err != nil {
+			g.mu.Lock()
+			g.recoveryFailed = true
+			g.mu.Unlock()
 		}
 	}
 
@@ -288,6 +313,21 @@ func New(ctx context.Context, st store.Store, notifier Notifier, cfg Config) *Gu
 		g.notify(n.reason, n.at)
 	}
 	return g
+}
+
+// bumpHaltEpoch raises the durable halt epoch to target if it is behind,
+// inside the caller's transaction. It is monotonic (never lowers) so
+// concurrent global trips whose transactions commit out of order still leave
+// the durable epoch at the highest haltGen.
+func bumpHaltEpoch(ctx context.Context, tx store.Tx, target uint64) error {
+	cur, err := tx.Counter(ctx, CounterHaltEpoch)
+	if err != nil {
+		return err
+	}
+	if int64(target) > cur.Value {
+		return tx.SetCounter(ctx, store.Counter{Name: CounterHaltEpoch, Value: int64(target)})
+	}
+	return nil
 }
 
 // CanSubmit is the synchronous fail-closed predicate on the new-exposure
@@ -367,43 +407,49 @@ type tripPlan struct {
 	persistReason string
 	// notifyReason non-empty => the notifier fires (new halted transition).
 	notifyReason string
-	// seq is the halt sequence the persist plan belongs to; the durable mark
-	// after a successful write is only valid while it is still current.
-	seq uint64
+	// haltGen is the global-halt generation this plan must persist as the
+	// durable epoch (in the SAME transaction as the TripHalt).
+	haltGen uint64
 }
 
-// haltLocked transitions the mirror to halted. Mirror first, durability
-// second: even if the caller's durable write then fails, the in-process
-// guard is already blocking (fail-closed). If already durably halted it
-// keeps the first reason and plans nothing; if halted but not known durable
-// it plans a re-persist.
+// haltLocked transitions the mirror toward a global halt and returns the
+// persistence/notification plan. It bumps gen (so outstanding Decisions fail
+// Reconfirm — a threshold escalation is a trip too) and haltGen (the
+// durable-epoch mirror) so that (a) a clear in flight aborts and (b) the
+// durable epoch advances in lockstep. The reason follows first-wins: a
+// coalescing trip keeps the existing reason but still advances haltGen/epoch
+// (a fresh global danger during a clear must invalidate that clear). Callers
+// hold g.mu.
 func (g *Guard) haltLocked(reason string) tripPlan {
-	// Every halt-affecting event bumps the generation — including a
-	// threshold re-trip that merely coalesces into an existing halt.
-	// Without this, a threshold crossing during a ClearGlobalHalt window
-	// would not invalidate the clear and the guard could resume right over
-	// a fresh danger signal (codex P1, PR #57 round 4).
 	g.gen++
-	if g.halted {
-		if g.haltDurable {
-			return tripPlan{}
-		}
-		return tripPlan{persistReason: g.haltReason, seq: g.haltSeq}
+	g.haltGen++
+	if !g.halted {
+		g.halted = true
+		g.haltReason = reason
+		return tripPlan{persistReason: reason, notifyReason: reason, haltGen: g.haltGen}
 	}
-	g.halted = true
-	g.haltReason = reason
-	g.haltDurable = false
-	g.haltSeq++
-	return tripPlan{persistReason: reason, notifyReason: reason, seq: g.haltSeq}
+	return tripPlan{persistReason: g.haltReason, haltGen: g.haltGen}
+}
+
+// haltMirrorFailClosedLocked halts the mirror WITHOUT advancing haltGen — for
+// boot-recovery failures where nothing durable backs the halt. Keeping
+// haltGen == durable epoch lets a later ClearGlobalHalt fence correctly; the
+// recoveryFailed flag routes that clear through a resync. CanSubmit blocks on
+// g.halted regardless. Callers hold g.mu.
+func (g *Guard) haltMirrorFailClosedLocked(reason string) {
+	if !g.halted {
+		g.halted = true
+		g.haltReason = reason
+	}
 }
 
 // applyTrip applies the in-memory effects of a trip and returns the
-// persistence/notification plan. Every trip bumps the generation, so all
-// outstanding Decisions fail Reconfirm (conservative TOCTOU containment).
+// persistence/notification plan. Every trip bumps gen (Reconfirm TOCTOU —
+// via haltLocked for global/escalating, or directly for a per-symbol block);
+// only a global-scope trip or a threshold escalation bumps haltGen.
 func (g *Guard) applyTrip(scope Scope, reason string, occurredAt time.Time) tripPlan {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.gen++
 	if scope.global {
 		return g.haltLocked(reason)
 	}
@@ -421,6 +467,8 @@ func (g *Guard) applyTrip(scope Scope, reason string, occurredAt time.Time) trip
 			len(g.symbolTrips), g.cfg.AmbiguousWindow, g.cfg.AmbiguousTripThreshold, reason,
 		))
 	}
+	// A non-escalating per-symbol trip still invalidates outstanding Decisions.
+	g.gen++
 	return tripPlan{}
 }
 
@@ -439,20 +487,21 @@ func (g *Guard) pruneTripsLocked() {
 // generic — ADR-0004 point 7); occurredAt is when the underlying event
 // happened, which matters for re-injected trips during the restart scan.
 //
-// Global scope: mirror halt, durable TripHalt in its own transaction, then
-// notifier. Symbol scope: memory-only block plus the frequency window; if the
-// window crosses the threshold the trip escalates to a persisted global halt.
-// On a persist failure the mirror stays halted and the error is returned.
+// Global scope: mirror halt, then durable TripHalt + halt-epoch bump in one
+// transaction, then notifier. Symbol scope: memory-only block plus the
+// frequency window; if the window crosses the threshold the trip escalates to
+// a persisted global halt. On a persist failure the mirror stays halted and
+// the error is returned.
 func (g *Guard) Trip(ctx context.Context, scope Scope, reason string, occurredAt time.Time) error {
 	plan := g.applyTrip(scope, reason, occurredAt)
 	var persistErr error
 	if plan.persistReason != "" {
 		persistErr = g.st.Atomically(ctx, func(tx store.Tx) error {
-			return tx.TripHalt(ctx, plan.persistReason)
+			if err := tx.TripHalt(ctx, plan.persistReason); err != nil {
+				return err
+			}
+			return bumpHaltEpoch(ctx, tx, plan.haltGen)
 		})
-		if persistErr == nil {
-			g.markHaltDurable(plan.seq)
-		}
 	}
 	if plan.notifyReason != "" {
 		g.notify(plan.notifyReason, occurredAt)
@@ -462,7 +511,8 @@ func (g *Guard) Trip(ctx context.Context, scope Scope, reason string, occurredAt
 
 // TripTx is Trip participating in the caller's transaction (ADR-0005
 // point 3): the caller owns the atomic coupling of a journal write and the
-// halt trip, e.g. "record ambiguous marker AND trip halt" in one commit.
+// halt trip, e.g. "record ambiguous marker AND trip halt" in one commit. The
+// halt-epoch bump joins the same transaction.
 //
 // The mirror updates immediately: if the caller's transaction later rolls
 // back, the durable halt is gone but the in-process guard keeps blocking —
@@ -472,8 +522,9 @@ func (g *Guard) TripTx(ctx context.Context, tx store.Tx, scope Scope, reason str
 	plan := g.applyTrip(scope, reason, occurredAt)
 	var persistErr error
 	if plan.persistReason != "" {
-		persistErr = tx.TripHalt(ctx, plan.persistReason)
-		// haltDurable deliberately not set: commit is the caller's call.
+		if persistErr = tx.TripHalt(ctx, plan.persistReason); persistErr == nil {
+			persistErr = bumpHaltEpoch(ctx, tx, plan.haltGen)
+		}
 	}
 	if plan.notifyReason != "" {
 		g.notify(plan.notifyReason, occurredAt)
@@ -548,7 +599,8 @@ func (g *Guard) reportFailure(ctx context.Context, tx store.Tx, name string, occ
 
 	// Counter write and any halt trip are one logical event: one transaction
 	// (ADR-0005 point 3). The monotonic guard keeps a racing older increment
-	// from overwriting a newer persisted value.
+	// from overwriting a newer persisted value; a threshold escalation also
+	// bumps the durable halt epoch in the same transaction.
 	write := func(tx store.Tx) error {
 		cur, err := tx.Counter(ctx, name)
 		if err != nil {
@@ -560,7 +612,10 @@ func (g *Guard) reportFailure(ctx context.Context, tx store.Tx, name string, occ
 			}
 		}
 		if plan.persistReason != "" {
-			return tx.TripHalt(ctx, plan.persistReason)
+			if err := tx.TripHalt(ctx, plan.persistReason); err != nil {
+				return err
+			}
+			return bumpHaltEpoch(ctx, tx, plan.haltGen)
 		}
 		return nil
 	}
@@ -581,9 +636,6 @@ func (g *Guard) reportFailure(ctx context.Context, tx store.Tx, name string, occ
 			g.forcePersistFailureHalt(err, occurredAt)
 		}
 		return err
-	}
-	if tx == nil && plan.persistReason != "" {
-		g.markHaltDurable(plan.seq)
 	}
 	if plan.notifyReason != "" {
 		g.notify(plan.notifyReason, occurredAt)
@@ -656,31 +708,46 @@ func (g *Guard) ClearSymbol(symbol string) {
 	g.mu.Unlock()
 }
 
-// errClearRaced reports that a trip landed while ClearGlobalHalt was in
-// flight; the clear keeps the fresher halt and the operator must review and
-// retry.
-var errClearRaced = errors.New("killswitch: clear aborted, a trip raced the clear — review and retry")
+// errClearRaced reports that a GLOBAL trip raced ClearGlobalHalt. The clear
+// did not release the halt (it aborted before or without committing halt=0,
+// or a global trip re-persisted the halt) and the mirror stays halted, so
+// this is the SAFE outcome; the operator reviews and retries.
+var errClearRaced = errors.New("killswitch: clear aborted, a global trip raced the clear — review and retry")
 
 // ClearGlobalHalt is the ONLY path that releases the global halt (explicit
-// human reset — ADR-0004 point 6). It is fail-closed end to end:
+// human reset — ADR-0004 point 6). It is a fail-closed conditional
+// single-transaction:
 //
-//   - A clear on an un-halted guard is a no-op, so a spurious clear cannot
-//     race a fresh trip's durable write.
-//   - If boot recovery had failed it first reloads the persisted counters,
-//     refusing to resume while the store still fails.
-//   - The durable clear is conditional: it runs inside one store transaction
-//     and re-checks the trip generation first. The store's single write
-//     connection serializes that transaction against every TripHalt, so a
-//     trip that already raced ahead aborts the clear before it touches the
-//     store (no wiping a fresher persisted halt — codex P1 on PR #57).
-//   - If a trip lands AFTER the in-tx check but before the commit, the clear
-//     commits (store cleared) yet the mirror stays halted. The clear then
-//     re-persists the halt itself before returning errClearRaced — it does
-//     NOT rely on the racing event to restore durability, because a
-//     below-threshold per-symbol trip bumps the generation with an empty
-//     plan and never re-persists. This guarantees the invariant "mirror
-//     halted ⇒ store at least as halted" for every kind of racing event
-//     (orchestrator adversarial panel finding on PR #57).
+//   - A clear on an un-halted guard is a no-op.
+//   - It snapshots the durable halt epoch E, then, INSIDE one store
+//     transaction, re-reads the durable epoch and only commits ClearHalt
+//     (plus the ADR-0007 authorization marker) if it is still E and the
+//     in-memory haltGen still equals E. The store's single write connection
+//     serializes that transaction against every global TripHalt, so "no
+//     global trip raced" and "halt=0" commit atomically — there is NO second
+//     transaction and therefore NO clear/repersist crash window (the defect
+//     the orchestrator's panel found in the two-transaction repair).
+//   - A per-symbol trip never bumps haltGen or the durable epoch, so it never
+//     makes a clear abort and never leaves store and mirror inconsistent —
+//     the global halt it does not affect is released cleanly and the symbol
+//     block simply remains in the mirror.
+//   - If a global trip applies to the mirror AFTER the in-tx fence but before
+//     the mirror flip, the clear keeps the mirror halted and returns
+//     errClearRaced. No self-repersist is needed: only a global trip bumps
+//     haltGen, and a global trip ALWAYS persists halt=1 + a higher epoch
+//     itself, so the store converges to halted.
+//
+// Known residual (booked): the clear's halt=0 commit and a concurrently
+// racing global trip's halt=1 commit are two independent events. If the clear
+// legitimately committed halt=0 (no global trip had applied at the in-tx
+// fence) and a global trip arrives in the same instant and the process
+// crashes strictly between the two commits, the store is momentarily halt=0.
+// This is NOT the eliminated two-tx repair window and NOT the symbol-trip
+// defect: it requires a real global danger to coincide to the instruction
+// with an operator clear plus a crash in the sub-microsecond gap, and the
+// condition that raised the global trip re-manifests on restart (re-halt).
+// Making even this atomic would require the store to conditionally commit on
+// an in-memory value, which store's API (rightly) does not expose.
 //
 // Escalation counters are NOT reset: if the root cause persists, the next
 // failure report re-trips.
@@ -691,27 +758,16 @@ func (g *Guard) ClearGlobalHalt(ctx context.Context) error {
 		return nil
 	}
 	needReload := g.recoveryFailed
-	genBefore := g.gen
-	// Counter epochs guard the recovery reload below: a below-threshold
-	// failure report does not bump gen, so without these a report racing the
-	// reload would be overwritten by the stale snapshot (codex P2, round 4).
+	hgBefore := g.haltGen
 	tokenEpochBefore := g.tokenFail.epoch
 	orderEpochBefore := g.orderFail.epoch
-	// Force any racing trip to plan a re-persist of the halt it coalesces
-	// into (haltLocked re-persists when the halt is not known durable), and
-	// bump the halt sequence so an in-flight persist completing during this
-	// clear cannot resurrect the durable flag with a stale mark.
-	g.haltDurable = false
-	g.haltSeq++
 	g.mu.Unlock()
 
 	var tokenN, orderN int64
 	if needReload {
 		// The clear may only resume what it can read: if boot could not load
-		// the halt state, an unconditional clear here would wipe a durable
-		// halt the guard never observed (codex review round 2 on PR #57).
-		// The persisted state itself is what the operator's explicit clear
-		// resumes from, so a successful read is the gate.
+		// the halt/counter state, refuse until the store serves it again
+		// (ADR-0004 point 3). The reload also resyncs the halt epoch below.
 		if _, err := g.st.Halt(ctx); err != nil {
 			return fmt.Errorf("killswitch: clear refused, halt state still unreadable: %w", err)
 		}
@@ -726,17 +782,34 @@ func (g *Guard) ClearGlobalHalt(ctx context.Context) error {
 		tokenN, orderN = tc.Value, oc.Value
 	}
 
-	err := g.st.Atomically(ctx, func(tx store.Tx) error {
-		// Conditional clear: abort before writing if any trip invalidated
-		// the state the operator observed. Taking g.mu inside the write
-		// transaction is safe because no code path holds g.mu while waiting
-		// on the write connection (mirror phases release the lock before
-		// any store I/O).
-		g.mu.RLock()
-		genNow := g.gen
-		g.mu.RUnlock()
-		if genNow != genBefore {
+	epochRec, err := g.st.Counter(ctx, CounterHaltEpoch)
+	if err != nil {
+		return fmt.Errorf("killswitch: clear refused, halt epoch unreadable: %w", err)
+	}
+	E := epochRec.Value
+
+	err = g.st.Atomically(ctx, func(tx store.Tx) error {
+		// Durable fence: has a global halt trip committed since we snapshotted
+		// E? Serialized on the single write connection against every TripHalt.
+		cur, err := tx.Counter(ctx, CounterHaltEpoch)
+		if err != nil {
+			return err
+		}
+		if cur.Value != E {
 			return errClearRaced
+		}
+		if !needReload {
+			// In-memory fence: a global trip bumps haltGen BEFORE its durable
+			// epoch commit, so haltGen != E means a global trip is in flight
+			// even though its durable write has not landed yet. Taking g.mu
+			// inside the write transaction is safe: no path holds g.mu while
+			// waiting on the write connection.
+			g.mu.RLock()
+			hg := g.haltGen
+			g.mu.RUnlock()
+			if hg != uint64(E) {
+				return errClearRaced
+			}
 		}
 		if err := tx.ClearHalt(ctx); err != nil {
 			return err
@@ -759,80 +832,51 @@ func (g *Guard) ClearGlobalHalt(ctx context.Context) error {
 	}
 
 	g.mu.Lock()
-	raced := g.gen != genBefore
-	if needReload && (g.tokenFail.epoch != tokenEpochBefore || g.orderFail.epoch != orderEpochBefore) {
-		// A failure report raced the recovery reload; assigning the stale
-		// snapshot would erase it from the live mirror.
-		raced = true
-	}
-	if raced {
-		// The store was ALREADY durably cleared by the transaction above, but
-		// a racing event kept the mirror halted. That event may not re-persist
-		// the halt: a below-threshold per-symbol Trip bumps the generation
-		// with an EMPTY plan (no TripHalt), and a below-threshold failure
-		// report writes only its counter. Relying on the racing event to
-		// restore durability (the old design) left the store cleared while the
-		// mirror stayed halted — a restart would then boot UNHALTED and allow
-		// live orders (ADR-0004 point 4 restart-bypass / ADR-0007 violation;
-		// caught by the orchestrator's adversarial panel).
-		//
-		// Restore the durable halt ourselves so the invariant "mirror halted
-		// ⇒ store at least as halted" holds unconditionally. The mirror kept
-		// the original reason (first-reason-wins in haltLocked), so re-persist
-		// that. auth=1 committed by the clear tx is harmless while halt=1 (the
-		// halted branch in New dominates the auth check).
-		reason := g.haltReason
-		g.haltDurable = false
-		g.haltSeq++
-		seq := g.haltSeq
-		g.mu.Unlock()
-
-		if perr := g.st.Atomically(ctx, func(tx store.Tx) error {
-			return tx.TripHalt(ctx, reason)
-		}); perr != nil {
-			// Even the restore write failed. The mirror stays halted
-			// (fail-closed); surface a compound error so the operator knows
-			// durability is uncertain and must be re-established before relying
-			// on a restart.
-			return fmt.Errorf("%w; durable halt restore failed, mirror stays halted: %v", errClearRaced, perr)
-		}
-		g.markHaltDurable(seq)
+	defer g.mu.Unlock()
+	if g.haltGen != hgBefore {
+		// A global trip applied to the mirror after the in-tx fence. It
+		// re-persists halt=1 + a higher epoch itself (only global trips move
+		// haltGen, and they always persist), so keep the mirror halted; the
+		// store converges to halted. No self-repersist here.
 		return errClearRaced
 	}
 	if needReload {
-		g.tokenFail = failureCounter{count: tokenN, epoch: g.tokenFail.epoch + 1}
-		g.orderFail = failureCounter{count: orderN, epoch: g.orderFail.epoch + 1}
+		// Preserve any failure increment that raced the recovery reload
+		// (round 4 P2): only assign the reloaded snapshot when the counter
+		// epoch is unchanged. Resync the halt epoch mirror to the durable
+		// value we just fenced on.
+		if g.tokenFail.epoch == tokenEpochBefore {
+			g.tokenFail = failureCounter{count: tokenN, epoch: g.tokenFail.epoch + 1}
+		}
+		if g.orderFail.epoch == orderEpochBefore {
+			g.orderFail = failureCounter{count: orderN, epoch: g.orderFail.epoch + 1}
+		}
+		g.haltGen = uint64(E)
 		g.recoveryFailed = false
 	}
 	g.halted = false
 	g.haltReason = ""
-	g.haltDurable = false
-	g.mu.Unlock()
 	return nil
 }
 
-// markHaltDurable records that the persist planned under halt sequence seq
-// committed. It is a no-op if the halt state moved on (new transition, or a
-// clear dropped the durable flag): a stale completion must not resurrect the
-// flag, or a coalescing trip during a clear would skip its re-persist.
-func (g *Guard) markHaltDurable(seq uint64) {
-	g.mu.Lock()
-	if g.halted && g.haltSeq == seq {
-		g.haltDurable = true
-	}
-	g.mu.Unlock()
-}
-
-// forcePersistFailureHalt trips the mirror after the guard failed to persist
+// forcePersistFailureHalt halts the mirror after the guard failed to persist
 // its own state (fail-closed: cannot record safety state => cannot submit
-// safely). Not durable by definition; the startup replay gate and the
+// safely). It does NOT advance haltGen: the persist failed, so no durable
+// epoch backs this halt, and keeping haltGen == durable epoch lets a later
+// ClearGlobalHalt still fence correctly. The startup replay gate and the
 // surfaced error cover the restart window.
 func (g *Guard) forcePersistFailureHalt(cause error, occurredAt time.Time) {
 	g.mu.Lock()
-	plan := g.haltLocked(fmt.Sprintf("kill-switch state persist failed: %v", cause))
+	var notifyReason string
+	if !g.halted {
+		g.gen++
+		g.halted = true
+		g.haltReason = fmt.Sprintf("kill-switch state persist failed: %v", cause)
+		notifyReason = g.haltReason
+	}
 	g.mu.Unlock()
-	if plan.notifyReason != "" {
-		g.notify(plan.notifyReason, occurredAt)
+	if notifyReason != "" {
+		g.notify(notifyReason, occurredAt)
 	}
 }
 

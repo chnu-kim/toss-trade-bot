@@ -37,6 +37,15 @@
 //   - No auto-resume for the global halt (ADR-0004 point 6): only the
 //     explicit ClearGlobalHalt call resumes submission. Per-symbol blocks
 //     auto-clear via ClearSymbol when the reconciler resolves the ambiguity.
+//   - ClearGlobalHalt is a conditional single transaction: it commits halt=0
+//     only if the durable halt epoch (CounterHaltEpoch, bumped by every
+//     global TripHalt in the same transaction) and the in-memory haltGen are
+//     both unchanged since the clear started. Because only a global trip
+//     moves the epoch/haltGen, a per-symbol trip never aborts the clear and
+//     never leaves store and mirror inconsistent, and there is no separate
+//     halt=1 repair write (hence no clear/repersist crash window).
+//     haltGen tracks global-halt transitions; the any-trip generation above
+//     stays the Reconfirm token.
 //   - Initial authorization is a halt, not a separate mechanism (ADR-0007):
 //     a store that has never seen an explicit clear boots halted with
 //     ReasonAwaitingInitialAuthorization, so deploying is never the event

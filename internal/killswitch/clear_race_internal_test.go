@@ -1,15 +1,20 @@
 package killswitch
 
-// White-box regression tests for the clear/trip race found by codex review on
-// PR #57: an unconditional durable clear racing a concurrent global trip
-// could wipe the freshly persisted halt, so a restart would boot unhalted —
-// turning a restart into a bypass of the very halt ADR-0004 persists.
+// White-box tests for the conditional single-transaction ClearGlobalHalt
+// (PR #57 redesign). The clear commits halt=0 inside ONE store transaction
+// that is fenced on the durable halt epoch (and the in-memory haltGen), so:
 //
-// The tests are white-box because reproducing the race deterministically
-// needs to observe the guard's generation counter: the injected store hooks
-// fire the racing Trip at a precise point of the clear and wait until the
-// trip's in-memory phase (gen bump) completed before letting the clear
-// proceed.
+//   - a GLOBAL trip racing the clear either aborts it (fence) or is itself
+//     the halt=1 re-persist (no self-repersist tx — the two-tx crash window
+//     is gone),
+//   - a below-threshold PER-SYMBOL trip never touches the epoch/haltGen, so
+//     it never makes the clear abort and never leaves store and mirror
+//     inconsistent (the CRITICAL fail-open is structurally removed).
+//
+// The tests are white-box because reproducing the interleavings
+// deterministically needs to observe the guard's generation counters: the
+// injected store hooks fire the racing action at a precise point of the
+// clear and block until its in-memory phase completed.
 
 import (
 	"context"
@@ -35,20 +40,19 @@ func authorizeForTest(t *testing.T, ctx context.Context, st store.Store) {
 type hookPoint int
 
 const (
-	// hookInsideClearWrite fires the racing trip from inside the durable
-	// clear write itself — after any pre-write checks the clear performs,
-	// exercising the "clear commits first, trip must re-persist" ordering.
+	// hookInsideClearWrite fires the racing action from inside the clear's
+	// ClearHalt call — AFTER the in-tx epoch/haltGen fence has passed,
+	// exercising the "fence passed, then a trip lands" ordering.
 	hookInsideClearWrite hookPoint = iota
-	// hookBeforeClearTx fires the racing trip before the clear transaction
-	// starts, exercising the "trip already raced, clear must abort without
-	// touching the store" ordering.
+	// hookBeforeClearTx fires the racing action before the clear transaction
+	// starts, exercising the "trip already applied, the in-tx fence must
+	// catch it" ordering.
 	hookBeforeClearTx
 )
 
-// raceStore wraps the real store and, once armed, fires a racing global Trip
-// exactly once at the configured point of the durable clear (both the direct
-// ClearHalt path and the transactional path are hooked), then blocks until
-// the trip's in-memory phase is visible.
+// raceStore wraps the real store and, once armed, fires a racing action
+// exactly once at the configured point of the clear, then blocks until the
+// action's in-memory phase (a gen or haltGen bump) is visible.
 type raceStore struct {
 	store.Store
 	tb    *testing.T
@@ -56,27 +60,22 @@ type raceStore struct {
 	ctx   context.Context
 	point hookPoint
 	armed bool // set (single-goroutine) right before ClearGlobalHalt
-	// beforeRace, when set, runs right before the racing trip fires —
-	// used to inject an event (e.g. a stale durable mark) into the window.
-	beforeRace func()
-	// action, when set, replaces the default racing Trip(Global) — e.g. a
-	// threshold-crossing failure report. It must bump the guard generation.
+	// action is the racing event fired inside the clear window. Nil defaults
+	// to a global Trip.
 	action   func() error
 	once     sync.Once
-	tripDone sync.WaitGroup
-	tripErr  error
+	raceDone sync.WaitGroup
+	raceErr  error
 }
 
-func (s *raceStore) fireRacingTrip() {
+func (s *raceStore) fireRace() {
 	if !s.armed {
 		return
 	}
 	s.once.Do(func() {
-		if s.beforeRace != nil {
-			s.beforeRace()
-		}
 		s.g.mu.RLock()
 		genBefore := s.g.gen
+		haltGenBefore := s.g.haltGen
 		s.g.mu.RUnlock()
 
 		action := s.action
@@ -85,24 +84,24 @@ func (s *raceStore) fireRacingTrip() {
 				return s.g.Trip(s.ctx, Global(), "raced signal", time.Now())
 			}
 		}
-		s.tripDone.Add(1)
+		s.raceDone.Add(1)
 		go func() {
-			defer s.tripDone.Done()
-			s.tripErr = action()
+			defer s.raceDone.Done()
+			s.raceErr = action()
 		}()
 
-		// Wait for the trip's synchronous in-memory phase (gen bump); its
-		// durable write then queues behind whatever transaction is open.
+		// Wait for the action's synchronous in-memory phase; its durable
+		// write (if any) then queues behind whatever transaction is open.
 		deadline := time.Now().Add(5 * time.Second)
 		for {
 			s.g.mu.RLock()
-			bumped := s.g.gen != genBefore
+			bumped := s.g.gen != genBefore || s.g.haltGen != haltGenBefore
 			s.g.mu.RUnlock()
 			if bumped {
 				return
 			}
 			if time.Now().After(deadline) {
-				s.tb.Error("racing trip never applied its in-memory phase")
+				s.tb.Error("racing action never applied its in-memory phase")
 				return
 			}
 			time.Sleep(time.Millisecond)
@@ -110,16 +109,9 @@ func (s *raceStore) fireRacingTrip() {
 	})
 }
 
-func (s *raceStore) ClearHalt(ctx context.Context) error {
-	if s.point == hookInsideClearWrite {
-		s.fireRacingTrip()
-	}
-	return s.Store.ClearHalt(ctx)
-}
-
 func (s *raceStore) Atomically(ctx context.Context, fn func(tx store.Tx) error) error {
 	if s.point == hookBeforeClearTx {
-		s.fireRacingTrip()
+		s.fireRace()
 	}
 	return s.Store.Atomically(ctx, func(tx store.Tx) error {
 		return fn(hookedTx{Tx: tx, s: s})
@@ -133,270 +125,240 @@ type hookedTx struct {
 
 func (tx hookedTx) ClearHalt(ctx context.Context) error {
 	if tx.s.point == hookInsideClearWrite {
-		tx.s.fireRacingTrip()
+		tx.s.fireRace()
 	}
 	return tx.Tx.ClearHalt(ctx)
 }
 
-func runClearRace(t *testing.T, point hookPoint) {
-	runClearRaceOpts(t, clearRaceOpts{point: point})
-}
-
-// clearRaceOpts parametrizes the clear/trip race harness so the durable-halt
-// invariant can be checked against every kind of racing event, not just the
-// global trip that happens to re-persist.
-type clearRaceOpts struct {
-	point hookPoint
-	// action is the racing event fired inside the clear window. Nil defaults
-	// to a global Trip. It must bump the guard generation so the clear's
-	// post-commit recheck detects the race.
-	action func(g *Guard) error
-	// config for the guard under test (thresholds). Zero value is fine.
-	config Config
-	// beforeRace runs right before the racing action fires.
-	beforeRace func(g *Guard)
-}
-
-func runClearRaceOpts(t *testing.T, opts clearRaceOpts) {
+// setupRaced builds an authorized store with a persisted global halt, wraps
+// it in a raceStore, and returns the guard plus the db path. The caller arms
+// rs and calls ClearGlobalHalt.
+func setupRaced(t *testing.T, cfg Config, point hookPoint, action func(g *Guard) error) (*Guard, *raceStore, *store.DB, string) {
+	t.Helper()
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "store.db")
 	db, err := store.Open(path)
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	closed := false
-	defer func() {
-		if !closed {
-			_ = db.Close()
-		}
-	}()
-
 	authorizeForTest(t, ctx, db)
-	rs := &raceStore{Store: db, tb: t, ctx: ctx, point: opts.point}
-	g := New(ctx, rs, nil, opts.config)
+	rs := &raceStore{Store: db, tb: t, ctx: ctx, point: point}
+	g := New(ctx, rs, nil, cfg)
 	rs.g = g
+	if action != nil {
+		rs.action = func() error { return action(g) }
+	}
 	g.MarkReplayComplete()
-
 	if err := g.Trip(ctx, Global(), "first incident", time.Now()); err != nil {
-		t.Fatalf("Trip: %v", err)
+		t.Fatalf("Trip(global): %v", err)
 	}
+	return g, rs, db, path
+}
 
-	if opts.beforeRace != nil {
-		rs.beforeRace = func() { opts.beforeRace(g) }
-	}
-	if opts.action != nil {
-		rs.action = func() error { return opts.action(g) }
-	}
-	rs.armed = true
-	if err := g.ClearGlobalHalt(ctx); err == nil {
-		t.Fatal("ClearGlobalHalt racing a trip must return an error")
-	}
-	rs.tripDone.Wait()
-	if rs.tripErr != nil {
-		t.Fatalf("racing action: %v", rs.tripErr)
-	}
-	if halted, _ := g.Halted(); !halted {
-		t.Fatal("mirror must stay halted after a raced clear")
-	}
-
-	// The core invariant: whenever the mirror stays halted, the store is at
-	// least as halted — so a restart still boots halted (restart is not a
-	// bypass), independent of whether the racing event re-persisted.
+func reopenHalted(t *testing.T, db *store.DB, path string) bool {
+	t.Helper()
+	ctx := context.Background()
 	if err := db.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	closed = true
 	db2, err := store.Open(path)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer db2.Close()
-	haltState, err := db2.Halt(ctx)
+	hs, err := db2.Halt(ctx)
 	if err != nil {
 		t.Fatalf("Halt: %v", err)
 	}
-	if !haltState.Halted {
-		t.Fatal("durable halt was lost across the raced clear: restart would boot unhalted (fail-open)")
-	}
-	g2 := New(ctx, db2, nil, opts.config)
-	g2.MarkReplayComplete()
-	if d := g2.CanSubmit("AAPL"); d.Allowed {
-		t.Fatal("guard rebooted after a raced clear must stay blocked")
-	}
+	return hs.Halted
 }
 
-// backward-compatible wrapper used by the round-3 stale-mark test.
-func runClearRaceWith(t *testing.T, point hookPoint, beforeRace func(g *Guard)) {
-	runClearRaceOpts(t, clearRaceOpts{point: point, beforeRace: beforeRace})
-}
+// --- Global trip racing the clear: clear must not release the halt ----------
 
-func TestClearRacingTripInsideClearWriteKeepsDurableHalt(t *testing.T) {
-	runClearRace(t, hookInsideClearWrite)
-}
-
-func TestClearRacingTripBeforeClearTxKeepsDurableHalt(t *testing.T) {
-	runClearRace(t, hookBeforeClearTx)
-}
-
-// TestClearRaceInvariantAcrossTripKinds is the regression for the CRITICAL
-// fail-open found by the orchestrator's adversarial panel: the clear's
-// durable-halt restore must NOT depend on the racing event re-persisting.
-// A below-threshold per-symbol Trip bumps the generation (invalidating the
-// clear's post-commit check) but returns an empty persist plan, so the
-// previous design left the store cleared while the mirror stayed halted — a
-// restart would boot UNHALTED and allow live orders (ADR-0004 point 4 /
-// ADR-0007 violation). The invariant "mirror halted ⇒ store at least as
-// halted" must hold for every kind of racing event, at every interleave
-// point, so this enumerates them.
-func TestClearRaceInvariantAcrossTripKinds(t *testing.T) {
-	kinds := []struct {
-		name   string
-		config Config
-		action func(g *Guard) error
-	}{
-		{
-			// The original covered case: a global trip that DOES re-persist.
-			name: "global-trip",
-			action: func(g *Guard) error {
-				return g.Trip(context.Background(), Global(), "raced global", time.Now())
-			},
-		},
-		{
-			// The CRITICAL uncovered case: a below-threshold symbol trip
-			// bumps gen but returns an empty plan (no re-persist).
-			name:   "below-threshold-symbol-trip",
-			config: Config{AmbiguousTripThreshold: 1000},
-			action: func(g *Guard) error {
-				return g.Trip(context.Background(), Symbol("TSLA"), "ambiguous submit", time.Now())
-			},
-		},
-		{
-			// A below-threshold order-failure report: writes only its counter,
-			// no TripHalt, yet bumps... actually it does not bump gen unless it
-			// crosses the threshold, so it cannot invalidate a non-recovery
-			// clear. Included as a threshold-crossing variant below instead.
-			name:   "threshold-crossing-order-failure",
-			config: Config{OrderFailureThreshold: 1},
-			action: func(g *Guard) error {
-				return g.ReportOrderFailure(context.Background(), time.Now())
-			},
-		},
-	}
-	points := []struct {
+func TestClearGlobalTripRaceKeepsHalt(t *testing.T) {
+	for _, pt := range []struct {
 		name string
 		p    hookPoint
 	}{
-		{"inside-clear-write", hookInsideClearWrite},
 		{"before-clear-tx", hookBeforeClearTx},
-	}
-	for _, k := range kinds {
-		for _, pt := range points {
-			t.Run(k.name+"/"+pt.name, func(t *testing.T) {
-				runClearRaceOpts(t, clearRaceOpts{
-					point:  pt.p,
-					action: k.action,
-					config: k.config,
-				})
+		{"inside-clear-write", hookInsideClearWrite},
+	} {
+		t.Run(pt.name, func(t *testing.T) {
+			ctx := context.Background()
+			g, rs, db, path := setupRaced(t, Config{}, pt.p, func(g *Guard) error {
+				return g.Trip(ctx, Global(), "raced global", time.Now())
 			})
-		}
+			rs.armed = true
+			err := g.ClearGlobalHalt(ctx)
+			rs.raceDone.Wait()
+			if rs.raceErr != nil {
+				t.Fatalf("racing global trip: %v", rs.raceErr)
+			}
+			if !errors.Is(err, errClearRaced) {
+				t.Fatalf("clear racing a global trip must return errClearRaced, got %v", err)
+			}
+			if halted, _ := g.Halted(); !halted {
+				t.Fatal("mirror must stay halted after a raced global clear")
+			}
+			if !reopenHalted(t, db, path) {
+				t.Fatal("durable halt lost: restart would boot unhalted (fail-open)")
+			}
+		})
 	}
 }
 
-// TestStalePersistMarkCannotDefeatClearRace covers codex P1 from round 3 on
-// PR #57: a halt persist that was in flight when the clear started completes
-// DURING the clear window. Its durable mark must be rejected as stale —
-// if it resurrected haltDurable, the coalescing trip fired next would plan no
-// re-persist and the clear's commit would wipe the only durable halt, so a
-// restart would boot unhalted.
-func TestStalePersistMarkCannotDefeatClearRace(t *testing.T) {
-	var staleSeq uint64
-	captured := false
-	runClearRaceWith(t, hookInsideClearWrite, func(g *Guard) {
-		if !captured {
-			// Simulate the pre-clear persist completing now: it carries the
-			// halt sequence from before the clear bumped it.
-			g.mu.RLock()
-			staleSeq = g.haltSeq - 1
-			g.mu.RUnlock()
-			captured = true
+// --- Threshold escalation racing the clear: same as a global trip -----------
+
+func TestClearThresholdCrossingRaceKeepsHalt(t *testing.T) {
+	ctx := context.Background()
+	// A single order failure crosses the threshold and escalates to a global
+	// halt (bumps haltGen + persists epoch), so it must abort the clear.
+	g, rs, db, path := setupRaced(t, Config{OrderFailureThreshold: 1}, hookInsideClearWrite,
+		func(g *Guard) error { return g.ReportOrderFailure(ctx, time.Now()) })
+	rs.armed = true
+	err := g.ClearGlobalHalt(ctx)
+	rs.raceDone.Wait()
+	if rs.raceErr != nil {
+		t.Fatalf("racing report: %v", rs.raceErr)
+	}
+	if !errors.Is(err, errClearRaced) {
+		t.Fatalf("clear racing a threshold escalation must return errClearRaced, got %v", err)
+	}
+	if halted, _ := g.Halted(); !halted {
+		t.Fatal("mirror must stay halted after a raced escalation clear")
+	}
+	if !reopenHalted(t, db, path) {
+		t.Fatal("durable halt lost after a raced escalation clear")
+	}
+}
+
+// --- Below-threshold symbol trip racing the clear: the CRITICAL case --------
+//
+// In the OLD design this left store=halt0 / mirror=halted and needed a
+// self-repersist that could crash. In the redesign a per-symbol trip never
+// touches the halt epoch, so the clear of the (unrelated) GLOBAL halt SUCCEEDS
+// cleanly, the symbol block simply remains in the mirror, and a restart boots
+// unhalted because the operator legitimately released the global halt. There
+// is no inconsistency and no fail-open.
+
+func TestClearSymbolTripRaceReleasesGlobalCleanly(t *testing.T) {
+	for _, pt := range []struct {
+		name string
+		p    hookPoint
+	}{
+		{"before-clear-tx", hookBeforeClearTx},
+		{"inside-clear-write", hookInsideClearWrite},
+	} {
+		t.Run(pt.name, func(t *testing.T) {
+			ctx := context.Background()
+			g, rs, db, path := setupRaced(t, Config{AmbiguousTripThreshold: 1000}, pt.p,
+				func(g *Guard) error { return g.Trip(ctx, Symbol("TSLA"), "ambiguous submit", time.Now()) })
+			rs.armed = true
+			err := g.ClearGlobalHalt(ctx)
+			rs.raceDone.Wait()
+			if rs.raceErr != nil {
+				t.Fatalf("racing symbol trip: %v", rs.raceErr)
+			}
+			// A per-symbol trip does not affect the global halt: the clear
+			// succeeds (the operator's authorization stands).
+			if err != nil {
+				t.Fatalf("clear racing a below-threshold symbol trip must succeed, got %v", err)
+			}
+			if halted, _ := g.Halted(); halted {
+				t.Fatal("global halt must be released after a clean clear")
+			}
+			// The symbol block still stands in the mirror.
+			if d := g.CanSubmit("TSLA"); d.Allowed {
+				t.Fatal("the raced symbol block must remain after the global clear")
+			}
+			if d := g.CanSubmit("AAPL"); !d.Allowed {
+				t.Fatal("unrelated symbols must be submittable after the global clear")
+			}
+			// The store is consistently unhalted (operator released it); the
+			// symbol block is memory-only and re-derived by the reconciler.
+			if reopenHalted(t, db, path) {
+				t.Fatal("store must be unhalted after a clean global clear (no self-repersist inconsistency)")
+			}
+		})
+	}
+}
+
+// --- No self-repersist: the clear issues no second halt=1 write -------------
+//
+// Prove the two-tx repair is gone by counting the halt writes the clear
+// itself performs. A raced GLOBAL clear must issue exactly one clear
+// transaction (ClearHalt) and zero TripHalt of its own — any halt=1 that
+// lands comes from the racing global trip, on its own transaction.
+
+type countingTx struct {
+	store.Tx
+	clears, trips *int
+}
+
+func (tx countingTx) ClearHalt(ctx context.Context) error {
+	*tx.clears++
+	return tx.Tx.ClearHalt(ctx)
+}
+
+func (tx countingTx) TripHalt(ctx context.Context, reason string) error {
+	*tx.trips++
+	return tx.Tx.TripHalt(ctx, reason)
+}
+
+type countingStore struct {
+	store.Store
+	afterAuthorize bool
+	clears, trips  int
+}
+
+func (s *countingStore) Atomically(ctx context.Context, fn func(tx store.Tx) error) error {
+	return s.Store.Atomically(ctx, func(tx store.Tx) error {
+		if !s.afterAuthorize {
+			return fn(tx)
 		}
-		g.markHaltDurable(staleSeq)
+		return fn(countingTx{Tx: tx, clears: &s.clears, trips: &s.trips})
 	})
 }
 
-// TestThresholdCrossingDuringClearAbortsClear covers codex P1 from round 4 on
-// PR #57: a threshold-crossing failure report that lands inside the clear
-// window coalesces into the existing halt without a state transition. It must
-// still invalidate the clear (generation bump) exactly like a Trip would —
-// otherwise the clear resumes right over a fresh danger signal.
-func TestThresholdCrossingDuringClearAbortsClear(t *testing.T) {
+func TestClearIssuesNoSelfRepersist(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "store.db")
 	db, err := store.Open(path)
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	closed := false
-	defer func() {
-		if !closed {
-			_ = db.Close()
-		}
-	}()
+	defer db.Close()
 	authorizeForTest(t, ctx, db)
 
-	rs := &raceStore{Store: db, tb: t, ctx: ctx, point: hookInsideClearWrite}
-	g := New(ctx, rs, nil, Config{OrderFailureThreshold: 3})
-	rs.g = g
+	cs := &countingStore{Store: db}
+	g := New(ctx, cs, nil, Config{})
 	g.MarkReplayComplete()
-
-	at := time.Now()
-	for i := 0; i < 2; i++ {
-		if err := g.ReportOrderFailure(ctx, at); err != nil {
-			t.Fatalf("ReportOrderFailure: %v", err)
-		}
-	}
-	if err := g.Trip(ctx, Global(), "first incident", at); err != nil {
+	if err := g.Trip(ctx, Global(), "incident", time.Now()); err != nil {
 		t.Fatalf("Trip: %v", err)
 	}
+	// Only count writes issued from here on (the clear + any racing trip).
+	cs.afterAuthorize = true
 
-	rs.action = func() error { return g.ReportOrderFailure(ctx, time.Now()) }
-	rs.armed = true
-	if err := g.ClearGlobalHalt(ctx); err == nil {
-		t.Fatal("clear racing a threshold crossing must return an error")
+	// No race: a plain clear must be a single ClearHalt, zero TripHalt.
+	if err := g.ClearGlobalHalt(ctx); err != nil {
+		t.Fatalf("ClearGlobalHalt: %v", err)
 	}
-	rs.tripDone.Wait()
-	if rs.tripErr != nil {
-		t.Fatalf("racing report: %v", rs.tripErr)
+	if cs.clears != 1 {
+		t.Fatalf("clear must issue exactly one ClearHalt, got %d", cs.clears)
 	}
-	if halted, _ := g.Halted(); !halted {
-		t.Fatal("mirror must stay halted after the raced clear")
-	}
-
-	// The durable halt survived (the report's re-persist queued behind the
-	// clear transaction), so a restart still boots halted.
-	if err := db.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-	closed = true
-	db2, err := store.Open(path)
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
-	}
-	defer db2.Close()
-	haltState, err := db2.Halt(ctx)
-	if err != nil {
-		t.Fatalf("Halt: %v", err)
-	}
-	if !haltState.Halted {
-		t.Fatal("durable halt was lost across the raced clear: restart would boot unhalted (fail-open)")
+	if cs.trips != 0 {
+		t.Fatalf("clear must issue zero TripHalt of its own (no self-repersist), got %d", cs.trips)
 	}
 }
 
-// reloadRaceStore reproduces codex P2 from round 4 on PR #57: during a
-// recovery clear (boot could not load counters), a below-threshold failure
-// report lands right after the clear read its reload snapshot. The report
-// does not bump the generation, so only the counter epochs can protect the
-// mirror from being overwritten by the stale snapshot.
+// --- Recovery-reload race preserves a concurrent failure increment ----------
+//
+// During a needReload clear (boot could not load counters), a below-threshold
+// failure report lands right after the clear read its reload snapshot. The
+// report does not bump haltGen, so the clear still SUCCEEDS (the recovery
+// halt is released), but the reloaded snapshot must not overwrite the racing
+// increment in the mirror.
+
 type reloadRaceStore struct {
 	store.Store
 	g        *Guard
@@ -424,7 +386,7 @@ func (s *reloadRaceStore) Counter(ctx context.Context, name string) (store.Count
 	return c, err
 }
 
-func TestReportRacingRecoveryReloadAbortsClear(t *testing.T) {
+func TestRecoveryReloadRacePreservesIncrement(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
@@ -442,14 +404,14 @@ func TestReportRacingRecoveryReloadAbortsClear(t *testing.T) {
 
 	rs.failLoad = false
 	rs.armed = true
-	if err := g.ClearGlobalHalt(ctx); err == nil {
-		t.Fatal("clear whose reload snapshot was invalidated by a racing report must return an error")
+	// The recovery clear succeeds (the racing failure is below threshold, so
+	// it does not re-halt), and the concurrent increment survives.
+	if err := g.ClearGlobalHalt(ctx); err != nil {
+		t.Fatalf("recovery clear should succeed, got %v", err)
 	}
 	if rs.raceErr != nil {
 		t.Fatalf("racing report: %v", rs.raceErr)
 	}
-
-	// The racing report's increment must survive in the live mirror.
 	g.mu.RLock()
 	count := g.tokenFail.count
 	g.mu.RUnlock()
