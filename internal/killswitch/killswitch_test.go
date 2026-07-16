@@ -816,6 +816,79 @@ func TestTripTxRollbackKeepsMirrorHalted(t *testing.T) {
 	mustBlock(t, g.CanSubmit("AAPL"), "") // mirror stays halted: fail-closed
 }
 
+// failCounterWriteStore fails SetCounter for one counter name (a selective,
+// transient store fault) while allowing every other write — so a failure
+// counter cannot be persisted but the durable halt/epoch can.
+type failCounterWriteStore struct {
+	store.Store
+	failName string
+}
+
+var errInjectedCounterWrite = errors.New("injected counter-write failure")
+
+func (s *failCounterWriteStore) Atomically(ctx context.Context, fn func(tx store.Tx) error) error {
+	return s.Store.Atomically(ctx, func(tx store.Tx) error {
+		return fn(failCounterTx{Tx: tx, failName: s.failName})
+	})
+}
+
+type failCounterTx struct {
+	store.Tx
+	failName string
+}
+
+func (tx failCounterTx) SetCounter(ctx context.Context, c store.Counter) error {
+	if c.Name == tx.failName {
+		return errInjectedCounterWrite
+	}
+	return tx.Tx.SetCounter(ctx, c)
+}
+
+func TestCounterPersistFailureEscalatesToDurableHalt(t *testing.T) {
+	// codex adversarial: a below-threshold failure whose counter write fails
+	// must not leave a mirror-only halt — on an authorized store a restart
+	// would then boot unhalted and lose the failure evidence. The persist
+	// failure must escalate to a DURABLE global halt (ADR-0005 point 6), so a
+	// fresh guard on the same store boots halted.
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "store.db")
+
+	db := openStoreAt(t, path)
+	authorizeStore(t, db)
+
+	fail := &failCounterWriteStore{Store: db, failName: killswitch.CounterOrderFailures}
+	g := killswitch.New(ctx, fail, nil, killswitch.Config{OrderFailureThreshold: 5})
+	g.MarkReplayComplete()
+	mustAllow(t, g.CanSubmit("AAPL")) // authorized, not halted
+
+	// One below-threshold failure; its counter write fails.
+	if err := g.ReportOrderFailure(ctx, time.Now()); err == nil {
+		t.Fatal("ReportOrderFailure must surface the counter-write failure")
+	}
+	// The durable escalation (halt + epoch) uses different counter names, so
+	// it succeeds: the mirror is halted now.
+	mustBlock(t, g.CanSubmit("AAPL"), "")
+
+	haltState, err := db.Halt(ctx)
+	if err != nil {
+		t.Fatalf("Halt: %v", err)
+	}
+	if !haltState.Halted {
+		t.Fatal("a counter-persist failure must escalate to a DURABLE global halt")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// A fresh guard on the same store must boot halted (fail-closed across
+	// restart) — the evidence was not lost.
+	db2 := openStoreAt(t, path)
+	defer db2.Close()
+	g2 := killswitch.New(ctx, db2, nil, killswitch.Config{OrderFailureThreshold: 5})
+	g2.MarkReplayComplete()
+	mustBlock(t, g2.CanSubmit("AAPL"), "")
+}
+
 func TestClearAfterTripTxRollbackSucceeds(t *testing.T) {
 	// codex review/adversarial on the redesign: TripTx bumps the in-memory
 	// haltGen (mirror-first) before the caller's transaction commits. If the

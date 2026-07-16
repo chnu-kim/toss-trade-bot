@@ -12,6 +12,7 @@ package killswitch
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -25,14 +26,21 @@ import (
 // failure's in-memory phase is visible.
 type resetRaceStore struct {
 	store.Store
-	tb       *testing.T
-	g        *Guard
-	ctx      context.Context
-	armed    bool // set (single-goroutine) right before the reset
-	once     sync.Once
-	raceDone sync.WaitGroup
-	raceErr  error
+	tb    *testing.T
+	g     *Guard
+	ctx   context.Context
+	armed bool // set (single-goroutine) right before the reset
+	// failRepersist makes the racing failure's own re-persist write (the
+	// non-zero SetCounter) fail, simulating a crash before the repair lands.
+	// It proves the reset must ROLL BACK its zero rather than rely on that
+	// repair.
+	failRepersist bool
+	once          sync.Once
+	raceDone      sync.WaitGroup
+	raceErr       error
 }
+
+var errInjectedRepersist = errors.New("injected re-persist failure")
 
 func (s *resetRaceStore) maybeFire(c store.Counter) {
 	if !s.armed || c.Name != CounterOrderFailures || c.Value != 0 {
@@ -84,6 +92,12 @@ type resetHookedTx struct {
 
 func (tx resetHookedTx) SetCounter(ctx context.Context, c store.Counter) error {
 	tx.s.maybeFire(c)
+	if tx.s.armed && tx.s.failRepersist && c.Name == CounterOrderFailures && c.Value > 0 {
+		// The racing failure's repair write: fail it to simulate a crash
+		// before the streak is re-persisted. Gated on armed so the setup
+		// failures (before the reset) still persist.
+		return errInjectedRepersist
+	}
 	return tx.Tx.SetCounter(ctx, c)
 }
 
@@ -132,5 +146,52 @@ func TestResetRacingFailureKeepsCounterProgress(t *testing.T) {
 	}
 	if c.Value != 3 {
 		t.Fatalf("durable counter = %d, want 3: a restart would lose escalation progress", c.Value)
+	}
+}
+
+func TestResetRollsBackWhenFailureRacesBeforeCommit(t *testing.T) {
+	// codex review P1: when a failure races the reset before its zero write
+	// commits, the reset must ROLL BACK the zero rather than commit it and
+	// rely on the failure's later repair write. Proof: fail the repair write
+	// too — if the reset had committed zero, the durable streak would be lost
+	// (0); with the rollback it is preserved.
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "store.db")
+	db, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer db.Close()
+
+	authorizeForTest(t, ctx, db)
+	rs := &resetRaceStore{Store: db, tb: t, ctx: ctx, failRepersist: true}
+	g := New(ctx, rs, nil, Config{OrderFailureThreshold: 5})
+	rs.g = g
+	g.MarkReplayComplete()
+
+	at := time.Now()
+	for i := 0; i < 2; i++ {
+		if err := g.ReportOrderFailure(ctx, at); err != nil {
+			t.Fatalf("ReportOrderFailure: %v", err)
+		}
+	}
+
+	// Reset races failure #3, whose repair write then fails.
+	rs.armed = true
+	if err := g.ReportOrderSuccess(ctx); err == nil {
+		t.Fatal("a reset that raced a failure must not report clean success")
+	}
+	rs.raceDone.Wait()
+	// (rs.raceErr is the racing failure's error: its repair write failed and
+	// the guard escalated to a durable halt — expected, not a test failure.)
+
+	// The durable streak must be preserved (never committed to zero): the
+	// reset rolled back rather than leaving a crash window at zero.
+	c, err := db.Counter(ctx, CounterOrderFailures)
+	if err != nil {
+		t.Fatalf("Counter: %v", err)
+	}
+	if c.Value == 0 {
+		t.Fatal("durable streak was committed to zero: a crash before repair would lose escalation progress")
 	}
 }

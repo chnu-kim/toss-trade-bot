@@ -641,17 +641,27 @@ func (g *Guard) reportFailure(ctx context.Context, tx store.Tx, name string, occ
 		err = g.st.Atomically(ctx, write)
 	}
 	if err != nil {
-		// The reconstruction-resistant signal could not be persisted: a
-		// restart would silently lose escalation progress, so fail closed
-		// now (mirror halt). If the threshold trip above already halted the
-		// mirror, its haltGen ran ahead of the durable epoch, so also mark
-		// degraded so a later clear resyncs; otherwise force the mirror halt.
+		// The reconstruction-resistant counter could not be persisted. Fail
+		// closed. A mirror-only halt is not enough: on an already-authorized
+		// store a restart would read the old (clear) halt + old counter and
+		// reopen submission, losing the failure evidence (codex adversarial).
 		if plan.notifyReason != "" {
-			g.markRecoveryFailed()
 			g.notify(plan.notifyReason, occurredAt)
-		} else {
-			g.forcePersistFailureHalt(err, occurredAt)
 		}
+		if tx != nil {
+			// The caller owns this transaction and its rollback, so we cannot
+			// issue our own durable write here. Fail closed in memory + flag
+			// recovery; the caller must handle the store outage's durability.
+			g.forcePersistFailureHalt(err, occurredAt)
+			return err
+		}
+		// We own the write and it failed: a durable-write failure is itself a
+		// fail-closed halt trigger (ADR-0005 point 6). Escalate to a DURABLE
+		// global halt so a restart boots halted instead of losing the failure
+		// evidence. Trip persists halt + epoch consistently and, if it too
+		// fails, flags recovery and keeps the mirror halted (best effort).
+		_ = g.Trip(ctx, Global(),
+			fmt.Sprintf("kill-switch counter %s persist failed: %v", name, err), occurredAt)
 		return err
 	}
 	if plan.notifyReason != "" {
@@ -687,13 +697,23 @@ func (g *Guard) resetFailures(ctx context.Context, name string) error {
 	}
 
 	err := g.st.Atomically(ctx, func(tx store.Tx) error {
+		if err := tx.SetCounter(ctx, store.Counter{Name: name, UpdatedAt: g.now()}); err != nil {
+			return err
+		}
+		// Re-check the epoch as the LAST action before the callback returns: if
+		// a failure incremented the counter since epochBefore (including during
+		// this SetCounter), roll the zero write back by returning an error,
+		// rather than committing zero and relying on the racing failure's
+		// repair write (which a crash between the two commits could skip —
+		// codex review P1). The residual (a failure landing between this check
+		// and the actual commit) is caught by the post-commit check below.
 		g.mu.RLock()
 		raced := g.failureCounterRef(name).epoch != epochBefore
 		g.mu.RUnlock()
 		if raced {
 			return errResetRaced
 		}
-		return tx.SetCounter(ctx, store.Counter{Name: name, UpdatedAt: g.now()})
+		return nil
 	})
 	switch {
 	case errors.Is(err, errResetRaced):
