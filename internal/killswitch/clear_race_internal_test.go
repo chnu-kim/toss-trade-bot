@@ -62,51 +62,71 @@ type raceStore struct {
 	armed bool // set (single-goroutine) right before ClearGlobalHalt
 	// action is the racing event fired inside the clear window. Nil defaults
 	// to a global Trip.
-	action   func() error
-	once     sync.Once
+	action func() error
+	// waitFull makes fireRace block until the racing action FULLY completes
+	// (its durable write committed), not just its in-memory phase. Only valid
+	// with hookBeforeClearTx (the clear does not yet hold the write
+	// connection, so the racing trip can commit). This reproduces the codex
+	// review P1 scenario: a global trip whose epoch bump is durably committed
+	// before the clear transaction runs.
+	waitFull bool
+	fireMu   sync.Mutex
+	fired    bool
 	raceDone sync.WaitGroup
 	raceErr  error
 }
 
 func (s *raceStore) fireRace() {
-	if !s.armed {
+	// Explicit fire-once guard (not sync.Once): the racing trip re-enters this
+	// method via the hooked Atomically, and a re-entrant call must be a cheap
+	// no-op rather than block on the in-flight fire (which, under waitFull,
+	// waits for that very trip — a self-deadlock).
+	s.fireMu.Lock()
+	if !s.armed || s.fired {
+		s.fireMu.Unlock()
 		return
 	}
-	s.once.Do(func() {
+	s.fired = true
+	s.fireMu.Unlock()
+
+	s.g.mu.RLock()
+	genBefore := s.g.gen
+	haltGenBefore := s.g.haltGen
+	s.g.mu.RUnlock()
+
+	action := s.action
+	if action == nil {
+		action = func() error {
+			return s.g.Trip(s.ctx, Global(), "raced signal", time.Now())
+		}
+	}
+	s.raceDone.Add(1)
+	go func() {
+		defer s.raceDone.Done()
+		s.raceErr = action()
+	}()
+
+	// Wait for the action's synchronous in-memory phase; its durable write
+	// (if any) then queues behind whatever transaction is open.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
 		s.g.mu.RLock()
-		genBefore := s.g.gen
-		haltGenBefore := s.g.haltGen
+		bumped := s.g.gen != genBefore || s.g.haltGen != haltGenBefore
 		s.g.mu.RUnlock()
-
-		action := s.action
-		if action == nil {
-			action = func() error {
-				return s.g.Trip(s.ctx, Global(), "raced signal", time.Now())
-			}
+		if bumped {
+			break
 		}
-		s.raceDone.Add(1)
-		go func() {
-			defer s.raceDone.Done()
-			s.raceErr = action()
-		}()
-
-		// Wait for the action's synchronous in-memory phase; its durable
-		// write (if any) then queues behind whatever transaction is open.
-		deadline := time.Now().Add(5 * time.Second)
-		for {
-			s.g.mu.RLock()
-			bumped := s.g.gen != genBefore || s.g.haltGen != haltGenBefore
-			s.g.mu.RUnlock()
-			if bumped {
-				return
-			}
-			if time.Now().After(deadline) {
-				s.tb.Error("racing action never applied its in-memory phase")
-				return
-			}
-			time.Sleep(time.Millisecond)
+		if time.Now().After(deadline) {
+			s.tb.Error("racing action never applied its in-memory phase")
+			return
 		}
-	})
+		time.Sleep(time.Millisecond)
+	}
+	if s.waitFull {
+		// Also wait for the durable commit: the racing trip's epoch bump must
+		// be persisted before the clear transaction proceeds.
+		s.raceDone.Wait()
+	}
 }
 
 func (s *raceStore) Atomically(ctx context.Context, fn func(tx store.Tx) error) error {
@@ -204,6 +224,37 @@ func TestClearGlobalTripRaceKeepsHalt(t *testing.T) {
 				t.Fatal("durable halt lost: restart would boot unhalted (fail-open)")
 			}
 		})
+	}
+}
+
+// TestClearGlobalTripFullyCommittedBeforeClearKeepsHalt reproduces the codex
+// review P1 on the redesign: a global trip that durably commits its
+// TripHalt/epoch bump BEFORE the clear transaction runs (but after the clear
+// captured its baseline) must not be overwritten. The old code re-read the
+// epoch after the race and sampled the trip's new epoch, then committed
+// halt=0 and only aborted afterwards — losing the halt across a restart. The
+// fixed clear fences the durable epoch against the baseline captured before
+// any I/O, so it aborts before committing halt=0.
+func TestClearGlobalTripFullyCommittedBeforeClearKeepsHalt(t *testing.T) {
+	ctx := context.Background()
+	g, rs, db, path := setupRaced(t, Config{}, hookBeforeClearTx, func(g *Guard) error {
+		return g.Trip(ctx, Global(), "raced global (fully committed)", time.Now())
+	})
+	rs.waitFull = true // the racing trip's epoch bump commits before the clear tx
+	rs.armed = true
+	err := g.ClearGlobalHalt(ctx)
+	rs.raceDone.Wait()
+	if rs.raceErr != nil {
+		t.Fatalf("racing global trip: %v", rs.raceErr)
+	}
+	if !errors.Is(err, errClearRaced) {
+		t.Fatalf("clear must abort when a global trip already committed, got %v", err)
+	}
+	if halted, _ := g.Halted(); !halted {
+		t.Fatal("mirror must stay halted")
+	}
+	if !reopenHalted(t, db, path) {
+		t.Fatal("durable halt lost: the committed global trip was overwritten (fail-open)")
 	}
 }
 

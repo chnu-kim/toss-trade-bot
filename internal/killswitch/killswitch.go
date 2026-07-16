@@ -502,11 +502,26 @@ func (g *Guard) Trip(ctx context.Context, scope Scope, reason string, occurredAt
 			}
 			return bumpHaltEpoch(ctx, tx, plan.haltGen)
 		})
+		if persistErr != nil {
+			// The mirror bumped haltGen but the durable epoch did not: mark
+			// degraded so a later ClearGlobalHalt resyncs from the durable
+			// epoch instead of fencing against a haltGen that ran ahead.
+			g.markRecoveryFailed()
+		}
 	}
 	if plan.notifyReason != "" {
 		g.notify(plan.notifyReason, occurredAt)
 	}
 	return persistErr
+}
+
+// markRecoveryFailed flags that the mirror's haltGen may have advanced past
+// the durable epoch (a global-halt persist failed), so ClearGlobalHalt must
+// resync from the durable epoch rather than fence against the mirror.
+func (g *Guard) markRecoveryFailed() {
+	g.mu.Lock()
+	g.recoveryFailed = true
+	g.mu.Unlock()
 }
 
 // TripTx is Trip participating in the caller's transaction (ADR-0005
@@ -629,8 +644,10 @@ func (g *Guard) reportFailure(ctx context.Context, tx store.Tx, name string, occ
 		// The reconstruction-resistant signal could not be persisted: a
 		// restart would silently lose escalation progress, so fail closed
 		// now (mirror halt). If the threshold trip above already halted the
-		// mirror, just surface its (unfired) notification.
+		// mirror, its haltGen ran ahead of the durable epoch, so also mark
+		// degraded so a later clear resyncs; otherwise force the mirror halt.
 		if plan.notifyReason != "" {
+			g.markRecoveryFailed()
 			g.notify(plan.notifyReason, occurredAt)
 		} else {
 			g.forcePersistFailureHalt(err, occurredAt)
@@ -758,16 +775,30 @@ func (g *Guard) ClearGlobalHalt(ctx context.Context) error {
 		return nil
 	}
 	needReload := g.recoveryFailed
+	// hgBefore is THE baseline, captured under g.mu before any store I/O so no
+	// racing global trip can slip between capturing it and using it (the bug a
+	// separately re-read epoch snapshot had: it could be sampled AFTER a trip
+	// committed — codex review P1 on the redesign). Every global trip bumps
+	// haltGen synchronously, so comparing the durable epoch and the live
+	// haltGen against this fixed baseline catches any trip, committed or in
+	// flight.
 	hgBefore := g.haltGen
 	tokenEpochBefore := g.tokenFail.epoch
 	orderEpochBefore := g.orderFail.epoch
 	g.mu.Unlock()
 
+	// baseline is the durable epoch the clear expects to still see. In the
+	// normal path it is hgBefore itself (in steady state haltGen == durable
+	// epoch). In the recovery path the mirror haltGen is unreliable (boot
+	// could not sync it), so we resync the baseline from the durable epoch we
+	// re-read; the relative haltGen check below still fences races.
+	baseline := int64(hgBefore)
+
 	var tokenN, orderN int64
 	if needReload {
 		// The clear may only resume what it can read: if boot could not load
 		// the halt/counter state, refuse until the store serves it again
-		// (ADR-0004 point 3). The reload also resyncs the halt epoch below.
+		// (ADR-0004 point 3).
 		if _, err := g.st.Halt(ctx); err != nil {
 			return fmt.Errorf("killswitch: clear refused, halt state still unreadable: %w", err)
 		}
@@ -779,37 +810,35 @@ func (g *Guard) ClearGlobalHalt(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("killswitch: clear refused, counter recovery still failing: %w", err)
 		}
-		tokenN, orderN = tc.Value, oc.Value
+		er, err := g.st.Counter(ctx, CounterHaltEpoch)
+		if err != nil {
+			return fmt.Errorf("killswitch: clear refused, halt epoch unreadable: %w", err)
+		}
+		tokenN, orderN, baseline = tc.Value, oc.Value, er.Value
 	}
 
-	epochRec, err := g.st.Counter(ctx, CounterHaltEpoch)
-	if err != nil {
-		return fmt.Errorf("killswitch: clear refused, halt epoch unreadable: %w", err)
-	}
-	E := epochRec.Value
-
-	err = g.st.Atomically(ctx, func(tx store.Tx) error {
-		// Durable fence: has a global halt trip committed since we snapshotted
-		// E? Serialized on the single write connection against every TripHalt.
+	err := g.st.Atomically(ctx, func(tx store.Tx) error {
+		// Durable fence: the durable epoch must still equal the baseline.
+		// Serialized on the single write connection against every TripHalt, so
+		// a global trip whose epoch bump committed since the baseline advances
+		// cur.Value and aborts here — before halt=0 is committed.
 		cur, err := tx.Counter(ctx, CounterHaltEpoch)
 		if err != nil {
 			return err
 		}
-		if cur.Value != E {
+		if cur.Value != baseline {
 			return errClearRaced
 		}
-		if !needReload {
-			// In-memory fence: a global trip bumps haltGen BEFORE its durable
-			// epoch commit, so haltGen != E means a global trip is in flight
-			// even though its durable write has not landed yet. Taking g.mu
-			// inside the write transaction is safe: no path holds g.mu while
-			// waiting on the write connection.
-			g.mu.RLock()
-			hg := g.haltGen
-			g.mu.RUnlock()
-			if hg != uint64(E) {
-				return errClearRaced
-			}
+		// Mirror fence (relative to the fixed baseline): a global trip bumps
+		// haltGen BEFORE its durable epoch commit, so haltGen != hgBefore
+		// means a trip applied (in flight or committed) even if its durable
+		// write has not landed yet. Taking g.mu inside the write transaction
+		// is safe: no path holds g.mu while waiting on the write connection.
+		g.mu.RLock()
+		hg := g.haltGen
+		g.mu.RUnlock()
+		if hg != hgBefore {
+			return errClearRaced
 		}
 		if err := tx.ClearHalt(ctx); err != nil {
 			return err
@@ -851,7 +880,7 @@ func (g *Guard) ClearGlobalHalt(ctx context.Context) error {
 		if g.orderFail.epoch == orderEpochBefore {
 			g.orderFail = failureCounter{count: orderN, epoch: g.orderFail.epoch + 1}
 		}
-		g.haltGen = uint64(E)
+		g.haltGen = uint64(baseline)
 		g.recoveryFailed = false
 	}
 	g.halted = false
@@ -867,6 +896,9 @@ func (g *Guard) ClearGlobalHalt(ctx context.Context) error {
 // surfaced error cover the restart window.
 func (g *Guard) forcePersistFailureHalt(cause error, occurredAt time.Time) {
 	g.mu.Lock()
+	// recoveryFailed: the store could not record safety state, so a later
+	// clear must re-read/resync rather than trust the mirror.
+	g.recoveryFailed = true
 	var notifyReason string
 	if !g.halted {
 		g.gen++
