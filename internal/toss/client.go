@@ -330,13 +330,22 @@ func (c *Client) issueToken(ctx context.Context) (string, time.Duration, error) 
 		ExpiresIn   int64  `json:"expires_in"`
 	}
 	if err := DecodeJSON(resp.Body, &tr); err != nil {
-		// A decode/EOF failure on a 200 (mid-body TCP reset, truncated JSON) is
-		// a recoverable network glitch, not a credential failure — classify it
-		// transient so GET retries it and so, in the stale window, it does not
-		// poison terminalErr and defeat the L-3 stale fallback. (Semantic
-		// problems in a fully decoded body — missing access_token, bad
-		// expires_in below — remain terminal: those do not heal on retry.)
-		return "", 0, &transientError{err: fmt.Errorf("toss: decode token response: %w", err)}
+		// Classify by shape, not blanket-transient. Only a transport-shaped
+		// failure — EOF or a truncated body from a mid-response reset — is a
+		// recoverable network glitch worth a retry; classifying it transient
+		// lets GET retry and keeps it from poisoning terminalErr in the stale
+		// window (L-3). Schema/contract violations — a type mismatch
+		// (*json.UnmarshalTypeError), malformed JSON (*json.SyntaxError), or an
+		// oversized body over the 1 MiB cap — do NOT heal on retry, so they
+		// stay terminal: a bounded retry loop must not be spent on them, and in
+		// the stale window they must fail fast rather than mask a broken
+		// contract until hard expiry. (Semantic problems in a fully decoded
+		// body — missing access_token, bad expires_in below — are terminal for
+		// the same reason.)
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return "", 0, &transientError{err: fmt.Errorf("toss: decode token response: %w", err)}
+		}
+		return "", 0, fmt.Errorf("toss: decode token response: %w", err)
 	}
 	if tr.AccessToken == "" {
 		return "", 0, errors.New("toss: token response missing access_token")

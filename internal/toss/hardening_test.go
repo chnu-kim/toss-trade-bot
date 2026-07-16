@@ -438,3 +438,42 @@ func TestClient_TruncatedTokenBodyIsTransient(t *testing.T) {
 		t.Fatalf("token issued %d times, want 2 (a truncated 200 body is transient and must be retried)", n)
 	}
 }
+
+// TestIssueToken_DecodeErrorClassification pins the exact transient/terminal
+// boundary for a 200 whose body fails to decode. Only transport-shaped failures
+// (EOF / truncated body from a mid-response reset) are recoverable glitches;
+// schema/contract violations (type mismatch, malformed JSON, an oversized body)
+// do not heal on retry and must stay terminal — otherwise a bounded retry loop
+// is spent on them and, in the stale window, the failure is masked (terminalErr
+// unset) until hard expiry.
+func TestIssueToken_DecodeErrorClassification(t *testing.T) {
+	tests := []struct {
+		name      string
+		body      string
+		transient bool
+	}{
+		{"truncated body (transport)", `{"access_token":"tok-1","exp`, true},
+		{"empty body (transport)", ``, true},
+		{"expires_in type mismatch (schema)", `{"access_token":"tok-1","expires_in":"86400"}`, false},
+		{"malformed json (schema)", `{"access_token":"tok-1",,}`, false},
+		{"oversized body (contract)", `{"access_token":"` + strings.Repeat("x", 2<<20) + `"}`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer srv.Close()
+
+			c := newTestClient(t, srv)
+			_, _, err := c.issueToken(context.Background())
+			if err == nil {
+				t.Fatal("expected a decode error, got nil")
+			}
+			if got := isTransient(err); got != tt.transient {
+				t.Fatalf("isTransient = %v, want %v (err: %v)", got, tt.transient, err)
+			}
+		})
+	}
+}
