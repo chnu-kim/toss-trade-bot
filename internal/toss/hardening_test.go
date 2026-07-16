@@ -2,6 +2,7 @@ package toss
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -159,6 +160,19 @@ func TestDecodeJSON_TrailingData(t *testing.T) {
 	var v payload
 	if err := DecodeJSON(strings.NewReader(huge), &v); err == nil {
 		t.Fatal("DecodeJSON with oversized trailing = nil, want error")
+	}
+
+	// A trailing-stage error must NOT carry the io.ErrUnexpectedEOF transient
+	// signal — that signal is reserved for a truncated PRIMARY value. DecodeJSON
+	// breaks the chain so issueToken's errors.Is check cannot misclassify a
+	// trailing garbage error as a retryable transport glitch.
+	var w payload
+	err := DecodeJSON(strings.NewReader(`{"a":"ok"}`+"\n"+`"unterminat`), &w)
+	if err == nil {
+		t.Fatal("DecodeJSON with unterminated trailing = nil, want error")
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("trailing-stage error %v must not carry io.ErrUnexpectedEOF (would misclassify as transient)", err)
 	}
 }
 
@@ -491,6 +505,10 @@ func TestIssueToken_DecodeErrorClassification(t *testing.T) {
 		{"malformed json (schema)", `{"access_token":"tok-1",,}`, false},
 		{"oversized single value (contract)", `{"access_token":"` + strings.Repeat("x", 2<<20) + `"}`, false},
 		{"valid value + oversized trailing (contract)", `{"access_token":"tok-1","expires_in":86400}` + "\n" + `"` + strings.Repeat("x", 2<<20) + `"`, false},
+		// A truncated string in the TRAILING position must stay terminal — the
+		// io.ErrUnexpectedEOF transient signal is only meaningful for a cut-off
+		// PRIMARY value, and DecodeJSON must break the chain so it cannot leak.
+		{"unterminated trailing string (contract)", `{"access_token":"tok-1","expires_in":86400}` + "\n" + `"unterminat`, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

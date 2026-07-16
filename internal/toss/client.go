@@ -376,6 +376,14 @@ func (c *Client) issueToken(ctx context.Context) (string, time.Duration, error) 
 // trailing lazily and never buffers it whole, so this is contract hygiene, not
 // an OOM fix.) Trailing whitespace — e.g. the newline json.Encoder emits — is
 // allowed.
+//
+// Phase boundary: only a truncated PRIMARY value (the first Decode below) may
+// surface io.ErrUnexpectedEOF — that is the sole "mid-stream transport cut"
+// signal callers treat as transient (retryable). Every trailing-stage error is
+// a contract violation and is wrapped with %v (NOT %w) so it cannot carry the
+// io.ErrUnexpectedEOF chain upward and be misclassified as transient. This
+// keeps the transient/terminal decision encapsulated here: callers just test
+// errors.Is(err, io.ErrUnexpectedEOF) without guessing which phase produced it.
 func DecodeJSON(r io.Reader, v any) error {
 	lr := &io.LimitedReader{R: r, N: maxResponseBytes + 1}
 	dec := json.NewDecoder(lr)
@@ -393,7 +401,9 @@ func DecodeJSON(r io.Reader, v any) error {
 			return errResponseTooLarge()
 		}
 		if err != nil {
-			return err
+			// %v, not %w: sever any io.ErrUnexpectedEOF chain so a truncated
+			// TRAILING value is terminal, not a transient transport glitch.
+			return fmt.Errorf("toss: malformed trailing data after JSON response: %v", err)
 		}
 		return errors.New("toss: unexpected trailing data after JSON response")
 	}
