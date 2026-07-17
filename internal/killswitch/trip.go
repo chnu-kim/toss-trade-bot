@@ -154,9 +154,10 @@ func (g *Guard) ReportOrderFailure(ctx context.Context, occurredAt time.Time) er
 	g.escalationMu.Lock()
 	defer g.escalationMu.Unlock()
 
-	willTrip := g.orderReportWillTrip(ctx)
-	if willTrip {
-		g.beginPending(reasonOrderFailures) // fail-closed BEFORE the durable write
+	var pendingGen uint64
+	var owned bool
+	if g.orderReportWillTrip(ctx) {
+		pendingGen, owned = g.beginPending(reasonOrderFailures) // fail-closed BEFORE the durable write
 	}
 
 	tripped := false
@@ -183,11 +184,10 @@ func (g *Guard) ReportOrderFailure(ctx context.Context, occurredAt time.Time) er
 	}
 	if tripped {
 		g.markHalted(reasonOrderFailures, occurredAt) // pending → halted (durable committed)
-	} else if willTrip {
-		// Conservatively pre-set pending but the tx did not trip (only reachable if
-		// the pre-read errored and over-approximated). Reconcile the mirror to
-		// durable truth without clobbering any concurrent real halt.
-		g.resyncPendingToDurable(ctx)
+	} else if owned {
+		// We conservatively pre-set pending (pre-read over-approximated) but the tx
+		// did not trip: undo our pending, but only if it is still ours.
+		g.revertOwnedPending(pendingGen)
 	}
 	return nil
 }
@@ -228,38 +228,38 @@ func (g *Guard) ReportOrderSuccess(ctx context.Context) error {
 // a halt a concurrent trip already exposed. Setting pending (blocked, more
 // conservative) rather than halted keeps this consistent with durable-before-
 // visible: the completed halt is exposed only after the durable commit.
-func (g *Guard) beginPending(reason string) {
+//
+// It returns the generation stamped on the pending it set and true; if the mirror
+// was not none (a concurrent trip already owns it) it changes nothing and returns
+// false, so the caller never tries to revert a pending it does not own.
+func (g *Guard) beginPending(reason string) (uint64, bool) {
 	g.mu.Lock()
+	defer g.mu.Unlock()
 	if g.mirrorPhase == phaseNone {
 		g.mirrorPhase = phasePending
 		g.haltReason = reason
 		g.gen++
+		return g.gen, true
 	}
-	g.mu.Unlock()
+	return 0, false
 }
 
-// resyncPendingToDurable reconciles a pending mirror we conservatively pre-set to
-// the durable truth, used only when a count-first pre-read over-approximated
-// (errored ⇒ pending) but the tx then committed without tripping. It is
-// clobber-safe: it acts only while the mirror is still pending (a concurrent real
-// trip would have advanced it to halted, which is left untouched) and only after
-// confirming the durable phase, so it never reverts a halt that actually exists.
-func (g *Guard) resyncPendingToDurable(ctx context.Context) {
-	hs, err := g.store.Halt(ctx)
-	if err != nil {
-		return // cannot confirm durable state ⇒ leave pending (fail-closed)
-	}
+// revertOwnedPending undoes a speculative pending a count-first path pre-set, used
+// only when its pre-read over-approximated (errored ⇒ pending) but the tx then
+// committed without tripping. It reverts ONLY if the pending is still ours: the
+// mirror is still pending AND the generation has not advanced since we set it. A
+// concurrent real trip (manual Trip, boot-halt, ambiguous escalation) bumps the
+// generation when it sets its own pending/halted, so a generation mismatch means
+// the pending now belongs to that trip and must be left blocked (fail-closed).
+// Because a still-ours pending whose tx did not trip proves the durable halt is
+// none, no store read is needed — which removes the read-then-lock window a stale
+// read would otherwise reopen fail-open.
+func (g *Guard) revertOwnedPending(gen uint64) {
 	g.mu.Lock()
-	if g.mirrorPhase == phasePending {
-		switch hs.Phase {
-		case store.HaltNone:
-			g.mirrorPhase = phaseNone
-			g.haltReason = ""
-			g.durablePhase = store.HaltNone
-		default: // pending or halted durably ⇒ a real halt exists; expose halted
-			g.mirrorPhase = phaseHalted
-			g.durablePhase = hs.Phase
-		}
+	if g.mirrorPhase == phasePending && g.gen == gen {
+		g.mirrorPhase = phaseNone
+		g.haltReason = ""
+		g.durablePhase = store.HaltNone
 	}
 	g.mu.Unlock()
 }
@@ -275,9 +275,10 @@ func (g *Guard) ReportTokenRefreshFailure(ctx context.Context, occurredAt time.T
 	g.escalationMu.Lock()
 	defer g.escalationMu.Unlock()
 
-	willTrip := g.tokenReportWillTrip(ctx, occurredAt)
-	if willTrip {
-		g.beginPending(reasonTokenRefresh) // fail-closed BEFORE the durable write
+	var pendingGen uint64
+	var owned bool
+	if g.tokenReportWillTrip(ctx, occurredAt) {
+		pendingGen, owned = g.beginPending(reasonTokenRefresh) // fail-closed BEFORE the durable write
 	}
 
 	tripped := false
@@ -301,8 +302,8 @@ func (g *Guard) ReportTokenRefreshFailure(ctx context.Context, occurredAt time.T
 	}
 	if tripped {
 		g.markHalted(reasonTokenRefresh, occurredAt)
-	} else if willTrip {
-		g.resyncPendingToDurable(ctx)
+	} else if owned {
+		g.revertOwnedPending(pendingGen)
 	}
 	return nil
 }

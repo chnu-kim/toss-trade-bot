@@ -34,6 +34,26 @@ type scriptedStore struct {
 	holdCall int           // if >0, that Atomically call signals entered then blocks on release
 	entered  chan struct{} // closed when the held call is entered
 	release  chan struct{} // the held call waits on this
+
+	holdGates map[int]*holdGate // per-call gates for multi-call deterministic holds
+}
+
+// holdGate blocks a specific Atomically call so a test can interleave
+// deterministically: the call closes entered when reached and waits on release.
+type holdGate struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *scriptedStore) hold(n int) *holdGate {
+	g := &holdGate{entered: make(chan struct{}), release: make(chan struct{})}
+	s.mu.Lock()
+	if s.holdGates == nil {
+		s.holdGates = make(map[int]*holdGate)
+	}
+	s.holdGates[n] = g
+	s.mu.Unlock()
+	return g
 }
 
 func (s *scriptedStore) Atomically(ctx context.Context, fn func(tx store.Tx) error) error {
@@ -42,8 +62,13 @@ func (s *scriptedStore) Atomically(ctx context.Context, fn func(tx store.Tx) err
 	n := s.calls
 	ferr := s.failOn[n]
 	hold := s.holdCall == n
+	gate := s.holdGates[n]
 	s.mu.Unlock()
 
+	if gate != nil {
+		close(gate.entered)
+		<-gate.release
+	}
 	if hold {
 		close(s.entered)
 		<-s.release
@@ -500,6 +525,55 @@ func TestReportTokenRefreshFailure_InFlightWindowBlocks(t *testing.T) {
 	}
 	if allowed, _ := g.CanSubmit("AAPL"); allowed {
 		t.Fatal("CanSubmit must stay blocked after the token count-first trip")
+	}
+}
+
+// A count-first path that over-approximated (pre-read errored ⇒ pre-set pending)
+// and then did not trip must NOT clobber a pending a concurrent trip set in the
+// meantime. The revert may only undo OUR pending (generation unchanged); a
+// concurrent trip advances the generation, so its pending must survive — otherwise
+// submissions reopen during that trip's in-flight durable write (fail-open).
+//
+// Deterministic interleaving: hold the report's own tx and the concurrent trip's
+// MarkHaltPending. While both are held the mirror is the concurrent trip's pending
+// (a newer generation) and the durable halt is still none; releasing only the
+// report's tx drives its revert, which must decline to touch the newer pending.
+func TestReportOrderFailure_ResyncDoesNotClobberConcurrentTrip(t *testing.T) {
+	db, _ := openTempStore(t)
+	ctx := context.Background()
+	ss := &scriptedStore{inner: db, failCounter: errBoom} // pre-read errors ⇒ over-approximate
+	reportTx := ss.hold(1)                                // the report's counter++ tx
+	tripMark := ss.hold(2)                                // the concurrent trip's MarkHaltPending
+	g := killswitch.New(ctx, ss, &recNotifier{}, killswitch.Config{OrderFailureThreshold: 3})
+	g.NotifyScanComplete()
+
+	reportDone := make(chan error, 1)
+	go func() { reportDone <- g.ReportOrderFailure(ctx, time.Now()) }()
+	<-reportTx.entered // report has pre-set its own pending and is holding its tx
+
+	tripDone := make(chan error, 1)
+	go func() { tripDone <- g.Trip(ctx, killswitch.Global(), "manual concurrent", time.Now()) }()
+	<-tripMark.entered // the concurrent trip has set its (newer) pending; its durable write is held
+
+	// Drive the report's revert while the concurrent trip's pending stands and its
+	// durable write is still none.
+	close(reportTx.release)
+	if err := <-reportDone; err != nil {
+		t.Fatalf("ReportOrderFailure: %v", err)
+	}
+
+	// The concurrent trip's pending must NOT have been clobbered.
+	if allowed, _ := g.CanSubmit("AAPL"); allowed {
+		t.Fatal("resync clobbered a concurrent trip's pending — submissions reopened (fail-open)")
+	}
+
+	// Let the concurrent trip finish and confirm it lands halted.
+	close(tripMark.release)
+	if err := <-tripDone; err != nil {
+		t.Fatalf("Trip: %v", err)
+	}
+	if allowed, _ := g.CanSubmit("AAPL"); allowed {
+		t.Fatal("guard must be halted after the concurrent global trip completes")
 	}
 }
 
