@@ -21,14 +21,28 @@ func (g *Guard) Trip(ctx context.Context, scope Scope, reason string, occurredAt
 	return g.tripSymbol(ctx, scope.symbol, reason, occurredAt)
 }
 
-// tripGlobal is the durable-before-visible 2-phase global trip (ADR-0012
-// Decision 1). It (1) exposes the mirror as pending so CanSubmit fails closed
-// during the in-flight window, (2) commits MarkHaltPending (none→pending), (3)
-// commits TripHalt (pending→halted), and only then (4) exposes the mirror as
-// halted and notifies. If either durable commit fails, the mirror stays pending
-// (blocked) — it is never reverted to unhalted (a failed durable write is
-// "blocked", not "no evidence").
+// tripGlobal is the manual/generic global-trip entry: it acquires the transition
+// lock and delegates to tripGlobalLocked. tripSymbol's escalation reuses
+// tripGlobalLocked directly because it already holds the lock.
 func (g *Guard) tripGlobal(ctx context.Context, reason string, occurredAt time.Time) error {
+	g.transitionMu.Lock()
+	defer g.transitionMu.Unlock()
+	return g.tripGlobalLocked(ctx, reason, occurredAt)
+}
+
+// tripGlobalLocked is the durable-before-visible 2-phase global trip (ADR-0012
+// Decision 1). The caller MUST hold transitionMu. It (1) exposes the mirror as
+// pending so CanSubmit fails closed during the in-flight window, (2) commits
+// MarkHaltPending (none→pending), (3) commits TripHalt (pending→halted), and only
+// then (4) exposes the mirror as halted and notifies. If either durable commit
+// fails, the mirror stays pending (blocked) — never reverted to unhalted (a failed
+// durable write is "blocked", not "no evidence").
+//
+// The idempotent no-op is safe under transitionMu: because a ClearHalt holds the
+// same lock across its durable write AND its mirror update, this check can never
+// observe a stably-halted mirror that a concurrent clear is about to wipe — the
+// window that dropped a trip during a clear-in-flight (P1-A) is gone.
+func (g *Guard) tripGlobalLocked(ctx context.Context, reason string, occurredAt time.Time) error {
 	g.mu.Lock()
 	if g.mirrorPhase == phaseHalted && g.durablePhase == store.HaltHalted {
 		g.mu.Unlock() // already fully halted and durable; idempotent no-op
@@ -62,7 +76,18 @@ func (g *Guard) tripGlobal(ctx context.Context, reason string, occurredAt time.T
 // global halt (ADR-0004 point 7). The ambiguous window is in-memory and
 // non-persisted: on restart the reconciler re-Trip's from the journal scan with
 // the original occurredAt, re-accumulating the window deterministically.
+//
+// It holds transitionMu across the escalation decision AND the escalating trip, so
+// the alreadyHalted observation cannot straddle a concurrent transition. In
+// particular it can never observe a count-first *speculative* pending (that pending
+// lives entirely within its own transitionMu hold), so a speculative pending never
+// suppresses a real escalation (P1-B). alreadyHalted is therefore an honest "a
+// committed/boot halt or durable-pending already blocks" — escalating on top would
+// be redundant.
 func (g *Guard) tripSymbol(ctx context.Context, symbol, reason string, occurredAt time.Time) error {
+	g.transitionMu.Lock()
+	defer g.transitionMu.Unlock()
+
 	g.mu.Lock()
 	if g.blockedSymbols == nil {
 		g.blockedSymbols = make(map[string]string)
@@ -73,7 +98,7 @@ func (g *Guard) tripSymbol(ctx context.Context, symbol, reason string, occurredA
 	g.mu.Unlock()
 
 	if escalate && !alreadyHalted {
-		return g.tripGlobal(ctx, reasonFrequentAmbiguous, occurredAt)
+		return g.tripGlobalLocked(ctx, reasonFrequentAmbiguous, occurredAt)
 	}
 	return nil
 }
@@ -149,10 +174,11 @@ func (g *Guard) markHalted(reason string, at time.Time) {
 // exactly like a manual Trip. That closes both the in-flight commit window (a
 // concurrent CanSubmit sees pending) and the commit-error window (a failed
 // durable write leaves the mirror blocked, never reverted to unhalted). The
-// pre-read runs under escalationMu so the threshold prediction is exact.
+// pre-read runs under transitionMu so the threshold prediction is exact and the
+// speculative pending is invisible to any other transition.
 func (g *Guard) ReportOrderFailure(ctx context.Context, occurredAt time.Time) error {
-	g.escalationMu.Lock()
-	defer g.escalationMu.Unlock()
+	g.transitionMu.Lock()
+	defer g.transitionMu.Unlock()
 
 	var pendingGen uint64
 	var owned bool
@@ -193,7 +219,7 @@ func (g *Guard) ReportOrderFailure(ctx context.Context, occurredAt time.Time) er
 }
 
 // orderReportWillTrip reports whether the next order-failure report will cross
-// the threshold. Caller holds escalationMu, so the counter is stable through the
+// the threshold. Caller holds transitionMu, so the counter is stable through the
 // following tx. A read error over-approximates to true (fail-closed).
 func (g *Guard) orderReportWillTrip(ctx context.Context) bool {
 	c, err := g.store.Counter(ctx, counterOrderFailures)
@@ -209,11 +235,11 @@ func (g *Guard) orderReportWillTrip(ctx context.Context) bool {
 // halt already tripped: that is manual-only (ADR-0004 point 6). The caller is the
 // success-confirming path (reconciler FILLED confirmation, #35).
 func (g *Guard) ReportOrderSuccess(ctx context.Context) error {
-	// Held under escalationMu so a concurrent ReportOrderFailure cannot reset the
+	// Held under transitionMu so a concurrent ReportOrderFailure cannot reset the
 	// order-failure counter between that path's pre-read and its tx (which would
 	// desync the threshold prediction).
-	g.escalationMu.Lock()
-	defer g.escalationMu.Unlock()
+	g.transitionMu.Lock()
+	defer g.transitionMu.Unlock()
 	if err := g.store.Atomically(ctx, func(tx store.Tx) error {
 		return tx.SetCounter(ctx, store.Counter{Name: counterOrderFailures, Value: 0})
 	}); err != nil {
@@ -224,14 +250,14 @@ func (g *Guard) ReportOrderSuccess(ctx context.Context) error {
 
 // beginPending exposes the mirror as pending (fail-closed) before a count-first
 // durable halt write, so both the in-flight commit window and a commit error stay
-// blocked (ADR-0012 Decision 1). It only advances from none — it never downgrades
-// a halt a concurrent trip already exposed. Setting pending (blocked, more
-// conservative) rather than halted keeps this consistent with durable-before-
-// visible: the completed halt is exposed only after the durable commit.
+// blocked (ADR-0012 Decision 1). Caller holds transitionMu. It only advances from
+// none — if the mirror already shows a halt (a prior committed halt, or a stable
+// durable-pending left by a partial finalize) it changes nothing and returns false,
+// so the caller does not later try to revert a pending it did not create. Setting
+// pending (blocked, more conservative) rather than halted keeps this consistent
+// with durable-before-visible: the completed halt is exposed only after commit.
 //
-// It returns the generation stamped on the pending it set and true; if the mirror
-// was not none (a concurrent trip already owns it) it changes nothing and returns
-// false, so the caller never tries to revert a pending it does not own.
+// It returns the generation stamped on the pending it set and true.
 func (g *Guard) beginPending(reason string) (uint64, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -246,14 +272,11 @@ func (g *Guard) beginPending(reason string) (uint64, bool) {
 
 // revertOwnedPending undoes a speculative pending a count-first path pre-set, used
 // only when its pre-read over-approximated (errored ⇒ pending) but the tx then
-// committed without tripping. It reverts ONLY if the pending is still ours: the
-// mirror is still pending AND the generation has not advanced since we set it. A
-// concurrent real trip (manual Trip, boot-halt, ambiguous escalation) bumps the
-// generation when it sets its own pending/halted, so a generation mismatch means
-// the pending now belongs to that trip and must be left blocked (fail-closed).
-// Because a still-ours pending whose tx did not trip proves the durable halt is
-// none, no store read is needed — which removes the read-then-lock window a stale
-// read would otherwise reopen fail-open.
+// committed without tripping. Caller holds transitionMu, so no other transition can
+// have touched the mirror since beginPending — the pending is necessarily still
+// ours. The mirrorPhase==pending && gen match is kept as a defensive invariant
+// check (and documents ownership); a still-ours pending whose tx did not trip
+// proves the durable halt is none, so no store read is needed.
 func (g *Guard) revertOwnedPending(gen uint64) {
 	g.mu.Lock()
 	if g.mirrorPhase == phasePending && g.gen == gen {
@@ -272,8 +295,8 @@ func (g *Guard) revertOwnedPending(gen uint64) {
 // manager's refresh-failure seam to this method (not to a direct Trip) so the
 // counting/persistence contract holds.
 func (g *Guard) ReportTokenRefreshFailure(ctx context.Context, occurredAt time.Time) error {
-	g.escalationMu.Lock()
-	defer g.escalationMu.Unlock()
+	g.transitionMu.Lock()
+	defer g.transitionMu.Unlock()
 
 	var pendingGen uint64
 	var owned bool
@@ -310,7 +333,7 @@ func (g *Guard) ReportTokenRefreshFailure(ctx context.Context, occurredAt time.T
 
 // tokenReportWillTrip predicts whether the next token-refresh report crosses the
 // threshold, applying the SAME windowed projection the tx uses so the prediction
-// is exact under escalationMu. A read error over-approximates to true.
+// is exact under transitionMu. A read error over-approximates to true.
 func (g *Guard) tokenReportWillTrip(ctx context.Context, occurredAt time.Time) bool {
 	c, err := g.store.Counter(ctx, counterTokenRefresh)
 	if err != nil {
@@ -348,7 +371,14 @@ func (g *Guard) ClearSymbol(symbol string) {
 // mirror un-halts only AFTER ClearHalt commits durably; a failed commit keeps the
 // halt (fail-closed). Clearing reopens the replay gate if the scan already
 // completed (gate = scanComplete && no global halt).
+//
+// It holds transitionMu across the durable write AND the mirror update, so a
+// concurrent trip cannot slip in during the clear's in-flight window and be
+// dropped by the trip's idempotent no-op (P1-A) — the trip serializes strictly
+// after the clear and, seeing the mirror now none, durably re-trips.
 func (g *Guard) ClearHalt(ctx context.Context) error {
+	g.transitionMu.Lock()
+	defer g.transitionMu.Unlock()
 	if err := g.store.Atomically(ctx, func(tx store.Tx) error {
 		return tx.ClearHalt(ctx)
 	}); err != nil {
@@ -371,7 +401,12 @@ func (g *Guard) ClearHalt(ctx context.Context) error {
 // re-derived from the sentinel each boot — so it does not write durable state and
 // does not make the graceful-shutdown query report an unpersisted pending (that
 // query fires only for a *pending* mirror; this sets halted).
+//
+// It holds transitionMu so it serializes with every other transition (it is a boot
+// affordance, so contention is nil, but the discipline keeps the invariant total).
 func (g *Guard) BootHalt(reason string, at time.Time) {
+	g.transitionMu.Lock()
+	defer g.transitionMu.Unlock()
 	g.mu.Lock()
 	already := g.mirrorPhase == phaseHalted
 	g.mirrorPhase = phaseHalted
@@ -404,7 +439,13 @@ func (g *Guard) HasUnpersistedPendingHalt() bool {
 // surviving halt; on failure the halt is left as it was (still blocked) so #36
 // refuses to record a clean shutdown — via this query if MarkHaltPending still
 // failed, or via the store read if only TripHalt failed (durable is then pending).
+//
+// It holds transitionMu across the pending observation and the durable finalize so
+// no concurrent transition can change the mirror underneath it.
 func (g *Guard) FinalizePendingHalt(ctx context.Context) error {
+	g.transitionMu.Lock()
+	defer g.transitionMu.Unlock()
+
 	g.mu.Lock()
 	if g.mirrorPhase != phasePending {
 		g.mu.Unlock() // nothing pending to finalize (none, or already halted)

@@ -146,14 +146,21 @@ type Guard struct {
 	notifier Notifier
 	cfg      Config
 
-	// escalationMu serializes the count-first paths (ReportOrderFailure,
-	// ReportTokenRefreshFailure, ReportOrderSuccess) so a counter cannot change
-	// between a path's pre-read and its write tx. That makes the "will this report
-	// cross the threshold" prediction exact, closing the race where a pre-read
-	// says "won't trip" but a concurrent increment makes the tx trip (fail-open).
-	// It is a separate lock from mu: mu guards the hot-path mirror and is never
-	// held across a store call, while escalationMu is held across one.
-	escalationMu sync.Mutex
+	// transitionMu serializes EVERY global-halt state transition — tripGlobal,
+	// the ambiguous-escalation decision in tripSymbol, the count-first paths
+	// (ReportOrderFailure/ReportTokenRefreshFailure/ReportOrderSuccess), ClearHalt,
+	// BootHalt, and FinalizePendingHalt — so their "observe the current global halt,
+	// then durably transition it, then update the mirror" sequences never interleave.
+	// That single serialization is what closes the fail-open windows the earlier
+	// point-fixes kept re-opening: a clear-in-flight cannot coincide with a trip's
+	// idempotent no-op, a speculative pending cannot be observed by the escalation
+	// decision, and a count-first pre-read stays exact against its own tx.
+	//
+	// Lock order is transitionMu (outer) → mu (inner, held only briefly and NEVER
+	// across a store call). The hot path (CanSubmit/Reserve/Reconfirm/Snapshot) and
+	// the memory-only per-symbol/gate mutators take mu alone and never transitionMu,
+	// so they neither block on a transition nor can deadlock against one.
+	transitionMu sync.Mutex
 
 	mu             sync.Mutex
 	mirrorPhase    mirrorPhase       // global halt as exposed by the mirror (hot path)

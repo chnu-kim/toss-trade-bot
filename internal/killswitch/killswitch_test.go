@@ -528,52 +528,145 @@ func TestReportTokenRefreshFailure_InFlightWindowBlocks(t *testing.T) {
 	}
 }
 
-// A count-first path that over-approximated (pre-read errored ⇒ pre-set pending)
-// and then did not trip must NOT clobber a pending a concurrent trip set in the
-// meantime. The revert may only undo OUR pending (generation unchanged); a
-// concurrent trip advances the generation, so its pending must survive — otherwise
-// submissions reopen during that trip's in-flight durable write (fail-open).
-//
-// Deterministic interleaving: hold the report's own tx and the concurrent trip's
-// MarkHaltPending. While both are held the mirror is the concurrent trip's pending
-// (a newer generation) and the durable halt is still none; releasing only the
-// report's tx drives its revert, which must decline to touch the newer pending.
-func TestReportOrderFailure_ResyncDoesNotClobberConcurrentTrip(t *testing.T) {
+// A global Trip launched while a count-first report holds a speculative pending
+// must never be lost: the transition lock serializes it strictly after the report
+// (which reverts its own speculative pending), and it then durably trips. This
+// guards against the report's revert eating a concurrent trip (a fail-open the
+// transition serialization closes structurally).
+func TestReportOrderFailure_ConcurrentGlobalTripNotLost(t *testing.T) {
 	db, _ := openTempStore(t)
 	ctx := context.Background()
-	ss := &scriptedStore{inner: db, failCounter: errBoom} // pre-read errors ⇒ over-approximate
-	reportTx := ss.hold(1)                                // the report's counter++ tx
-	tripMark := ss.hold(2)                                // the concurrent trip's MarkHaltPending
+	ss := &scriptedStore{inner: db, failCounter: errBoom} // pre-read errors ⇒ speculative pending
+	reportTx := ss.hold(1)                                // hold the report's counter++ tx
 	g := killswitch.New(ctx, ss, &recNotifier{}, killswitch.Config{OrderFailureThreshold: 3})
 	g.NotifyScanComplete()
 
 	reportDone := make(chan error, 1)
 	go func() { reportDone <- g.ReportOrderFailure(ctx, time.Now()) }()
-	<-reportTx.entered // report has pre-set its own pending and is holding its tx
+	<-reportTx.entered // report holds the transition lock + a speculative pending
 
 	tripDone := make(chan error, 1)
 	go func() { tripDone <- g.Trip(ctx, killswitch.Global(), "manual concurrent", time.Now()) }()
-	<-tripMark.entered // the concurrent trip has set its (newer) pending; its durable write is held
 
-	// Drive the report's revert while the concurrent trip's pending stands and its
-	// durable write is still none.
-	close(reportTx.release)
+	close(reportTx.release) // report commits (no trip), reverts its pending, releases the lock
 	if err := <-reportDone; err != nil {
 		t.Fatalf("ReportOrderFailure: %v", err)
 	}
-
-	// The concurrent trip's pending must NOT have been clobbered.
-	if allowed, _ := g.CanSubmit("AAPL"); allowed {
-		t.Fatal("resync clobbered a concurrent trip's pending — submissions reopened (fail-open)")
-	}
-
-	// Let the concurrent trip finish and confirm it lands halted.
-	close(tripMark.release)
-	if err := <-tripDone; err != nil {
+	if err := <-tripDone; err != nil { // trip serializes after and durably trips
 		t.Fatalf("Trip: %v", err)
 	}
 	if allowed, _ := g.CanSubmit("AAPL"); allowed {
-		t.Fatal("guard must be halted after the concurrent global trip completes")
+		t.Fatal("a global trip concurrent with a count-first speculative pending must not be lost")
+	}
+}
+
+// P1-A: a global Trip that arrives while a ClearHalt's durable write is in flight
+// must not be dropped. Before the transition serialization, the trip hit the
+// idempotent no-op (mirror still halted mid-clear) and returned without writing,
+// then the clear wiped the halt — losing the new danger signal (fail-open). The
+// transition lock serializes the trip strictly after the clear, so it sees the
+// cleared mirror and durably re-trips.
+func TestClearInFlight_ConcurrentTripNotDropped(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.db")
+	ctx := context.Background()
+	db := mustOpen(t, path)
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.TripHalt(ctx, "prior halt"); err != nil { // boot halted
+		t.Fatalf("seed TripHalt: %v", err)
+	}
+	ss := &scriptedStore{inner: db}
+	clearTx := ss.hold(1) // hold ClearHalt's durable write
+	g := killswitch.New(ctx, ss, &recNotifier{}, killswitch.Config{})
+	g.NotifyScanComplete()
+
+	clearDone := make(chan error, 1)
+	go func() { clearDone <- g.ClearHalt(ctx) }()
+	<-clearTx.entered // clear's durable write is in flight; mirror still halted
+
+	tripDone := make(chan error, 1)
+	go func() { tripDone <- g.Trip(ctx, killswitch.Global(), "new danger during clear", time.Now()) }()
+
+	// Give the trip a chance either to finish (older code: idempotent no-op while
+	// the mirror is still halted) or to prove it is blocked on the transition lock.
+	tripFinished := false
+	var tripErr error
+	select {
+	case tripErr = <-tripDone:
+		tripFinished = true
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(clearTx.release) // clear commits (durable none), lowers the mirror, releases the lock
+	if err := <-clearDone; err != nil {
+		t.Fatalf("ClearHalt: %v", err)
+	}
+	if !tripFinished {
+		tripErr = <-tripDone
+	}
+	if tripErr != nil {
+		t.Fatalf("Trip: %v", tripErr)
+	}
+
+	if allowed, _ := g.CanSubmit("AAPL"); allowed {
+		t.Fatal("a trip arriving during a clear-in-flight was dropped — submissions reopened (fail-open)")
+	}
+	hs, _ := db.Halt(ctx)
+	if hs.Phase != store.HaltHalted {
+		t.Fatalf("durable halt = %q, want halted (the concurrent trip must have durably re-tripped)", hs.Phase)
+	}
+}
+
+// P1-B: an ambiguous escalation must not be suppressed by a count-first
+// speculative pending. Before the transition serialization, tripSymbol read the
+// speculative pending as "already halted" and skipped the escalation; the report
+// then reverted its pending, leaving the ambiguous threshold crossed with no halt
+// (fail-open). The transition lock serializes the escalation after the report, so
+// it observes the reverted mirror (none) and does escalate to a durable halt.
+func TestSpeculativePending_DoesNotSuppressAmbiguousEscalation(t *testing.T) {
+	db, _ := openTempStore(t)
+	ctx := context.Background()
+	ss := &scriptedStore{inner: db, failCounter: errBoom} // report pre-read errors ⇒ speculative pending
+	reportTx := ss.hold(1)                                // hold the report's counter++ tx
+	g := killswitch.New(ctx, ss, &recNotifier{}, killswitch.Config{
+		OrderFailureThreshold: 3,
+		AmbiguousThreshold:    1, // a single ambiguous symbol trip escalates
+		AmbiguousWindow:       time.Hour,
+	})
+	g.NotifyScanComplete()
+
+	reportDone := make(chan error, 1)
+	go func() { reportDone <- g.ReportOrderFailure(ctx, time.Now()) }()
+	<-reportTx.entered // report holds the transition lock + a speculative pending
+
+	escDone := make(chan error, 1)
+	go func() { escDone <- g.Trip(ctx, killswitch.Symbol("AAPL"), "ambiguous", time.Now()) }()
+
+	escFinished := false
+	var escErr error
+	select {
+	case escErr = <-escDone:
+		escFinished = true // older code: escalation suppressed, returns without a global halt
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(reportTx.release) // report commits (no trip), reverts its speculative pending
+	if err := <-reportDone; err != nil {
+		t.Fatalf("ReportOrderFailure: %v", err)
+	}
+	if !escFinished {
+		escErr = <-escDone
+	}
+	if escErr != nil {
+		t.Fatalf("Trip(symbol): %v", escErr)
+	}
+
+	// An unrelated symbol must be blocked by the escalation's global halt.
+	if allowed, _ := g.CanSubmit("MSFT"); allowed {
+		t.Fatal("ambiguous escalation was suppressed by a speculative pending — global halt lost (fail-open)")
+	}
+	hs, _ := db.Halt(ctx)
+	if hs.Phase != store.HaltHalted {
+		t.Fatalf("durable halt = %q, want halted (ambiguous escalation must durably trip)", hs.Phase)
 	}
 }
 
