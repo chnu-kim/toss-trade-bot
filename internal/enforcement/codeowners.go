@@ -52,6 +52,12 @@ var sacredRequiredPaths = []string{
 	// first order-failure), part of the sacred live-execution invariant set
 	// like ADR-0004. Same twin-artifact rule as the ADR-0011 registration.
 	"docs/adr/0012-killswitch-durability-ordering.md",
+	// ADR-0013 declares protects: [live-execution-human-gate] — it pins the
+	// kill-switch mirror/transition concurrency model (disjoint block-carriers,
+	// single-mu snapshot), part of the same sacred live-execution invariant set
+	// as ADR-0004/0012 (a mirror-coherence break is a money-guard fail-open).
+	// Same twin-artifact rule (codex review finding on PR #63).
+	"docs/adr/0013-killswitch-mirror-concurrency.md",
 	// Every non-test .go source file in internal/gate, individually — not
 	// just one representative file (codex:review [P2] finding on #48's PR:
 	// the privileged workflow compiles and executes the whole package via
