@@ -25,11 +25,10 @@ var errBoom = errors.New("boom")
 type scriptedStore struct {
 	inner killswitch.Store
 
-	mu          sync.Mutex
-	calls       int
-	failOn      map[int]error // 1-based Atomically call index → error
-	failHalt    error         // if set, Halt returns this
-	failCounter error         // if set, the standalone Counter read returns this
+	mu       sync.Mutex
+	calls    int
+	failOn   map[int]error // 1-based Atomically call index → error
+	failHalt error         // if set, Halt returns this
 
 	holdCall int           // if >0, that Atomically call signals entered then blocks on release
 	entered  chan struct{} // closed when the held call is entered
@@ -87,16 +86,6 @@ func (s *scriptedStore) Halt(ctx context.Context) (store.HaltState, error) {
 		return store.HaltState{}, fh
 	}
 	return s.inner.Halt(ctx)
-}
-
-func (s *scriptedStore) Counter(ctx context.Context, name string) (store.Counter, error) {
-	s.mu.Lock()
-	fc := s.failCounter
-	s.mu.Unlock()
-	if fc != nil {
-		return store.Counter{}, fc
-	}
-	return s.inner.Counter(ctx, name)
 }
 
 func (s *scriptedStore) setFailOn(m map[int]error) {
@@ -451,10 +440,13 @@ func TestReportTokenRefreshFailure_DurableTripError_FailClosed(t *testing.T) {
 	}
 }
 
-// A BELOW-threshold report whose durable write fails must NOT halt: only
-// threshold-crossing reports fail-closed, so a transient store hiccup on an early
-// failure does not spuriously halt the bot.
-func TestReportOrderFailure_BelowThreshold_StoreError_NotBlocked(t *testing.T) {
+// A report whose durable write fails stays fail-closed regardless of the count:
+// the report pre-blocks unconditionally (I1) and cannot rule out a threshold
+// crossing when the tx errors (the counter rolled back), so the mirror stays
+// blocked (ADR-0012 Decision 1: a failed durable write is "blocked", not "no
+// evidence"). This is an intentional over-block in the safe direction — a store
+// write error is itself a serious signal for an unattended bot.
+func TestReportOrderFailure_StoreError_FailClosed(t *testing.T) {
 	db, _ := openTempStore(t)
 	ctx := context.Background()
 	ss := &scriptedStore{inner: db, failOn: map[int]error{1: errBoom}}
@@ -464,8 +456,8 @@ func TestReportOrderFailure_BelowThreshold_StoreError_NotBlocked(t *testing.T) {
 	if err := g.ReportOrderFailure(ctx, time.Now()); err == nil {
 		t.Fatal("ReportOrderFailure must surface the store error")
 	}
-	if allowed, _ := g.CanSubmit("AAPL"); !allowed {
-		t.Fatal("a below-threshold store error must not fail-closed the guard (no spurious halt)")
+	if allowed, _ := g.CanSubmit("AAPL"); allowed {
+		t.Fatal("a report whose durable write failed must stay blocked (fail-closed)")
 	}
 }
 
@@ -536,14 +528,14 @@ func TestReportTokenRefreshFailure_InFlightWindowBlocks(t *testing.T) {
 func TestReportOrderFailure_ConcurrentGlobalTripNotLost(t *testing.T) {
 	db, _ := openTempStore(t)
 	ctx := context.Background()
-	ss := &scriptedStore{inner: db, failCounter: errBoom} // pre-read errors ⇒ speculative pending
-	reportTx := ss.hold(1)                                // hold the report's counter++ tx
+	ss := &scriptedStore{inner: db}
+	reportTx := ss.hold(1) // hold the report's counter++ tx (mirror already pre-blocked)
 	g := killswitch.New(ctx, ss, &recNotifier{}, killswitch.Config{OrderFailureThreshold: 3})
 	g.NotifyScanComplete()
 
 	reportDone := make(chan error, 1)
 	go func() { reportDone <- g.ReportOrderFailure(ctx, time.Now()) }()
-	<-reportTx.entered // report holds the transition lock + a speculative pending
+	<-reportTx.entered // report holds haltMu + its unconditional pre-block (pending)
 
 	tripDone := make(chan error, 1)
 	go func() { tripDone <- g.Trip(ctx, killswitch.Global(), "manual concurrent", time.Now()) }()
@@ -625,8 +617,8 @@ func TestClearInFlight_ConcurrentTripNotDropped(t *testing.T) {
 func TestSpeculativePending_DoesNotSuppressAmbiguousEscalation(t *testing.T) {
 	db, _ := openTempStore(t)
 	ctx := context.Background()
-	ss := &scriptedStore{inner: db, failCounter: errBoom} // report pre-read errors ⇒ speculative pending
-	reportTx := ss.hold(1)                                // hold the report's counter++ tx
+	ss := &scriptedStore{inner: db}
+	reportTx := ss.hold(1) // hold the report's counter++ tx (mirror already pre-blocked)
 	g := killswitch.New(ctx, ss, &recNotifier{}, killswitch.Config{
 		OrderFailureThreshold: 3,
 		AmbiguousThreshold:    1, // a single ambiguous symbol trip escalates
@@ -636,7 +628,7 @@ func TestSpeculativePending_DoesNotSuppressAmbiguousEscalation(t *testing.T) {
 
 	reportDone := make(chan error, 1)
 	go func() { reportDone <- g.ReportOrderFailure(ctx, time.Now()) }()
-	<-reportTx.entered // report holds the transition lock + a speculative pending
+	<-reportTx.entered // report holds haltMu + its unconditional pre-block (pending)
 
 	escDone := make(chan error, 1)
 	go func() { escDone <- g.Trip(ctx, killswitch.Symbol("AAPL"), "ambiguous", time.Now()) }()
@@ -667,6 +659,53 @@ func TestSpeculativePending_DoesNotSuppressAmbiguousEscalation(t *testing.T) {
 	hs, _ := db.Halt(ctx)
 	if hs.Phase != store.HaltHalted {
 		t.Fatalf("durable halt = %q, want halted (ambiguous escalation must durably trip)", hs.Phase)
+	}
+}
+
+// Round-5: a non-halting operation (ReportOrderSuccess counter reset) that is slow
+// must NOT stall a concurrent global Trip's fail-closed immediacy (I6). While the
+// reset's durable write is held, the Trip must still block CanSubmit promptly — it
+// pre-blocks the mirror before any slow wait (I1), and the reset does not hold the
+// transition lock. Before the fix, the reset held the shared lock and the Trip
+// waited on it with the mirror still none (fail-open).
+func TestNonHaltingResetDoesNotStallTripImmediacy(t *testing.T) {
+	db, _ := openTempStore(t)
+	ctx := context.Background()
+	ss := &scriptedStore{inner: db}
+	resetTx := ss.hold(1) // hold ReportOrderSuccess's durable reset
+	g := killswitch.New(ctx, ss, &recNotifier{}, killswitch.Config{})
+	g.NotifyScanComplete()
+
+	resetDone := make(chan error, 1)
+	go func() { resetDone <- g.ReportOrderSuccess(ctx) }()
+	<-resetTx.entered // the non-halting reset is in flight (holding the lock, in older code)
+
+	tripDone := make(chan error, 1)
+	go func() { tripDone <- g.Trip(ctx, killswitch.Global(), "danger during reset", time.Now()) }()
+
+	// The trip must fail-close the mirror promptly, even though a non-halting reset
+	// is in flight. Poll rather than sleep-then-check so a correct guard passes fast.
+	blocked := false
+	for i := 0; i < 200; i++ {
+		if allowed, _ := g.CanSubmit("AAPL"); !allowed {
+			blocked = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	close(resetTx.release)
+	if err := <-resetDone; err != nil {
+		t.Fatalf("ReportOrderSuccess: %v", err)
+	}
+	if err := <-tripDone; err != nil {
+		t.Fatalf("Trip: %v", err)
+	}
+	if !blocked {
+		t.Fatal("a non-halting reset in flight stalled the trip's fail-closed immediacy (round-5 fail-open)")
+	}
+	if allowed, _ := g.CanSubmit("AAPL"); allowed {
+		t.Fatal("guard must be halted after the trip completes")
 	}
 }
 

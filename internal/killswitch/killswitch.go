@@ -18,11 +18,6 @@ type Store interface {
 	Atomically(ctx context.Context, fn func(tx store.Tx) error) error
 	// Halt reads the persisted global halt phase (none/pending/halted).
 	Halt(ctx context.Context) (store.HaltState, error)
-	// Counter reads a persistent counter. The count-first paths read it once
-	// before their write tx to decide whether the report may cross the threshold,
-	// so they can pre-set the mirror pending (fail-closed) before the durable
-	// write (ADR-0012 Decision 1). A never-written counter reads back zero.
-	Counter(ctx context.Context, name string) (store.Counter, error)
 }
 
 // Notifier is the seam the guard calls when the global halt trips. It is
@@ -146,21 +141,27 @@ type Guard struct {
 	notifier Notifier
 	cfg      Config
 
-	// transitionMu serializes EVERY global-halt state transition — tripGlobal,
-	// the ambiguous-escalation decision in tripSymbol, the count-first paths
-	// (ReportOrderFailure/ReportTokenRefreshFailure/ReportOrderSuccess), ClearHalt,
-	// BootHalt, and FinalizePendingHalt — so their "observe the current global halt,
-	// then durably transition it, then update the mirror" sequences never interleave.
-	// That single serialization is what closes the fail-open windows the earlier
-	// point-fixes kept re-opening: a clear-in-flight cannot coincide with a trip's
-	// idempotent no-op, a speculative pending cannot be observed by the escalation
-	// decision, and a count-first pre-read stays exact against its own tx.
+	// haltMu serializes the DURABLE part of every global-halt transition —
+	// tripGlobal, the ambiguous-escalation trip in tripSymbol, the count-first
+	// reports (ReportOrderFailure/ReportTokenRefreshFailure), ClearHalt, BootHalt,
+	// and FinalizePendingHalt — so two durable transitions never interleave (I4).
+	// It is held across the slow durable write. Crucially it is held ONLY by paths
+	// that have already blocked the mirror, so a trip that waits on it always waits
+	// behind a blocked mirror (no fail-open window). Non-halting work
+	// (ReportOrderSuccess) does NOT take haltMu, so it can never delay a concurrent
+	// trip's fail-closed immediacy (I6).
 	//
-	// Lock order is transitionMu (outer) → mu (inner, held only briefly and NEVER
-	// across a store call). The hot path (CanSubmit/Reserve/Reconfirm/Snapshot) and
-	// the memory-only per-symbol/gate mutators take mu alone and never transitionMu,
-	// so they neither block on a transition nor can deadlock against one.
-	transitionMu sync.Mutex
+	// The FAST fail-closed pre-block is not haltMu's job: a trip-causing path sets
+	// the mirror pending under mu (fast, before any slow wait — I1), then takes
+	// haltMu for the durable write. The counter is read inside the write tx (the
+	// store's single writer serializes counter access), so there is no separate
+	// pre-read lock to conflate responsibilities into.
+	//
+	// Lock order is haltMu (outer) → mu (inner, held only briefly and NEVER across a
+	// store call). The hot path (CanSubmit/Reserve/Reconfirm/Snapshot) and the
+	// memory-only per-symbol/gate mutators take mu alone and never haltMu, so they
+	// neither block on a transition (I5) nor can deadlock against one.
+	haltMu sync.Mutex
 
 	mu             sync.Mutex
 	mirrorPhase    mirrorPhase       // global halt as exposed by the mirror (hot path)
