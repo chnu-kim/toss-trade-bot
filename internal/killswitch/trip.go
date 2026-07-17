@@ -85,7 +85,11 @@ func (k *Switch) withTripCarrier(onPanic func(), body func() error) (err error) 
 // it latches; on a panic it latches (not order-failure, W-B).
 func (k *Switch) tripGlobal(ctx context.Context, reason string) error {
 	return k.withTripCarrier(
-		func() { k.latch(reason) },
+		// The panic promotion establishes a new global block, so it must also
+		// notify — the body's notify is unreachable once the panic unwinds
+		// (ADR-0004 point 8). notify has its own recover boundary and haltMu is
+		// already released here, so there is no deadlock or re-panic.
+		func() { k.latch(reason); k.notify(reason) },
 		func() error { return k.doGlobalHalt(ctx, reason) },
 	)
 }
@@ -120,7 +124,10 @@ func (k *Switch) doGlobalHalt(ctx context.Context, reason string) error {
 	if err := k.store.TripHalt(ctx, reason); err != nil {
 		// durable=pending is already recorded — persistence-wins covers the
 		// restart, so no latch is needed. The mirror stays pending (blocked); it
-		// is NOT rolled back to none (that would fail open).
+		// is NOT rolled back to none (that would fail open). A durable pending
+		// block was established, so notify (consistent with the MarkHaltPending
+		// latch arm above — ADR-0004 point 8).
+		k.notify(reason)
 		return fmt.Errorf("killswitch: trip halt: %w", err)
 	}
 	k.mu.Lock()

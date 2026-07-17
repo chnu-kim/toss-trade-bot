@@ -18,7 +18,10 @@ import (
 func (k *Switch) ReportOrderFailure(ctx context.Context, reason string, occurredAt time.Time) error {
 	_ = occurredAt
 	return k.withTripCarrier(
-		k.BootHalt, // W-B: count-first order-failure panic → in-memory bootHalt
+		// W-B: count-first order-failure panic → in-memory bootHalt, and notify —
+		// the panic-promoted halt is a new global block the operator must hear
+		// about (ADR-0004 point 8); the body's notify is unreachable on panic.
+		func() { k.BootHalt(); k.notify(reason) },
 		func() error { return k.doReportOrderFailure(ctx, reason) },
 	)
 }
@@ -71,7 +74,8 @@ func (k *Switch) doReportOrderFailure(ctx context.Context, reason string) error 
 // escalation (ADR-0013 latch scope (b)). A panic latches (not order-failure).
 func (k *Switch) ReportTokenRefreshFailure(ctx context.Context, occurredAt time.Time) error {
 	return k.withTripCarrier(
-		func() { k.latch(reasonTokenRefresh) },
+		// panic → latch (not order-failure) and notify (ADR-0004 point 8).
+		func() { k.latch(reasonTokenRefresh); k.notify(reasonTokenRefresh) },
 		func() error { return k.doReportTokenRefresh(ctx, occurredAt) },
 	)
 }

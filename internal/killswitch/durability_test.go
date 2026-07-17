@@ -17,7 +17,8 @@ func TestDurableBeforeVisibleWriteErrorStaysBlocked(t *testing.T) {
 
 	t.Run("TripHalt error leaves mirror pending, not unhalted", func(t *testing.T) {
 		cs := newControlStore(openStore(t))
-		k := newOpen(t, cs)
+		rec := &recordingNotifier{}
+		k := newOpen(t, cs, WithNotifier(rec))
 		cs.set(func(c *controlStore) { c.errTripHalt = errors.New("disk full") })
 
 		if err := k.Trip(ctx, ScopeGlobal, "", "manual", time.Now()); err == nil {
@@ -31,6 +32,11 @@ func TestDurableBeforeVisibleWriteErrorStaysBlocked(t *testing.T) {
 		// The durable pending phase (MarkHaltPending committed) backs the mirror.
 		if p := haltPhase(t, cs.Store); p != store.HaltPending {
 			t.Fatalf("durable phase = %s, want pending", p)
+		}
+		// A durable pending block was established → the operator must be notified,
+		// consistent with the MarkHaltPending-error latch arm.
+		if rec.count() == 0 {
+			t.Fatalf("TripHalt-error pending halt did not notify")
 		}
 	})
 

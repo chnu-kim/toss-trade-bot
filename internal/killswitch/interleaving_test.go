@@ -186,13 +186,16 @@ func TestWALatchSurvivesToDurable(t *testing.T) {
 }
 
 // W-B: the panic-span promotion follows the decision-locus — count-first
-// order-failure promotes to in-memory bootHalt; every other trip latches.
+// order-failure promotes to in-memory bootHalt; every other trip latches. And in
+// every case the panic-promoted block must still fire the notifier (ADR-0004
+// point 8) — the operator's only out-of-band signal that trading stopped.
 func TestWBPanicPromotionByDecisionLocus(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("order-failure panic → bootHalt", func(t *testing.T) {
 		cs := newControlStore(openStore(t))
-		k := newOpen(t, cs)
+		rec := &recordingNotifier{}
+		k := newOpen(t, cs, WithNotifier(rec))
 		// Reach the threshold so the tx runs TripHalt, then panic there.
 		if err := k.ReportOrderFailure(ctx, "rejected", time.Now()); err != nil {
 			t.Fatalf("failure #1: %v", err)
@@ -215,11 +218,15 @@ func TestWBPanicPromotionByDecisionLocus(t *testing.T) {
 		if latched {
 			t.Fatalf("order-failure panic set a latch; W-B allows only bootHalt")
 		}
+		if rec.count() == 0 {
+			t.Fatalf("order-failure panic-promoted halt did not notify")
+		}
 	})
 
 	t.Run("manual trip panic → latch", func(t *testing.T) {
 		cs := newControlStore(openStore(t))
-		k := newOpen(t, cs)
+		rec := &recordingNotifier{}
+		k := newOpen(t, cs, WithNotifier(rec))
 		cs.set(func(c *controlStore) { c.panicMarkPending = true })
 		if err := k.Trip(ctx, ScopeGlobal, "", "manual", time.Now()); err == nil {
 			t.Fatalf("panicking Trip returned nil error")
@@ -235,11 +242,15 @@ func TestWBPanicPromotionByDecisionLocus(t *testing.T) {
 		if boot {
 			t.Fatalf("manual-trip panic set bootHalt; W-B requires a latch")
 		}
+		if rec.count() == 0 {
+			t.Fatalf("manual-trip panic-promoted halt did not notify")
+		}
 	})
 
 	t.Run("token-failure panic → latch", func(t *testing.T) {
 		cs := newControlStore(openStore(t))
-		k := newOpen(t, cs)
+		rec := &recordingNotifier{}
+		k := newOpen(t, cs, WithNotifier(rec))
 		if err := k.ReportTokenRefreshFailure(ctx, time.Now()); err != nil {
 			t.Fatalf("token failure #1: %v", err)
 		}
@@ -251,6 +262,9 @@ func TestWBPanicPromotionByDecisionLocus(t *testing.T) {
 			t.Fatalf("submit allowed after token panic")
 		} else if reason != "unpersisted-pending-halt" {
 			t.Fatalf("blocked reason = %q, want unpersisted-pending-halt", reason)
+		}
+		if rec.count() == 0 {
+			t.Fatalf("token panic-promoted halt did not notify")
 		}
 	})
 }
