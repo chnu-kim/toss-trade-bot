@@ -353,6 +353,42 @@ func TestSubmitOrder_APIErrorDecoded(t *testing.T) {
 	}
 }
 
+func TestSubmitOrder_MissingOrderIDRejected(t *testing.T) {
+	// A schema-drifted or partial 200 (an intermediary, a proxy, API drift) can
+	// return a success envelope with no usable orderId. orderId is the ONLY
+	// durable truth handle for an irreversible POST (ADR-0002 p3 / ADR-0003):
+	// returning nil error here would let the caller "ack" a handle it does not
+	// have, masking an ambiguous submit as a clean success.
+	bodies := []string{
+		`{"result":{}}`,
+		`{"result":{"orderId":""}}`,
+		`{"result":{"clientOrderId":"intent-abc"}}`,
+	}
+	for _, b := range bodies {
+		t.Run(b, func(t *testing.T) {
+			srv := tokenAndThen(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(b))
+			})
+			defer srv.Close()
+
+			_, err := newClient(srv).SubmitOrder(context.Background(), 7, OrderRequest{
+				Symbol:    "005930",
+				Side:      SideBuy,
+				OrderType: OrderTypeLimit,
+				Quantity:  "10",
+				Price:     "70000",
+			})
+			if err == nil {
+				t.Fatalf("200 with no orderId (%s) must be an error, got nil", b)
+			}
+			if !strings.Contains(err.Error(), "orderId") {
+				t.Fatalf("error %q should name the missing orderId", err.Error())
+			}
+		})
+	}
+}
+
 func TestSubmitOrder_ServerErrorNotRetried(t *testing.T) {
 	var calls int
 	srv := tokenAndThen(t, func(w http.ResponseWriter, r *http.Request) {
@@ -557,8 +593,10 @@ func TestGetOrder_EscapesOrderIDPathSegment(t *testing.T) {
 	srv := tokenAndThen(t, func(w http.ResponseWriter, r *http.Request) {
 		seenRawPath = r.URL.EscapedPath()
 		w.Header().Set("Content-Type", "application/json")
+		// Echo back the requested orderId so the identity check passes; this
+		// test is only about path escaping.
 		_, _ = w.Write([]byte(`{"result":{
-			"orderId":"weird","symbol":"005930","side":"BUY","orderType":"LIMIT",
+			"orderId":"a b/c?d","symbol":"005930","side":"BUY","orderType":"LIMIT",
 			"timeInForce":"DAY","status":"FILLED","quantity":"1","currency":"KRW",
 			"orderedAt":"2026-03-28T09:30:00+09:00",
 			"execution":{"filledQuantity":"1","averageFilledPrice":"1","filledAmount":"1",
@@ -583,6 +621,49 @@ func TestGetOrder_RejectsEmptyOrderID(t *testing.T) {
 	_, err := c.GetOrder(context.Background(), 42, "")
 	if err == nil {
 		t.Fatal("expected error for empty orderId, got nil")
+	}
+}
+
+func TestGetOrder_RejectsMissingOrderIDInBody(t *testing.T) {
+	// A malformed/empty 200 body must not surface as an authoritative Order with
+	// zero-value identity — reconciliation/audit would act on empty truth.
+	srv := tokenAndThen(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"result":{}}`))
+	})
+	defer srv.Close()
+
+	_, err := newClient(srv).GetOrder(context.Background(), 42, "srv-order-1")
+	if err == nil {
+		t.Fatal("200 detail with no orderId must be an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "orderId") {
+		t.Fatalf("error %q should name the missing orderId", err.Error())
+	}
+}
+
+func TestGetOrder_RejectsMismatchedOrderID(t *testing.T) {
+	// The detail response must be about the order we asked for. A body echoing a
+	// different orderId (proxy/cache mixup, schema drift) must never be accepted
+	// as this order's truth — acting on the wrong order's status is money-unsafe.
+	srv := tokenAndThen(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"result":{
+			"orderId":"a-different-order","symbol":"005930","side":"BUY","orderType":"LIMIT",
+			"timeInForce":"DAY","status":"FILLED","quantity":"1","currency":"KRW",
+			"orderedAt":"2026-03-28T09:30:00+09:00",
+			"execution":{"filledQuantity":"1","averageFilledPrice":"1","filledAmount":"1",
+			"commission":"0","tax":"0","filledAt":"2026-03-28T09:30:00+09:00","settlementDate":"2026-03-30"}
+		}}`))
+	})
+	defer srv.Close()
+
+	_, err := newClient(srv).GetOrder(context.Background(), 42, "srv-order-1")
+	if err == nil {
+		t.Fatal("mismatched orderId in detail body must be an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "srv-order-1") || !strings.Contains(err.Error(), "a-different-order") {
+		t.Fatalf("error %q should name both the requested and returned orderId", err.Error())
 	}
 }
 

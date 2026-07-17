@@ -308,6 +308,15 @@ func (c *Client) SubmitOrder(ctx context.Context, accountSeq int64, req OrderReq
 	if err := toss.DecodeJSON(resp.Body, &env); err != nil {
 		return OrderResponse{}, fmt.Errorf("order: decode submit response: %w", err)
 	}
+	// orderId is required on OrderResponse and is the ONLY durable truth handle
+	// for this (possibly already-placed) irreversible order. A 200 without it
+	// (schema drift, a partial body from a proxy) must NOT be reported as a
+	// clean success: the caller would have no handle to ack/reconcile and could
+	// treat a real submit as never-sent. Surface it as an error so the caller
+	// routes it through its ambiguous-submit handling (ADR-0002 p3 / ADR-0003).
+	if env.Result.OrderID == "" {
+		return OrderResponse{}, fmt.Errorf("order: submit returned 200 but no orderId — outcome ambiguous, do not treat as sent-or-not-sent without reconciliation")
+	}
 	return env.Result, nil
 }
 
@@ -339,6 +348,18 @@ func (c *Client) GetOrder(ctx context.Context, accountSeq int64, orderID string)
 	}
 	if err := toss.DecodeJSON(resp.Body, &env); err != nil {
 		return Order{}, fmt.Errorf("order: decode order detail: %w", err)
+	}
+	// This detail is authoritative truth for reconciliation/audit, so verify the
+	// response is actually ABOUT the order we asked for before returning it. An
+	// empty orderId (malformed/partial 200) or a mismatched one (proxy/cache
+	// mixup, schema drift) must not be surfaced as this order's truth — acting
+	// on the wrong or empty order state is money-unsafe. Downstream policy
+	// decides on unknown status codes; the wrapper guards only order identity.
+	if env.Result.OrderID == "" {
+		return Order{}, fmt.Errorf("order: detail for %q returned 200 but no orderId in body", orderID)
+	}
+	if env.Result.OrderID != orderID {
+		return Order{}, fmt.Errorf("order: detail for %q returned a different orderId %q", orderID, env.Result.OrderID)
 	}
 	return env.Result, nil
 }
