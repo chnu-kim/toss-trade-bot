@@ -17,6 +17,9 @@ verification:
   - reviewer: chnu-kim
     date: 2026-07-17
     verdict: approved (grilling 수렴 — open forks 1·2·4 해소; 최종 하드닝 W-A/W-B refinement 반영)
+  - reviewer: codex:github-bot (PR #63)
+    date: 2026-07-17
+    verdict: bootHalt 배선 갭 2건 지적 → 반영. P2(수동 ClearHalt이 bootHalt를 clear 안 해 stuck-block) · P1(clean-shutdown 자격이 bootHalt를 빠뜨려 bootHalt-only halt 재시작 유실). 결정 불변, 배선 완결성 수정.
 ---
 
 # ADR-0013: 킬 스위치 미러 정합성은 disjoint block-carrier로 확보한다 — 3값 durable 미러 + sticky 미영속-pending 래치 + 단조 in-flight 카운터를 단일 잠금 스냅샷으로 읽는다
@@ -76,10 +79,11 @@ CanSubmit(sym) blocked iff:
   4. `haltMu` 해제.
   5. `inflightTrips--` — **자기 block-carrier를 발행한 뒤에만**(I7 발행-선행-감소). 균형 유지 = liveness. durable-error/panic arm의 block hold는 카운터가 아니라 래치(또는 `durableHalt=halted`)가 붙든다.
   - **panic 처리**: `inflightTrips` inc..dec span **내부**(worker recover 경계보다 안쪽)에 recover 경계를 두어, panic 포착 시 dec가 카운터를 놓기 **전에** 보수적 halt로 승격한다. 승격 대상은 **재량이 아니라 decision-locus로 결정**한다(W-B): count-first order-failure(결정이 tx 내부·재구성 가능)만 in-memory `bootHalt` 승격을 허용하고, **그 밖 모든 트립(수동·ambiguous 에스컬레이션·토큰 갱신 실패 — 결정이 tx 이전에 성립했거나 재구성 불가)은 sticky 래치를 set**해 durable-survivable하게 만든다. 이로써 stuck-block(dec 누락)·fail-open(무보호 defer dec)·lost-halt(bootHalt 유실) 세 horn을 동시에 닫는다.
-- **`ClearHalt`**(수동, ADR-0004 point 6): `haltMu` → durable `ClearHalt` commit; 성공 시 `durableHalt=none` **및** 래치 clear, 에러면 둘 다 유지(fail-closed) → 해제. **`inflightTrips`는 절대 안 건드린다** — 동시 트립의 `count>0`이 `durableHalt` 하강과 **독립적으로** block을 붙든다(W4/W7 구조적 봉쇄).
+- **`ClearHalt`**(수동, ADR-0004 point 6): `haltMu` → durable `ClearHalt` commit; 성공 시 `durableHalt=none` **및** 래치 clear **및 `bootHalt=false`**(operator clear가 in-memory 보수적/panic halt까지 실제로 풀어야 한다 — 안 그러면 durable 성공에도 `bootHalt`가 남아 영구 blocked, codex P2), 에러면 셋 다 유지(fail-closed) → 해제. **`inflightTrips`는 절대 안 건드린다** — 동시 트립의 `count>0`이 `durableHalt` 하강과 **독립적으로** block을 붙든다(W4/W7 구조적 봉쇄).
 - **`ReportOrderSuccess`**(카운터 리셋, ADR-0012 Decision 4): 자기 store tx만. `haltMu`·`inflightTrips`·미러 전부 미접촉(I6).
-- **`BootHalt`**(#36, ADR-0012 Decision 1(c)): in-memory halted(`bootHalt=true`), durable write 없음, 수동 `ClearHalt`까지 유지. panic-span 보수적 승격에도 재사용.
-- **`HasUnpersistedPendingHalt` = (`unpersistedPending` && `durableHalt==none`)**. **`FinalizePendingHalt`**: 래치의 `haltReason`으로 `MarkHaltPending`→`TripHalt` 재커밋; 성공 시 `durableHalt=halted`+래치 clear, 실패 시 래치 유지(→ #36이 clean sentinel 기록 거부). #36은 finalize **전에** 리포터 경로를 quiesce한다.
+- **`BootHalt`**(#36, ADR-0012 Decision 1(c)): in-memory halted(`bootHalt=true`), durable write 없음, 수동 `ClearHalt`까지 유지. panic-span 보수적 승격에도 재사용. **`bootHalt`도 래치와 마찬가지로 store가 반영 못 하는 in-memory-only halt이므로 clean-shutdown 자격을 차단한다**(아래).
+- **clean-shutdown 자격 (제약 ③, #36 소비)**: store read로 안 보이는 **in-memory-only halt**는 둘이다 — 래치(`unpersistedPending && durableHalt==none`)와 `bootHalt`(in-memory halted, durable 없음). 따라서 **`HasUnpersistedPendingHalt = (unpersistedPending && durableHalt==none) || bootHalt`** 로 정의하고, 이게 참이면 #36은 clean sentinel을 기록하지 않는다. `bootHalt`를 빠뜨리면(래치만 보면) bootHalt-only halt를 가진 run이 스스로를 clean으로 인증해 재시작이 durable `none`을 믿고 재개방한다 — line "manual `ClearHalt`까지" 계약 위반(codex P1). (order-failure panic→`bootHalt` 케이스는 재시작 reconciler re-count가 별도로 복구하지만, #36 보수적-boot `bootHalt`는 operator clear만이 풀 수 있으므로 clean 차단이 필수다.)
+- **`FinalizePendingHalt`**: 래치의 `haltReason`으로 `MarkHaltPending`→`TripHalt` 재커밋; 성공 시 `durableHalt=halted`+래치 clear, 실패 시 래치 유지(→ #36이 clean sentinel 기록 거부). #36은 finalize **전에** 리포터 경로를 quiesce한다. (`FinalizePendingHalt`는 래치를 durable로 승격하지만 `bootHalt`는 in-memory 계약이라 finalize 대상이 아니다 — `bootHalt`가 서 있으면 위 자격 술어가 clean을 막는다.)
 
 ### durable-error 래치는 decision-locus로 스코프한다 (Fork 1 + 최종 하드닝 W-A — ADR-0004 point 7 / ADR-0012 Decision 1(c)·3)
 
