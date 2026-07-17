@@ -19,7 +19,7 @@ verification:
     verdict: approved (grilling 수렴 — open forks 1·2·4 해소; 최종 하드닝 W-A/W-B refinement 반영)
   - reviewer: codex:github-bot (PR #63)
     date: 2026-07-17
-    verdict: 3건 지적 → 전부 반영. P2(수동 ClearHalt이 bootHalt를 clear 안 해 stuck-block) · P1(clean-shutdown 자격이 bootHalt를 빠뜨려 bootHalt-only halt 재시작 유실) · P1(token 카운터 임계미달 persist 실패가 non-reconstructable인데 래치 안 걸려 영구 undercount → 에스컬레이션 우회) → 래치 스코프 기준을 decision-locus에서 '잃은 상태의 재구성 가능성'(ADR-0004 point 7)으로 정정. 결정 불변, 배선·스코프 완결성 수정.
+    verdict: 5건 지적 → 전부 반영. bootHalt P2(수동 clear가 bootHalt 미clear→stuck-block)·bootHalt P1(clean-shutdown 자격이 bootHalt 누락→재시작 유실)·token P1(임계미달 persist 실패 non-reconstructable→래치 스코프를 decision-locus에서 '재구성 가능성'으로 정정)·enforcement P1(protects 선언에 CODEOWNERS/sacredRequiredPaths twin-artifact 배선 누락→등록)·W-C P1(idempotent-no-op 트립이 clear와 레이스→carrier 미발행 재개방; ClearHalt inflight-defer + delayed-halt booking, "모든 clear-vs-trip 구조적 봉쇄" 과장 완화). 결정 불변, 배선·스코프·정직성 수정.
 ---
 
 # ADR-0013: 킬 스위치 미러 정합성은 disjoint block-carrier로 확보한다 — 3값 durable 미러 + sticky 미영속-pending 래치 + 단조 in-flight 카운터를 단일 잠금 스냅샷으로 읽는다
@@ -79,7 +79,8 @@ CanSubmit(sym) blocked iff:
   4. `haltMu` 해제.
   5. `inflightTrips--` — **자기 block-carrier를 발행한 뒤에만**(I7 발행-선행-감소). 균형 유지 = liveness. durable-error/panic arm의 block hold는 카운터가 아니라 래치(또는 `durableHalt=halted`)가 붙든다.
   - **panic 처리**: `inflightTrips` inc..dec span **내부**(worker recover 경계보다 안쪽)에 recover 경계를 두어, panic 포착 시 dec가 카운터를 놓기 **전에** 보수적 halt로 승격한다. 승격 대상은 **재량이 아니라 decision-locus로 결정**한다(W-B): count-first order-failure(결정이 tx 내부·재구성 가능)만 in-memory `bootHalt` 승격을 허용하고, **그 밖 모든 트립(수동·ambiguous 에스컬레이션·토큰 갱신 실패 — 결정이 tx 이전에 성립했거나 재구성 불가)은 sticky 래치를 set**해 durable-survivable하게 만든다. 이로써 stuck-block(dec 누락)·fail-open(무보호 defer dec)·lost-halt(bootHalt 유실) 세 horn을 동시에 닫는다.
-- **`ClearHalt`**(수동, ADR-0004 point 6): `haltMu` → durable `ClearHalt` commit; 성공 시 `durableHalt=none` **및** 래치 clear **및 `bootHalt=false`**(operator clear가 in-memory 보수적/panic halt까지 실제로 풀어야 한다 — 안 그러면 durable 성공에도 `bootHalt`가 남아 영구 blocked, codex P2), 에러면 셋 다 유지(fail-closed) → 해제. **`inflightTrips`는 절대 안 건드린다** — 동시 트립의 `count>0`이 `durableHalt` 하강과 **독립적으로** block을 붙든다(W4/W7 구조적 봉쇄).
+- **`ClearHalt`**(수동, ADR-0004 point 6): `haltMu` 획득 → **`inflightTrips>0`이면 defer**(진행 중 트립이 있으니 clobber 금지 — 아래 W-C) → durable `ClearHalt` commit; 성공 시 `durableHalt=none` **및** 래치 clear **및 `bootHalt=false`**(operator clear가 in-memory 보수적/panic halt까지 실제로 풀어야 한다 — 안 그러면 durable 성공에도 `bootHalt`가 남아 영구 blocked, codex P2), 에러면 셋 다 유지(fail-closed) → 해제. **`inflightTrips`는 값을 바꾸지 않는다**(자기 owner만 dec) — 동시 트립의 `count>0`이 `durableHalt` 하강과 **독립적으로** block을 붙든다(carrier 발행 트립의 W4/W7 봉쇄).
+  - **W-C(codex, idempotent-no-op 트립 vs clear)**: 이미 `durableHalt==halted`일 때 fresh 트립이 idempotent no-op 경로(자기 carrier 미발행)를 타면, 동시 clear가 halt를 내린 뒤 그 트립이 dec하면 재개방된다. **defer 규칙**(clear는 `inflightTrips>0`인 동안 진행 안 함)이 "트립이 clear 임계구역과 겹치는" 순서를 닫는다. "트립이 완전히 끝난 뒤 clear" 순서는 trigger의 **persistent evidence**(order/token durable 카운터 · ambiguous journal)가 재-fire하는 **delayed-halt**로 흡수된다(order-failure와 동일 계약). 유일한 잔여는 **evidence 없는 bare one-shot `Trip(global)`이 halt 중 발생 + clear와 레이스**하는 operational edge(operator가 trip과 clear를 동시 지시) — 이 경우만 유실 가능하며, count-first·ambiguous·token 등 실 트리거는 전부 재-fire한다(아래 Consequences booking).
 - **`ReportOrderSuccess`**(카운터 리셋, ADR-0012 Decision 4): 자기 store tx만. `haltMu`·`inflightTrips`·미러 전부 미접촉(I6).
 - **`BootHalt`**(#36, ADR-0012 Decision 1(c)): in-memory halted(`bootHalt=true`), durable write 없음, 수동 `ClearHalt`까지 유지. panic-span 보수적 승격에도 재사용. **`bootHalt`도 래치와 마찬가지로 store가 반영 못 하는 in-memory-only halt이므로 clean-shutdown 자격을 차단한다**(아래).
 - **clean-shutdown 자격 (제약 ③, #36 소비)**: store read로 안 보이는 **in-memory-only halt**는 둘이다 — 래치(`unpersistedPending && durableHalt==none`)와 `bootHalt`(in-memory halted, durable 없음). 따라서 **`HasUnpersistedPendingHalt = (unpersistedPending && durableHalt==none) || bootHalt`** 로 정의하고, 이게 참이면 #36은 clean sentinel을 기록하지 않는다. `bootHalt`를 빠뜨리면(래치만 보면) bootHalt-only halt를 가진 run이 스스로를 clean으로 인증해 재시작이 durable `none`을 믿고 재개방한다 — line "manual `ClearHalt`까지" 계약 위반(codex P1). (order-failure panic→`bootHalt` 케이스는 재시작 reconciler re-count가 별도로 복구하지만, #36 보수적-boot `bootHalt`는 operator clear만이 풀 수 있으므로 clean 차단이 필수다.)
@@ -117,7 +118,8 @@ durable-error의 **런타임 핫패스는 모든 경우 fail-closed**다(in-flig
 
 ## Consequences
 
-- (좋음) **clobber window 계열(W3/W4/W7)이 구조적으로 닫힌다** — disjoint carrier가 gen 재조정을 제거한다. `ClearHalt`이 `durableHalt`를 내려도 동시 트립의 `inflightTrips>0`이 독립적으로 block을 붙든다. 정합성이 inspection이 아니라 구조로 성립한다.
+- (좋음) **clobber window 계열(W3/W4/W7)이 구조적으로 닫힌다** — disjoint carrier가 gen 재조정을 제거한다. `ClearHalt`이 `durableHalt`를 내려도 **carrier를 발행한** 동시 트립(durable write 또는 래치)의 block이 독립적으로 선다. 이 부분은 inspection이 아니라 구조로 성립한다.
+- (비용/한계) **idempotent-no-op 트립 vs clear(W-C)만은 완전 구조적이 아니다** — 이미 durably halted일 때 fresh 트립은 carrier를 안 만들므로, clear가 그 halt를 내리면 delayed-halt로 떨어진다. `ClearHalt`의 `inflightTrips>0` defer가 "겹치는" 순서를 닫고, 실 트리거(order/token/ambiguous)의 persistent evidence 재-fire가 나머지를 흡수한다(order-failure delayed-halt와 동일). **잔여 유실 가능성은 evidence 없는 bare one-shot `Trip(global)`이 halt 중 clear와 레이스하는 operational edge뿐**이다 — 실 트리거는 모두 재-fire하므로 무인 안전에서 수용 가능한 delayed-halt다. (이 한계를 정직히 booking한다 — "모든 clear-vs-trip이 구조적으로 닫힌다"는 과장이다.)
 - (좋음) **torn-read가 단일 `mu` 스냅샷으로 닫힌다**. 핫패스는 값싼 뮤텍스 1회(store round-trip 없음)라 ADR-0004 point 5를 지킨다.
 - (좋음) **lost-halt/제약 ③은 필수 sticky 래치로 처리**되고, graceful-shutdown finalize + clean-sentinel에 배선돼 재시작 fail-open까지 닫는다.
 - (비용) **block-carrier 삼원화**(`durableHalt` 미러 + 래치 + `inflightTrips` 카운터) — 단일 미러보다 상태가 많다. 그러나 각 조각은 소유자·역할이 하나씩이고, 취약했던 **재조정(gen)이 사라진다**. 순 트레이드는 "상태 수 ↑ vs 재조정 취약성 제거"이며 후자를 택한다.
