@@ -52,6 +52,7 @@ verification: []
    - **전역 halt = persist.** 연속 실패·빈발 임계발 전역 halt는 카운터가 휘발한다. 메모리에만 두면 재시작 시 카운터가 0으로 초기화되어 **임계를 다시 채우는 동안 주문이 유출**된다(재시작 = 안전장치 우회). 따라서 전역 halt 상태+사유를 **journal과 동일한 트랜잭션 저장소에 영속**하고, 재시작 시 그 상태를 읽어 **halted로 기동**한다. **두 번째 영속 계층을 발명하지 않는다.**
 
 5. **상태 모델: 저장소 = 영속 진실, 메모리 = 값싼 읽기 미러.** `CanSubmit`은 모든 주문마다 호출되는 뜨거운 경로이므로 매번 저장소를 때리지 않는다. trip/clear 시 저장소에 쓰고 in-process 미러를 갱신하며, 기동 시 저장소에서 로드해 미러를 채운다. ADR은 이 *성질*("값싼 in-process 읽기 + 동일 저장소 영속 백킹")만 고정하고, 구체 sync primitive(`atomic.Bool`/`atomic.Value` vs `RWMutex` 등)는 **구현 이슈에 맡긴다** — atomic 계열이 lock-free 읽기에 유력한 후보다.
+   > **Amend (ADR-0013)**: 이 point가 "구현 이슈에 맡긴" **동시 전이 사이의 미러 정합성 모델**을 ADR-0013이 구체 결정으로 확정한다 — 미러는 단일 phase가 아니라 **세 서로소 carrier**(3값 `durableHalt` 미러 + sticky 미영속-pending 래치 + 단조 `inflightTrips` 카운터)이고, 핫패스는 이들을 **`mu` 단일 스냅샷**으로 읽는다(**lock-free 아님** — torn-read 봉쇄에 정합 스냅샷이 필수). 여기 적힌 "atomic 계열 lock-free 읽기가 유력"은 ADR-0013이 정정한다(값싼 in-process 뮤텍스가 point 5의 "값싼 읽기"를 만족하되 lock-free는 아니다). 이 point는 여전히 유효하고 ADR-0013은 그 sync primitive 빈칸만 채운다. 상세·근거는 ADR-0013.
 
 6. **해제(reset) 절차.** *"자동으로 푼다는 건 = 그 조건에서 자동 재개해도 안전하다고 결정했다는 뜻이다."*
    - **종목별 = 조건 해소 시 자동 clear.** reconciler가 애매함을 해소하면(예: orderId를 확정 상태로 마감) 더 이상 위험하지 않으므로 그 종목 차단을 자동 해제한다.
