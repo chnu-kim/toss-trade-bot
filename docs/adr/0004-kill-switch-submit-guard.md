@@ -80,6 +80,7 @@ verification: []
 - **전역 halt를 메모리에만 보관(persist 안 함)** — 기각: 재시작이 곧 안전장치 우회다. 카운터 초기화 → 임계 재충전 중 주문 유출. 비가역 자금에서 수용 불가.
 - **종목별 차단도 영속** — 기각: 불필요하다. journal의 `unresolved-ambiguous` intent에서 reconciler가 재시작 시 공짜로 재도출한다. 중복 상태는 어긋남만 만든다.
 - **halt용 두 번째 영속 계층 신설** — 기각: journal과 같은 저장소를 재사용한다 — 단일 진실, journal 기록과 halt 기록을 한 트랜잭션으로 묶어 "주문은 실패 기록됐는데 halt는 안 켜진" 어긋남을 차단한다.
+  > **Amend (ADR-0012)**: 이 대안이 채택한 '한 트랜잭션 원자 결합'은 **order-failure 경로에 한해** ADR-0012가 count-before-resolve ordering + reconciler re-count로 대체한다 — 카운터 persist + 재시작 복구가 같은 어긋남을 원자 tx 없이 닫되, killswitch 미러의 durable-before-visible 순서와 정합한다(원자 seam을 유지하면 발신처가 commit을 소유해 미러 노출을 commit 뒤로 미루는 post-commit 문제가 생긴다 — ADR-0012 Alternatives). ambiguous 빈도는 journal 재계산, 토큰 갱신 실패는 journal 대응물 부재로 각각 무관. 상세는 ADR-0012 Decision point 2·3.
 - **전역 halt 자동 재개(조용해지면 스스로 재시작)** — 기각: 근본 원인(네트워크·API 장애·버그) 미해결 채 재발한다. 시스템 이상은 사람 확인이 안전 조건이다.
 - **임계 판단을 신호 발신처(order/reconciler)에 분산** — 기각: 위험 로직이 흩어져 테스트 표면이 여러 곳이 된다. 카운팅·임계는 killswitch 한 곳에 모은다.
 - **"예상외 손실" 트리거를 지금 포함** — 기각: `holdings` 집계·`trades` orderId 부재로 P&L을 주문에 엮을 수 없다. API가 못 받치는 트리거를 ADR이 약속하면 거짓 계약이다. 후보로만 남긴다.

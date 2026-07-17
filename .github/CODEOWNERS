@@ -26,6 +26,10 @@
 # 0011: loop PR 자격증명 흐름·특권 workflow 트리거·시크릿 배치 — 게이트 강제
 # 메커니즘의 구성을 정의하므로 enforcement-integrity 보호 대상(ADR-0011 point 11).
 /docs/adr/0011-*.md @chnu-kim
+# 0012: 킬 스위치 durability/순서 계약(durable-before-visible·count-first
+# order-failure). protects: [live-execution-human-gate] — 0004와 같은 sacred
+# live-execution invariant set이므로 code-owner 리뷰 대상(ADR-0012).
+/docs/adr/0012-*.md @chnu-kim
 
 # ADR-0008 verdict 게이트 workflow(이슈 #48) — 특권 verdict-생성 잡의 트리거·
 # 인젝션 하드닝·적격 가드·머지 스텝 정의. /.github/workflows/ 디렉터리 규칙에

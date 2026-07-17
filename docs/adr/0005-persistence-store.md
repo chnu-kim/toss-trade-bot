@@ -48,6 +48,7 @@ verification: []
    **테스트 seam**: 소비자는 store가 만족하는 **인터페이스에 의존**해 가짜 구현으로 단위 테스트한다. 그러나 **store 자신의 크래시·내구성·부분쓰기·원자성 테스트는 임시 디렉터리에 실제 엔진**을 띄워 돌린다 — 인메모리 가짜는 fsync·부분쓰기·트랜잭션 경계를 검증하지 못하기 때문이다(CLAUDE.md 테스트 방침).
 
 3. **트랜잭션 경계 = "하나의 관측 가능한 사건".** 2-마커 진행은 사건이 여러 개이므로 **각 전이가 독립 durable commit**이다(`prepared`, `submit-attempted`, `acked`를 한 트랜잭션에 뭉치지 않는다 — 뭉치면 마커 사이 크래시가 복구 불가가 되어 ADR-0002의 존재 이유가 무너진다). **단, 한 논리적 사건이 journal 상태 변경과 halt/카운터 상태 변경을 동시에 유발하면(예: ambiguous submit 기록 → 종목 차단/전역 halt), 그 둘은 반드시 단일 트랜잭션으로 원자화**한다 — 같이 살거나 같이 죽는다. 이 계약이 "저장소 1개"를 강제하는 이유다(별도 저장소면 두 write가 원자일 수 없다).
+   > **Amend (ADR-0012)**: **order-failure 카운터의 journal-결합에 한해** 이 point의 '단일 트랜잭션 원자화'를 ADR-0012가 count-before-resolve ordering + reconciler re-count로 대체한다 — killswitch가 카운터++를 자기 트랜잭션으로 `ResolveIntent(rejected)`보다 **먼저** durable commit하고, 카운터 persist + 재시작 재-count가 같은 어긋남('실패 기록됐는데 halt 안 켜짐')을 원자 tx 없이 닫는다(killswitch 미러의 durable-before-visible 순서와 정합하기 위해 seam을 killswitch 소유로 뒤집은 결과). ambiguous 종목차단·audit ack 등 **다른 결합엔 이 point 그대로 적용**한다. 상세·근거는 ADR-0012 Decision point 2·3·5.
 
 4. **내구성은 마커 commit마다 물리적 보장(fsync-on-commit)이고, 이를 끄는 것을 금지한다.** SQLite `synchronous=FULL` + WAL(또는 이와 동등한 commit 시 물리 내구성) 설정을 고정한다. **성능을 위해 내구성을 낮추는 설정(`synchronous=OFF`/`NORMAL`로의 완화, 비동기 flush 등)은 금지** — 명시적으로 이 ADR에 적어 미래의 "최적화"가 2-마커 crash-safety를 조용히 무효화하지 못하게 한다. 이 봇은 초당 수백 주문이 아니라 폴링 기반이라 commit 지연은 수용 가능하다.
 
