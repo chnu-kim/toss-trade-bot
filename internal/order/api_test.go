@@ -57,6 +57,18 @@ func (f failIfCalled) Post(context.Context, string, io.Reader, ...toss.RequestOp
 	return nil, nil
 }
 
+// postErrorAPI makes Post fail with a fixed error (e.g. a mid-flight transport
+// cut) so SubmitOrder's ambiguity signalling can be exercised without a server.
+type postErrorAPI struct{ err error }
+
+func (p postErrorAPI) Get(context.Context, string, ...toss.RequestOption) (*http.Response, error) {
+	return nil, errors.New("order test: unexpected Get")
+}
+
+func (p postErrorAPI) Post(context.Context, string, io.Reader, ...toss.RequestOption) (*http.Response, error) {
+	return nil, p.err
+}
+
 // --- SubmitOrder -----------------------------------------------------------
 
 func TestSubmitOrder_QuantityBasedRoundTrip(t *testing.T) {
@@ -386,6 +398,110 @@ func TestSubmitOrder_MissingOrderIDRejected(t *testing.T) {
 				t.Fatalf("error %q should name the missing orderId", err.Error())
 			}
 		})
+	}
+}
+
+func TestSubmitOrder_RejectsMismatchedClientOrderID(t *testing.T) {
+	// A proxy/cache mixup or schema drift could return a DIFFERENT order's 200
+	// body. clientOrderId is echoed from the request, so a present echo that
+	// differs from what we sent means this body is about another order — binding
+	// its orderId to our intent would reconcile the wrong order as ours.
+	srv := tokenAndThen(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"result":{"orderId":"orderB","clientOrderId":"B"}}`))
+	})
+	defer srv.Close()
+
+	_, err := newClient(srv).SubmitOrder(context.Background(), 7, OrderRequest{
+		ClientOrderID: "A",
+		Symbol:        "005930",
+		Side:          SideBuy,
+		OrderType:     OrderTypeLimit,
+		Quantity:      "10",
+		Price:         "70000",
+	})
+	if err == nil {
+		t.Fatal("mismatched clientOrderId echo must be an error, got nil")
+	}
+	if !strings.Contains(err.Error(), `"A"`) || !strings.Contains(err.Error(), `"B"`) {
+		t.Fatalf("error %q should name both the requested and returned clientOrderId", err.Error())
+	}
+}
+
+func TestSubmitOrder_AllowsMatchingClientOrderIDReplay(t *testing.T) {
+	// An idempotent replay legitimately returns the SAME clientOrderId — this
+	// must not be false-rejected.
+	srv := tokenAndThen(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"result":{"orderId":"orderA","clientOrderId":"A"}}`))
+	})
+	defer srv.Close()
+
+	resp, err := newClient(srv).SubmitOrder(context.Background(), 7, OrderRequest{
+		ClientOrderID: "A",
+		Symbol:        "005930",
+		Side:          SideBuy,
+		OrderType:     OrderTypeLimit,
+		Quantity:      "10",
+		Price:         "70000",
+	})
+	if err != nil {
+		t.Fatalf("matching clientOrderId echo must succeed, got %v", err)
+	}
+	if resp.OrderID != "orderA" {
+		t.Fatalf("orderId = %q, want orderA", resp.OrderID)
+	}
+}
+
+func TestSubmitOrder_SkipsEchoCheckWhenClientOrderIDUnset(t *testing.T) {
+	// When we send no clientOrderId there is nothing to compare against, so the
+	// echo guard must be skipped and only the orderId guard applies — even if
+	// the response happens to carry a clientOrderId value.
+	srv := tokenAndThen(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"result":{"orderId":"orderX","clientOrderId":"unexpected"}}`))
+	})
+	defer srv.Close()
+
+	resp, err := newClient(srv).SubmitOrder(context.Background(), 7, OrderRequest{
+		Symbol:    "005930",
+		Side:      SideBuy,
+		OrderType: OrderTypeLimit,
+		Quantity:  "10",
+		Price:     "70000",
+	})
+	if err != nil {
+		t.Fatalf("no clientOrderId sent: echo check must be skipped, got %v", err)
+	}
+	if resp.OrderID != "orderX" {
+		t.Fatalf("orderId = %q, want orderX", resp.OrderID)
+	}
+}
+
+func TestSubmitOrder_TransportErrorSignalsAmbiguity(t *testing.T) {
+	// A Post error is ambiguous for a write: the order may have reached the
+	// server and filled before the failure. The wrapper must signal that so the
+	// caller does not read "error" as "not submitted, safe to resubmit".
+	transport := errors.New("dial tcp: connection reset by peer")
+	c := NewClient(postErrorAPI{err: transport})
+
+	_, err := c.SubmitOrder(context.Background(), 7, OrderRequest{
+		Symbol:    "005930",
+		Side:      SideBuy,
+		OrderType: OrderTypeLimit,
+		Quantity:  "10",
+		Price:     "70000",
+	})
+	if err == nil {
+		t.Fatal("expected an error from a failing Post, got nil")
+	}
+	// The underlying transport error must remain inspectable.
+	if !errors.Is(err, transport) {
+		t.Fatalf("error %v should wrap the transport error", err)
+	}
+	// And it must carry the ambiguity/reconciliation signal.
+	if !strings.Contains(err.Error(), "reconciliation") {
+		t.Fatalf("error %q should signal that resubmission needs reconciliation", err.Error())
 	}
 }
 

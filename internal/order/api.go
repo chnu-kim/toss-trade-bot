@@ -294,7 +294,15 @@ func (c *Client) SubmitOrder(ctx context.Context, accountSeq int64, req OrderReq
 	resp, err := c.api.Post(ctx, "/api/v1/orders", bytes.NewReader(payload),
 		toss.WithAccount(seq), withJSONBody())
 	if err != nil {
-		return OrderResponse{}, err
+		// A failed Post is ambiguous for a write: the order may have reached the
+		// server and filled before the failure surfaced (a mid-flight transport
+		// cut), or it may have failed before anything was sent. The wrapper
+		// cannot tell those apart, so it conservatively signals ambiguity — the
+		// caller must NOT read this error as "not submitted, safe to resubmit"
+		// (that is how a duplicate fill happens). Any retry decision belongs to
+		// the caller and only after reconciliation (ADR-0003; CLAUDE.md forbids
+		// auto-retrying a submission). %w keeps the underlying error inspectable.
+		return OrderResponse{}, fmt.Errorf("order: submit did not confirm an outcome — the order may have reached the server and filled; do not treat as not-submitted or resubmit without reconciliation: %w", err)
 	}
 	defer drainClose(resp)
 
@@ -316,6 +324,22 @@ func (c *Client) SubmitOrder(ctx context.Context, accountSeq int64, req OrderReq
 	// routes it through its ambiguous-submit handling (ADR-0002 p3 / ADR-0003).
 	if env.Result.OrderID == "" {
 		return OrderResponse{}, fmt.Errorf("order: submit returned 200 but no orderId — outcome ambiguous, do not treat as sent-or-not-sent without reconciliation")
+	}
+	// Verify the response is about the order we submitted, symmetric with
+	// GetOrder's orderId identity guard. clientOrderId is echoed from the
+	// request, so a present echo that differs from what we sent means this 200
+	// body is about a DIFFERENT order (proxy/cache mixup, schema drift); binding
+	// its orderId to our intent would reconcile an unrelated order as ours.
+	//
+	// Calibration (openapi.json, verified): OrderResponse.required = ["orderId"]
+	// only, and clientOrderId has type ["string","null"] — it MAY be null even
+	// when sent, per the formal schema. So a null/absent echo is deferred to the
+	// orderId guard above (no false-reject of a legit success that omits the
+	// echo); only a PRESENT-but-different echo is a hard identity mismatch. When
+	// no clientOrderId was sent there is nothing to compare, so the check is
+	// skipped entirely.
+	if req.ClientOrderID != "" && env.Result.ClientOrderID != nil && *env.Result.ClientOrderID != req.ClientOrderID {
+		return OrderResponse{}, fmt.Errorf("order: submit for clientOrderId %q returned a different clientOrderId %q — response is about another order", req.ClientOrderID, *env.Result.ClientOrderID)
 	}
 	return env.Result, nil
 }
