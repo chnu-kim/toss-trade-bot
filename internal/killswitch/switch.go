@@ -107,12 +107,19 @@ func New(ctx context.Context, st Store, cfg Config, opts ...Option) (*Switch, er
 		return k, fmt.Errorf("killswitch: load halt state (fail-closed, boot-halted): %w", err)
 	}
 	switch hs.Phase {
+	case store.HaltNone:
+		k.durableHalt = store.HaltNone
 	case store.HaltPending, store.HaltHalted:
 		// persistence-wins: an interrupted (pending) or completed (halted) durable
 		// trip boots halted (ADR-0012 Decision 1(c)).
 		k.durableHalt = hs.Phase
 	default:
+		// Unrecognized phase (schema drift, a corrupted row, or an incompatible
+		// store reader) is "state unknown" → fail-closed, not unhalted
+		// (ADR-0004 point 3). Boot-halted until a human clear.
 		k.durableHalt = store.HaltNone
+		k.bootHalt = true
+		return k, fmt.Errorf("killswitch: unrecognized durable halt phase %q (fail-closed, boot-halted)", hs.Phase)
 	}
 	return k, nil
 }

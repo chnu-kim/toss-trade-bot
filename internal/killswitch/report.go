@@ -77,6 +77,17 @@ func (k *Switch) ReportTokenRefreshFailure(ctx context.Context, occurredAt time.
 }
 
 func (k *Switch) doReportTokenRefresh(ctx context.Context, occurredAt time.Time) error {
+	// A zero occurredAt cannot be time-accounted: it would persist a zero
+	// WindowStart (NULL), so every failure reloads an empty window and resets the
+	// count to 1, never reaching the threshold — a silent escalation bypass. This
+	// is exactly the "counter cannot accumulate" case ADR-0013 latch scope (b)
+	// closes: treat it fail-closed by latching rather than dropping the signal.
+	if occurredAt.IsZero() {
+		k.latch(reasonTokenRefresh)
+		k.notify(reasonTokenRefresh)
+		return fmt.Errorf("killswitch: token refresh failure with zero occurredAt (fail-closed latch)")
+	}
+
 	k.mu.Lock()
 	already := k.durableHalt == store.HaltHalted
 	k.mu.Unlock()

@@ -48,6 +48,7 @@ type controlStore struct {
 	mu sync.Mutex
 
 	errHalt        error
+	haltOverride   *store.HaltState // when set, Halt returns this (e.g. an invalid phase)
 	errMarkPending error
 	errTripHalt    error
 	errClearHalt   error
@@ -79,10 +80,13 @@ func (c *controlStore) set(mutate func(*controlStore)) {
 
 func (c *controlStore) Halt(ctx context.Context) (store.HaltState, error) {
 	c.mu.Lock()
-	err := c.errHalt
+	err, override := c.errHalt, c.haltOverride
 	c.mu.Unlock()
 	if err != nil {
 		return store.HaltState{}, err
+	}
+	if override != nil {
+		return *override, nil
 	}
 	return c.Store.Halt(ctx)
 }
