@@ -204,6 +204,15 @@ func NewSubmitter(cfg SubmitterConfig) (*Submitter, error) {
 	}, nil
 }
 
+// ackPersistTimeout bounds the post-POST critical section that durably records an
+// accepted order's orderId (the acked marker + its audit emit). That section is
+// detached from the caller's ctx (ADR-0002 point 3 — the sole truth handle must
+// survive caller cancellation), but it is still bounded so a wedged disk cannot
+// hang the submit goroutine forever (unattended safety). A local fsync-durable
+// marker write plus an audit fsync finish well within this bound; it exists only
+// to cap a pathological stall.
+const ackPersistTimeout = 30 * time.Second
+
 // SubmitIntent runs the fail-closed 2-marker write-ahead submit sequence for one
 // strategy intent, making at most one POST. The sequence (ADR-0002/0003/0004/
 // 0005/0006):
@@ -228,7 +237,28 @@ func (s *Submitter) SubmitIntent(ctx context.Context, intent Intent) (Outcome, e
 	if intent.IntentID == "" {
 		return Outcome{}, fmt.Errorf("order: SubmitIntent requires a non-empty intentId (strategy contract, ADR-0002 point 2)")
 	}
-	symbol := intent.Request.Symbol
+
+	// clientOrderId is derived deterministically from intentId (ADR-0002 point 4)
+	// and overwrites any caller-provided value — order owns this derivation. Assemble
+	// the exact request we will POST now so it can be structurally validated before
+	// anything durable happens.
+	clientOrderID := DeriveClientOrderID(intent.IntentID)
+	req := intent.Request
+	req.ClientOrderID = clientOrderID
+
+	// Structural validation gate — BEFORE any journal write, idempotency scan, or
+	// guard check. A request that fails req.validate() (missing symbol/side/
+	// orderType, or the quantity/orderAmount oneOf) is rejected by Client.SubmitOrder
+	// *before* the network POST, so the POST could never happen. Writing any marker
+	// for it — above all submit-attempted, which by ADR-0002 means "POST may have
+	// happened" — would forge a false ambiguous state the reconciler can never
+	// resolve against Toss. A contract-violating request must therefore never enter
+	// the journal: reject it here so nothing is written, no POST, no wake, no trip.
+	if err := req.validate(); err != nil {
+		return Outcome{}, fmt.Errorf("order: intent %q has a structurally invalid order request: %w", intent.IntentID, err)
+	}
+
+	symbol := req.Symbol
 
 	// 0. Idempotent replay. order never resolves intents, so any prior call for
 	// this intentId is still in the unresolved set — a replay finds it here and
@@ -245,12 +275,6 @@ func (s *Submitter) SubmitIntent(ctx context.Context, intent Intent) (Outcome, e
 	if allowed, reason := s.guard.CanSubmit(symbol); !allowed {
 		return Outcome{Status: StatusBlocked, IntentID: intent.IntentID, Reason: reason}, nil
 	}
-
-	// clientOrderId is derived deterministically from intentId (ADR-0002 point 4)
-	// and overwrites any caller-provided value — order owns this derivation.
-	clientOrderID := DeriveClientOrderID(intent.IntentID)
-	req := intent.Request
-	req.ClientOrderID = clientOrderID
 
 	payload, err := json.Marshal(req)
 	if err != nil {
@@ -311,15 +335,30 @@ func (s *Submitter) SubmitIntent(ctx context.Context, intent Intent) (Outcome, e
 
 	// 6. acked — its own durable commit — with the orderId that becomes the truth
 	// handle (ADR-0002 point 3).
-	if err := s.journal.AppendMarker(ctx, intent.IntentID, store.MarkerAcked, resp.OrderID); err != nil {
-		// The order WAS placed (orderId in hand) but we could not record acked. Do
-		// NOT resubmit; leave it unresolved with orderId-less markers and wake the
-		// reconciler, which will find the order by re-querying (ADR-0003).
+	//
+	// The POST was ACCEPTED: the order is irreversible (money moved) and
+	// resp.OrderID is its ONLY durable truth handle — clientOrderId is not
+	// queryable on the list/detail endpoints (ADR-0002 point 4). Recording that
+	// handle therefore must NOT be at the mercy of the caller's ctx: if the caller
+	// cancelled or its deadline elapsed during the POST, reusing that ctx here would
+	// drop the orderId and, on a crash right after, demote a real live order to an
+	// unresolvable ambiguous submit (the reconciler could never confirm its truth).
+	// So detach from caller cancellation and give this critical section its own
+	// bounded deadline. Everything up to and including the POST used the caller ctx
+	// (those steps are still cancellable — nothing irreversible had happened yet);
+	// the detach begins only now, once the irreversible act is done.
+	ackCtx, cancelAck := context.WithTimeout(context.WithoutCancel(ctx), ackPersistTimeout)
+	defer cancelAck()
+	if err := s.journal.AppendMarker(ackCtx, intent.IntentID, store.MarkerAcked, resp.OrderID); err != nil {
+		// A genuine durable failure (disk error, or the bounded deadline) — not
+		// caller cancellation, which the detach above rules out. Do NOT resubmit;
+		// leave it unresolved and wake the reconciler, which recovers the order by
+		// re-querying (ADR-0003). The orderId is reported on the Outcome for logging.
 		s.wakeReconciler()
 		return Outcome{Status: StatusUnresolved, IntentID: intent.IntentID, OrderID: resp.OrderID,
 			Reason: fmt.Sprintf("acked marker write failed: %v", err)}, nil
 	}
-	if err := s.emit(ctx, intent.IntentID, resp.OrderID, store.MarkerAcked); err != nil {
+	if err := s.emit(ackCtx, intent.IntentID, resp.OrderID, store.MarkerAcked); err != nil {
 		// The order is placed and acked durably; the global halt tripped inside emit
 		// stops further submits. Surface the fail-closed error but report the orderId.
 		return Outcome{Status: StatusAcked, IntentID: intent.IntentID, OrderID: resp.OrderID,

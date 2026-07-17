@@ -117,6 +117,25 @@ func (a *fakeAudit) markers() []string {
 	return out
 }
 
+// cancelingAPI models the money-critical race: the POST is ACCEPTED by Toss (an
+// orderId comes back — the order is irreversible), but the caller's ctx is
+// cancelled / its deadline elapses during that same POST. It cancels the caller
+// ctx at the instant it returns success, so the acked bookkeeping that follows
+// runs under a cancelled caller ctx.
+type cancelingAPI struct {
+	cancel context.CancelFunc
+	resp   OrderResponse
+	n      int32
+}
+
+func (a *cancelingAPI) SubmitOrder(_ context.Context, _ int64, _ OrderRequest) (OrderResponse, error) {
+	atomic.AddInt32(&a.n, 1)
+	a.cancel()         // the caller's deadline elapses mid-POST...
+	return a.resp, nil // ...but Toss accepted the order — orderId is in hand.
+}
+
+func (a *cancelingAPI) calls() int { return int(atomic.LoadInt32(&a.n)) }
+
 type wakeSpy struct{ n int32 }
 
 func (w *wakeSpy) wake()      { atomic.AddInt32(&w.n, 1) }
@@ -574,6 +593,105 @@ func TestSubmitIntentEmptyIntentIDRejected(t *testing.T) {
 	ins, _ := st.LoadUnresolvedIntents(ctx)
 	if len(ins) != 0 {
 		t.Fatalf("intents written for empty intentId: %d", len(ins))
+	}
+}
+
+// TestSubmitIntentAckSurvivesCallerCancel pins ADR-0002 point 3: once the POST is
+// accepted, resp.OrderID is the order's ONLY durable truth handle (clientOrderId
+// is not queryable — ADR-0002 point 4), so recording it must NOT be at the mercy
+// of the caller's ctx. Here the caller ctx is cancelled during the POST; the
+// accepted order's acked marker + orderId must still be durably recorded (the
+// post-POST bookkeeping is a cancellation-immune critical section). prepared and
+// submit-attempted precede the cancel and must be present too.
+func TestSubmitIntentAckSurvivesCallerCancel(t *testing.T) {
+	st := newStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	api := &cancelingAPI{cancel: cancel, resp: OrderResponse{OrderID: "ord-live"}}
+	var wake wakeSpy
+
+	sub, err := NewSubmitter(SubmitterConfig{
+		Journal: st, Audit: newAudit(t), Guard: allowingGuard(), API: api, AccountSeq: 1, Wake: wake.wake,
+	})
+	if err != nil {
+		t.Fatalf("NewSubmitter: %v", err)
+	}
+	out, err := sub.SubmitIntent(ctx, Intent{IntentID: "i1", Request: validReq("AAPL")})
+	if err != nil {
+		t.Fatalf("SubmitIntent: %v", err)
+	}
+	if out.Status != StatusAcked || out.OrderID != "ord-live" {
+		t.Fatalf("outcome = %+v, want acked ord-live (accepted order's handle must persist despite caller cancel)", out)
+	}
+	if api.calls() != 1 {
+		t.Fatalf("POST calls = %d, want 1", api.calls())
+	}
+	if got := markerKindsOf(t, st, "i1"); !eqKinds(got, store.MarkerPrepared, store.MarkerSubmitAttempted, store.MarkerAcked) {
+		t.Fatalf("markers = %v, want prepared/submit-attempted/acked (acked must survive caller cancel)", got)
+	}
+	in, _ := intentByID(t, st, "i1")
+	last := in.Markers[len(in.Markers)-1]
+	if last.Kind != store.MarkerAcked || last.OrderID != "ord-live" {
+		t.Fatalf("acked marker = %+v, want orderId ord-live durably recorded", last)
+	}
+}
+
+// TestSubmitIntentInvalidRequestRejectedBeforeJournal pins that a structurally
+// invalid OrderRequest (a strategy-contract violation the #33 wrapper rejects
+// before any network POST) is rejected at the SubmitIntent entry, BEFORE any
+// journal write. Otherwise a submit-attempted marker ("POST may have happened")
+// would be forged for an intent whose POST could never occur, leaving a false
+// ambiguous state the reconciler cannot resolve against Toss (ADR-0002). Nothing
+// must be written: no prepared, no submit-attempted, no POST, no wake, no trip.
+func TestSubmitIntentInvalidRequestRejectedBeforeJournal(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	api := &stubAPI{resp: OrderResponse{OrderID: "ord-x"}}
+	g := allowingGuard()
+	var wake wakeSpy
+
+	sub, err := NewSubmitter(SubmitterConfig{
+		Journal: st, Audit: newAudit(t), Guard: g, API: api, AccountSeq: 1, Wake: wake.wake,
+	})
+	if err != nil {
+		t.Fatalf("NewSubmitter: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		id   string
+		req  OrderRequest
+	}{
+		{"missing-symbol", "inv-1", OrderRequest{Side: SideBuy, OrderType: OrderTypeLimit, Quantity: "10", Price: "150.00"}},
+		{"missing-side", "inv-2", OrderRequest{Symbol: "AAPL", OrderType: OrderTypeLimit, Quantity: "10", Price: "150.00"}},
+		{"missing-ordertype", "inv-3", OrderRequest{Symbol: "AAPL", Side: SideBuy, Quantity: "10", Price: "150.00"}},
+		{"quantity-and-amount", "inv-4", OrderRequest{Symbol: "AAPL", Side: SideBuy, OrderType: OrderTypeMarket, Quantity: "10", OrderAmount: "100"}},
+		{"neither-quantity-nor-amount", "inv-5", OrderRequest{Symbol: "AAPL", Side: SideBuy, OrderType: OrderTypeMarket}},
+	}
+	for _, c := range cases {
+		out, err := sub.SubmitIntent(ctx, Intent{IntentID: c.id, Request: c.req})
+		if err == nil {
+			t.Errorf("%s: expected a validation error, got outcome %+v", c.name, out)
+		}
+		if _, ok := intentByID(t, st, c.id); ok {
+			t.Errorf("%s: intent entered the journal despite an invalid request", c.name)
+		}
+	}
+	if api.calls() != 0 {
+		t.Errorf("POST calls = %d, want 0 (an invalid request must never POST)", api.calls())
+	}
+	if wake.count() != 0 {
+		t.Errorf("wake count = %d, want 0 (an invalid request must not wake the reconciler)", wake.count())
+	}
+	if g.tripCount() != 0 {
+		t.Errorf("trip count = %d, want 0", g.tripCount())
+	}
+	ins, lerr := st.LoadUnresolvedIntents(ctx)
+	if lerr != nil {
+		t.Fatalf("LoadUnresolvedIntents: %v", lerr)
+	}
+	if len(ins) != 0 {
+		t.Errorf("journal holds %d intents, want 0 (no invalid request may create prepared/submit-attempted)", len(ins))
 	}
 }
 
