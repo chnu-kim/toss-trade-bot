@@ -143,7 +143,22 @@ func (g *Guard) markHalted(reason string, at time.Time) {
 // to return nil before resolving; on error it must NOT resolve (leave the intent
 // unresolved so the reconciler re-drives and re-counts). Over-counting from a
 // restart re-report is tolerated (over-halt = safe).
+//
+// Durable-before-visible (ADR-0012 Decision 1): a report that will cross the
+// threshold pre-sets the mirror pending (fail-closed) BEFORE the durable write,
+// exactly like a manual Trip. That closes both the in-flight commit window (a
+// concurrent CanSubmit sees pending) and the commit-error window (a failed
+// durable write leaves the mirror blocked, never reverted to unhalted). The
+// pre-read runs under escalationMu so the threshold prediction is exact.
 func (g *Guard) ReportOrderFailure(ctx context.Context, occurredAt time.Time) error {
+	g.escalationMu.Lock()
+	defer g.escalationMu.Unlock()
+
+	willTrip := g.orderReportWillTrip(ctx)
+	if willTrip {
+		g.beginPending(reasonOrderFailures) // fail-closed BEFORE the durable write
+	}
+
 	tripped := false
 	err := g.store.Atomically(ctx, func(tx store.Tx) error {
 		c, err := tx.Counter(ctx, counterOrderFailures)
@@ -162,13 +177,30 @@ func (g *Guard) ReportOrderFailure(ctx context.Context, occurredAt time.Time) er
 		return nil
 	})
 	if err != nil {
-		// fail-closed: nothing committed (rolled back). The caller must not resolve.
+		// fail-closed: nothing committed (rolled back). If we pre-set pending it
+		// stays (blocked), never reverted. The caller must not resolve.
 		return fmt.Errorf("killswitch: report order failure: %w", err)
 	}
 	if tripped {
-		g.markHalted(reasonOrderFailures, occurredAt)
+		g.markHalted(reasonOrderFailures, occurredAt) // pending → halted (durable committed)
+	} else if willTrip {
+		// Conservatively pre-set pending but the tx did not trip (only reachable if
+		// the pre-read errored and over-approximated). Reconcile the mirror to
+		// durable truth without clobbering any concurrent real halt.
+		g.resyncPendingToDurable(ctx)
 	}
 	return nil
+}
+
+// orderReportWillTrip reports whether the next order-failure report will cross
+// the threshold. Caller holds escalationMu, so the counter is stable through the
+// following tx. A read error over-approximates to true (fail-closed).
+func (g *Guard) orderReportWillTrip(ctx context.Context) bool {
+	c, err := g.store.Counter(ctx, counterOrderFailures)
+	if err != nil {
+		return true
+	}
+	return c.Value+1 >= int64(g.cfg.OrderFailureThreshold)
 }
 
 // ReportOrderSuccess durably resets the consecutive order-failure counter
@@ -177,12 +209,59 @@ func (g *Guard) ReportOrderFailure(ctx context.Context, occurredAt time.Time) er
 // halt already tripped: that is manual-only (ADR-0004 point 6). The caller is the
 // success-confirming path (reconciler FILLED confirmation, #35).
 func (g *Guard) ReportOrderSuccess(ctx context.Context) error {
+	// Held under escalationMu so a concurrent ReportOrderFailure cannot reset the
+	// order-failure counter between that path's pre-read and its tx (which would
+	// desync the threshold prediction).
+	g.escalationMu.Lock()
+	defer g.escalationMu.Unlock()
 	if err := g.store.Atomically(ctx, func(tx store.Tx) error {
 		return tx.SetCounter(ctx, store.Counter{Name: counterOrderFailures, Value: 0})
 	}); err != nil {
 		return fmt.Errorf("killswitch: reset order-failure counter: %w", err)
 	}
 	return nil
+}
+
+// beginPending exposes the mirror as pending (fail-closed) before a count-first
+// durable halt write, so both the in-flight commit window and a commit error stay
+// blocked (ADR-0012 Decision 1). It only advances from none — it never downgrades
+// a halt a concurrent trip already exposed. Setting pending (blocked, more
+// conservative) rather than halted keeps this consistent with durable-before-
+// visible: the completed halt is exposed only after the durable commit.
+func (g *Guard) beginPending(reason string) {
+	g.mu.Lock()
+	if g.mirrorPhase == phaseNone {
+		g.mirrorPhase = phasePending
+		g.haltReason = reason
+		g.gen++
+	}
+	g.mu.Unlock()
+}
+
+// resyncPendingToDurable reconciles a pending mirror we conservatively pre-set to
+// the durable truth, used only when a count-first pre-read over-approximated
+// (errored ⇒ pending) but the tx then committed without tripping. It is
+// clobber-safe: it acts only while the mirror is still pending (a concurrent real
+// trip would have advanced it to halted, which is left untouched) and only after
+// confirming the durable phase, so it never reverts a halt that actually exists.
+func (g *Guard) resyncPendingToDurable(ctx context.Context) {
+	hs, err := g.store.Halt(ctx)
+	if err != nil {
+		return // cannot confirm durable state ⇒ leave pending (fail-closed)
+	}
+	g.mu.Lock()
+	if g.mirrorPhase == phasePending {
+		switch hs.Phase {
+		case store.HaltNone:
+			g.mirrorPhase = phaseNone
+			g.haltReason = ""
+			g.durablePhase = store.HaltNone
+		default: // pending or halted durably ⇒ a real halt exists; expose halted
+			g.mirrorPhase = phaseHalted
+			g.durablePhase = hs.Phase
+		}
+	}
+	g.mu.Unlock()
 }
 
 // ReportTokenRefreshFailure is the counted, count-first entry for a token-refresh
@@ -193,21 +272,21 @@ func (g *Guard) ReportOrderSuccess(ctx context.Context) error {
 // manager's refresh-failure seam to this method (not to a direct Trip) so the
 // counting/persistence contract holds.
 func (g *Guard) ReportTokenRefreshFailure(ctx context.Context, occurredAt time.Time) error {
+	g.escalationMu.Lock()
+	defer g.escalationMu.Unlock()
+
+	willTrip := g.tokenReportWillTrip(ctx, occurredAt)
+	if willTrip {
+		g.beginPending(reasonTokenRefresh) // fail-closed BEFORE the durable write
+	}
+
 	tripped := false
 	err := g.store.Atomically(ctx, func(tx store.Tx) error {
 		c, err := tx.Counter(ctx, counterTokenRefresh)
 		if err != nil {
 			return err
 		}
-		c.Name = counterTokenRefresh
-		// Windowed: start a fresh window when the previous one has elapsed relative
-		// to occurredAt, otherwise accumulate.
-		if c.WindowStart.IsZero() || occurredAt.Sub(c.WindowStart) > g.cfg.TokenRefreshWindow {
-			c.WindowStart = occurredAt
-			c.Value = 1
-		} else {
-			c.Value++
-		}
+		c = projectTokenCounter(c, occurredAt, g.cfg.TokenRefreshWindow)
 		if err := tx.SetCounter(ctx, c); err != nil {
 			return err
 		}
@@ -222,8 +301,36 @@ func (g *Guard) ReportTokenRefreshFailure(ctx context.Context, occurredAt time.T
 	}
 	if tripped {
 		g.markHalted(reasonTokenRefresh, occurredAt)
+	} else if willTrip {
+		g.resyncPendingToDurable(ctx)
 	}
 	return nil
+}
+
+// tokenReportWillTrip predicts whether the next token-refresh report crosses the
+// threshold, applying the SAME windowed projection the tx uses so the prediction
+// is exact under escalationMu. A read error over-approximates to true.
+func (g *Guard) tokenReportWillTrip(ctx context.Context, occurredAt time.Time) bool {
+	c, err := g.store.Counter(ctx, counterTokenRefresh)
+	if err != nil {
+		return true
+	}
+	projected := projectTokenCounter(c, occurredAt, g.cfg.TokenRefreshWindow)
+	return projected.Value >= int64(g.cfg.TokenRefreshFailureThreshold)
+}
+
+// projectTokenCounter applies the windowed increment: a fresh window (value 1)
+// when the previous one has elapsed relative to occurredAt, otherwise value++.
+// Shared by the pre-read prediction and the tx so both agree exactly.
+func projectTokenCounter(c store.Counter, occurredAt time.Time, window time.Duration) store.Counter {
+	c.Name = counterTokenRefresh
+	if c.WindowStart.IsZero() || occurredAt.Sub(c.WindowStart) > window {
+		c.WindowStart = occurredAt
+		c.Value = 1
+	} else {
+		c.Value++
+	}
+	return c
 }
 
 // ClearSymbol removes a per-symbol block (memory-only). The reconciler (#35)

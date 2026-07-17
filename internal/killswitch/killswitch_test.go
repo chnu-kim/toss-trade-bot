@@ -25,10 +25,11 @@ var errBoom = errors.New("boom")
 type scriptedStore struct {
 	inner killswitch.Store
 
-	mu       sync.Mutex
-	calls    int
-	failOn   map[int]error // 1-based Atomically call index → error
-	failHalt error         // if set, Halt returns this
+	mu          sync.Mutex
+	calls       int
+	failOn      map[int]error // 1-based Atomically call index → error
+	failHalt    error         // if set, Halt returns this
+	failCounter error         // if set, the standalone Counter read returns this
 
 	holdCall int           // if >0, that Atomically call signals entered then blocks on release
 	entered  chan struct{} // closed when the held call is entered
@@ -61,6 +62,16 @@ func (s *scriptedStore) Halt(ctx context.Context) (store.HaltState, error) {
 		return store.HaltState{}, fh
 	}
 	return s.inner.Halt(ctx)
+}
+
+func (s *scriptedStore) Counter(ctx context.Context, name string) (store.Counter, error) {
+	s.mu.Lock()
+	fc := s.failCounter
+	s.mu.Unlock()
+	if fc != nil {
+		return store.Counter{}, fc
+	}
+	return s.inner.Counter(ctx, name)
 }
 
 func (s *scriptedStore) setFailOn(m map[int]error) {
@@ -377,7 +388,10 @@ func TestReportOrderFailure_Overcount_Tolerated(t *testing.T) {
 	}
 }
 
-func TestReportOrderFailure_DurableError_FailClosed(t *testing.T) {
+// A threshold-crossing report whose durable write fails must stay fail-closed:
+// the mirror is pre-set pending BEFORE the durable write, so a commit error leaves
+// CanSubmit blocked (the counter itself rolls back). ADR-0012 Decision 1.
+func TestReportOrderFailure_DurableTripError_FailClosed(t *testing.T) {
 	db, _ := openTempStore(t)
 	ctx := context.Background()
 	ss := &scriptedStore{inner: db, failOn: map[int]error{1: errBoom}}
@@ -391,8 +405,101 @@ func TestReportOrderFailure_DurableError_FailClosed(t *testing.T) {
 	if c.Value != 0 {
 		t.Fatalf("counter = %d, want 0 (rolled back)", c.Value)
 	}
-	if g.Snapshot().Halted {
-		t.Fatal("guard must not be halted when the count failed to commit")
+	if allowed, _ := g.CanSubmit("AAPL"); allowed {
+		t.Fatal("a threshold-crossing report whose durable write failed must stay blocked (fail-closed)")
+	}
+}
+
+// The token-refresh count-first path has the same fail-closed contract.
+func TestReportTokenRefreshFailure_DurableTripError_FailClosed(t *testing.T) {
+	db, _ := openTempStore(t)
+	ctx := context.Background()
+	ss := &scriptedStore{inner: db, failOn: map[int]error{1: errBoom}}
+	g := killswitch.New(ctx, ss, &recNotifier{}, killswitch.Config{TokenRefreshFailureThreshold: 1})
+	g.NotifyScanComplete()
+
+	if err := g.ReportTokenRefreshFailure(ctx, time.Now()); err == nil {
+		t.Fatal("ReportTokenRefreshFailure must return the durable write error")
+	}
+	if allowed, _ := g.CanSubmit("AAPL"); allowed {
+		t.Fatal("a threshold-crossing token report whose durable write failed must stay blocked (fail-closed)")
+	}
+}
+
+// A BELOW-threshold report whose durable write fails must NOT halt: only
+// threshold-crossing reports fail-closed, so a transient store hiccup on an early
+// failure does not spuriously halt the bot.
+func TestReportOrderFailure_BelowThreshold_StoreError_NotBlocked(t *testing.T) {
+	db, _ := openTempStore(t)
+	ctx := context.Background()
+	ss := &scriptedStore{inner: db, failOn: map[int]error{1: errBoom}}
+	g := killswitch.New(ctx, ss, &recNotifier{}, killswitch.Config{OrderFailureThreshold: 3})
+	g.NotifyScanComplete()
+
+	if err := g.ReportOrderFailure(ctx, time.Now()); err == nil {
+		t.Fatal("ReportOrderFailure must surface the store error")
+	}
+	if allowed, _ := g.CanSubmit("AAPL"); !allowed {
+		t.Fatal("a below-threshold store error must not fail-closed the guard (no spurious halt)")
+	}
+}
+
+// The in-flight window of a count-first threshold trip must block concurrent
+// submitters: while the durable commit is in flight, CanSubmit sees pending.
+// Run under -race.
+func TestReportOrderFailure_InFlightWindowBlocks(t *testing.T) {
+	db, _ := openTempStore(t)
+	ctx := context.Background()
+	ss := &scriptedStore{
+		inner:    db,
+		holdCall: 1, // hold the count-first Atomically (counter++/TripHalt)
+		entered:  make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	g := killswitch.New(ctx, ss, &recNotifier{}, killswitch.Config{OrderFailureThreshold: 1})
+	g.NotifyScanComplete()
+
+	done := make(chan error, 1)
+	go func() { done <- g.ReportOrderFailure(ctx, time.Now()) }()
+
+	<-ss.entered // the report has pre-set the mirror pending and is committing
+	if allowed, _ := g.CanSubmit("AAPL"); allowed {
+		t.Fatal("CanSubmit must block during the count-first in-flight window")
+	}
+	close(ss.release)
+	if err := <-done; err != nil {
+		t.Fatalf("ReportOrderFailure: %v", err)
+	}
+	if allowed, _ := g.CanSubmit("AAPL"); allowed {
+		t.Fatal("CanSubmit must stay blocked (halted) after the count-first trip completes")
+	}
+}
+
+func TestReportTokenRefreshFailure_InFlightWindowBlocks(t *testing.T) {
+	db, _ := openTempStore(t)
+	ctx := context.Background()
+	ss := &scriptedStore{
+		inner:    db,
+		holdCall: 1,
+		entered:  make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	g := killswitch.New(ctx, ss, &recNotifier{}, killswitch.Config{TokenRefreshFailureThreshold: 1})
+	g.NotifyScanComplete()
+
+	done := make(chan error, 1)
+	go func() { done <- g.ReportTokenRefreshFailure(ctx, time.Now()) }()
+
+	<-ss.entered
+	if allowed, _ := g.CanSubmit("AAPL"); allowed {
+		t.Fatal("CanSubmit must block during the token count-first in-flight window")
+	}
+	close(ss.release)
+	if err := <-done; err != nil {
+		t.Fatalf("ReportTokenRefreshFailure: %v", err)
+	}
+	if allowed, _ := g.CanSubmit("AAPL"); allowed {
+		t.Fatal("CanSubmit must stay blocked after the token count-first trip")
 	}
 }
 

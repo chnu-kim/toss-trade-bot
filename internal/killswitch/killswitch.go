@@ -18,6 +18,11 @@ type Store interface {
 	Atomically(ctx context.Context, fn func(tx store.Tx) error) error
 	// Halt reads the persisted global halt phase (none/pending/halted).
 	Halt(ctx context.Context) (store.HaltState, error)
+	// Counter reads a persistent counter. The count-first paths read it once
+	// before their write tx to decide whether the report may cross the threshold,
+	// so they can pre-set the mirror pending (fail-closed) before the durable
+	// write (ADR-0012 Decision 1). A never-written counter reads back zero.
+	Counter(ctx context.Context, name string) (store.Counter, error)
 }
 
 // Notifier is the seam the guard calls when the global halt trips. It is
@@ -140,6 +145,15 @@ type Guard struct {
 	store    Store
 	notifier Notifier
 	cfg      Config
+
+	// escalationMu serializes the count-first paths (ReportOrderFailure,
+	// ReportTokenRefreshFailure, ReportOrderSuccess) so a counter cannot change
+	// between a path's pre-read and its write tx. That makes the "will this report
+	// cross the threshold" prediction exact, closing the race where a pre-read
+	// says "won't trip" but a concurrent increment makes the tx trip (fail-open).
+	// It is a separate lock from mu: mu guards the hot-path mirror and is never
+	// held across a store call, while escalationMu is held across one.
+	escalationMu sync.Mutex
 
 	mu             sync.Mutex
 	mirrorPhase    mirrorPhase       // global halt as exposed by the mirror (hot path)
