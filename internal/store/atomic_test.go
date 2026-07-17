@@ -55,7 +55,7 @@ func TestAtomicallyRecoversConnectionAfterCallbackPanic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Halt: %v", err)
 	}
-	if !hs.Halted || hs.Reason != "post-panic recovery check" {
+	if hs.Phase != HaltHalted || hs.Reason != "post-panic recovery check" {
 		t.Fatalf("halt = %+v, want halted with reason after recovery TripHalt", hs)
 	}
 }
@@ -95,8 +95,8 @@ func TestAtomicallyRollsBackAllWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Halt: %v", err)
 	}
-	if hs.Halted {
-		t.Errorf("halt = %+v, want not halted (rolled back)", hs)
+	if hs.Phase != HaltNone {
+		t.Errorf("halt = %+v, want phase none (rolled back)", hs)
 	}
 	c, err := db.Counter(ctx, "fails")
 	if err != nil {
@@ -131,7 +131,7 @@ func TestAtomicallyCommitsAllWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Halt: %v", err)
 	}
-	if !hs.Halted || hs.Reason != "ambiguous-frequent" {
+	if hs.Phase != HaltHalted || hs.Reason != "ambiguous-frequent" {
 		t.Errorf("halt = %+v, want halted with reason", hs)
 	}
 	got, _ := db.LoadUnresolvedIntents(ctx)
@@ -168,7 +168,7 @@ func TestReadThenWriteInOneTx(t *testing.T) {
 		t.Errorf("counter = %d, want 1", c.Value)
 	}
 	hs, _ := db.Halt(ctx)
-	if !hs.Halted {
+	if hs.Phase != HaltHalted {
 		t.Errorf("halt = %+v, want halted", hs)
 	}
 }
@@ -200,7 +200,7 @@ func TestHaltPersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Halt after reopen: %v", err)
 	}
-	if !hs.Halted || hs.Reason != "manual-e2e" || hs.TrippedAt.IsZero() {
+	if hs.Phase != HaltHalted || hs.Reason != "manual-e2e" || hs.TrippedAt.IsZero() {
 		t.Fatalf("halt after reopen = %+v, want halted with reason and tripped time", hs)
 	}
 
@@ -209,7 +209,7 @@ func TestHaltPersistsAcrossReopen(t *testing.T) {
 		t.Fatalf("ClearHalt: %v", err)
 	}
 	hs2, _ := db2.Halt(ctx)
-	if hs2.Halted || !hs2.TrippedAt.IsZero() {
+	if hs2.Phase != HaltNone || !hs2.TrippedAt.IsZero() {
 		t.Fatalf("halt after clear = %+v, want cleared", hs2)
 	}
 }

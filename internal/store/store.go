@@ -28,9 +28,13 @@ type Store interface {
 	ResolveIntent(ctx context.Context, intentID, resolution string) error
 	LoadUnresolvedIntents(ctx context.Context) ([]Intent, error)
 
+	MarkHaltPending(ctx context.Context, reason string) error
 	TripHalt(ctx context.Context, reason string) error
 	ClearHalt(ctx context.Context) error
 	Halt(ctx context.Context) (HaltState, error)
+
+	SetLifecycle(ctx context.Context, s LifecycleState) error
+	Lifecycle(ctx context.Context) (LifecycleState, error)
 
 	SetCounter(ctx context.Context, c Counter) error
 	Counter(ctx context.Context, name string) (Counter, error)
@@ -166,7 +170,14 @@ func (d *DB) ResolveIntent(ctx context.Context, intentID, resolution string) err
 	return d.Atomically(ctx, func(tx Tx) error { return tx.ResolveIntent(ctx, intentID, resolution) })
 }
 
-// TripHalt persists the global halt (ADR-0004). killswitch owns the decision.
+// MarkHaltPending durably opens a pending global halt (ADR-0012 Decision 1(c)).
+// killswitch owns when to use it versus a direct TripHalt.
+func (d *DB) MarkHaltPending(ctx context.Context, reason string) error {
+	return d.Atomically(ctx, func(tx Tx) error { return tx.MarkHaltPending(ctx, reason) })
+}
+
+// TripHalt persists the completed global halt (ADR-0004/0012). killswitch owns
+// the decision.
 func (d *DB) TripHalt(ctx context.Context, reason string) error {
 	return d.Atomically(ctx, func(tx Tx) error { return tx.TripHalt(ctx, reason) })
 }
@@ -174,6 +185,12 @@ func (d *DB) TripHalt(ctx context.Context, reason string) error {
 // ClearHalt clears the global halt (manual reset per ADR-0004 point 6).
 func (d *DB) ClearHalt(ctx context.Context) error {
 	return d.Atomically(ctx, func(tx Tx) error { return tx.ClearHalt(ctx) })
+}
+
+// SetLifecycle durably sets the clean-shutdown sentinel (ADR-0012 Decision 1(c)).
+// cmd/bot (#36) owns the eligibility rules for when each value may be written.
+func (d *DB) SetLifecycle(ctx context.Context, s LifecycleState) error {
+	return d.Atomically(ctx, func(tx Tx) error { return tx.SetLifecycle(ctx, s) })
 }
 
 // SetCounter upserts a persistent counter.
@@ -204,6 +221,11 @@ func (d *DB) LoadUnresolvedIntents(ctx context.Context) ([]Intent, error) {
 // Halt reads the persisted global halt state.
 func (d *DB) Halt(ctx context.Context) (HaltState, error) {
 	return readHalt(ctx, d.readDB)
+}
+
+// Lifecycle reads the persisted clean-shutdown sentinel.
+func (d *DB) Lifecycle(ctx context.Context) (LifecycleState, error) {
+	return readLifecycle(ctx, d.readDB)
 }
 
 // Counter reads a persistent counter. A never-written counter reads back as a

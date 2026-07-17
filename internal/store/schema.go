@@ -13,16 +13,23 @@ import (
 // store fails closed instead (a rollback below a migration must not corrupt).
 var ErrSchemaTooNew = errors.New("store: database schema is newer than this binary supports")
 
-// schemaVersionV1 is the migration version this package owns. issue #14 adds V2
-// (the retention ack-flag column), so V1 is the ceiling here — the version
-// number is the shared contract that keeps the two issues from colliding.
-const schemaVersionV1 = 1
+// Migration versions this package owns. V1 establishes the live-state tables;
+// V2 (issue #60) extends the global halt to a 3-state lifecycle and adds the
+// clean-shutdown sentinel (ADR-0012). The version number is the shared contract
+// that keeps concurrently-open store issues (#14 retention ack-flag, #28/#29)
+// from colliding: whichever merges first claims the next number and the others
+// rebase onto it (issue #60 "공유 접점").
+const (
+	schemaVersionV1 = 1
+	schemaVersionV2 = 2
+)
 
 // migrations is the ordered migration list. Index i migrates the schema from
 // version i to version i+1; migrations[0] establishes V1. Append-only: never
 // edit a shipped migration, add a new one.
 var migrations = []string{
 	schemaV1,
+	schemaV2,
 }
 
 // schemaV1 creates the three areas of live state: the order journal (intents +
@@ -58,6 +65,43 @@ CREATE TABLE counters (
 	window_start INTEGER,
 	updated_at   INTEGER NOT NULL
 );
+`
+
+// schemaV2 backs the kill-switch durability substrate (ADR-0012, issue #60). It
+// does two things:
+//
+//   - Extends the global halt from a 2-value boolean to the 3-state lifecycle
+//     none→pending→halted→none. The halt table is recreated (rather than an
+//     ADD/DROP COLUMN dance) so the swap is portable across SQL engines and does
+//     not depend on the engine's DROP COLUMN support. The singleton row's reason
+//     and tripped_at are carried over, and the old boolean maps halted!=0 →
+//     'halted', else → 'none', so an existing tripped halt is never lost on
+//     upgrade (a mid-upgrade restart must not become a safety-guard bypass).
+//   - Adds the clean-shutdown sentinel as a single-row lifecycle state. The
+//     CHECK(id = 1) plus a single state column make two coexisting values
+//     structurally impossible (sentinel fail-open #1, ADR-0012 Decision 1(c)).
+//     A fresh/migrated DB defaults to the conservative 'running' — it has
+//     recorded no clean shutdown.
+//
+// No table references halt via a foreign key, so recreating it under
+// foreign_keys=ON is safe (nothing points at the old table to re-target).
+const schemaV2 = `
+CREATE TABLE halt_v2 (
+	id         INTEGER PRIMARY KEY CHECK (id = 1),
+	state      TEXT NOT NULL DEFAULT 'none' CHECK (state IN ('none', 'pending', 'halted')),
+	reason     TEXT NOT NULL DEFAULT '',
+	tripped_at INTEGER
+);
+INSERT INTO halt_v2 (id, state, reason, tripped_at)
+	SELECT id, CASE WHEN halted != 0 THEN 'halted' ELSE 'none' END, reason, tripped_at
+	FROM halt;
+DROP TABLE halt;
+ALTER TABLE halt_v2 RENAME TO halt;
+CREATE TABLE lifecycle (
+	id    INTEGER PRIMARY KEY CHECK (id = 1),
+	state TEXT NOT NULL DEFAULT 'running' CHECK (state IN ('clean', 'running'))
+);
+INSERT INTO lifecycle (id, state) VALUES (1, 'running');
 `
 
 // migrate brings the database up to the latest migration, running each pending

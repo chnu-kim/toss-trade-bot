@@ -8,10 +8,12 @@ import (
 // fakeStore is a stand-in a consumer package (order/killswitch/reconciler)
 // could write to unit-test itself without a real database. Its existence proves
 // the Store interface is a usable fake seam (ADR-0005 point 2 acceptance
-// criterion). It records the last halt reason and answers a canned intent set.
+// criterion). It records the last halt reason/phase, the sentinel value, and
+// answers a canned intent set.
 type fakeStore struct {
 	haltReason string
-	halted     bool
+	haltPhase  HaltPhase
+	lifecycle  LifecycleState
 	intents    []Intent
 }
 
@@ -27,13 +29,27 @@ func (f *fakeStore) ResolveIntent(context.Context, string, string) error        
 func (f *fakeStore) LoadUnresolvedIntents(context.Context) ([]Intent, error) {
 	return f.intents, nil
 }
-func (f *fakeStore) TripHalt(_ context.Context, reason string) error {
-	f.halted, f.haltReason = true, reason
+func (f *fakeStore) MarkHaltPending(_ context.Context, reason string) error {
+	f.haltPhase, f.haltReason = HaltPending, reason
 	return nil
 }
-func (f *fakeStore) ClearHalt(context.Context) error { f.halted = false; return nil }
+func (f *fakeStore) TripHalt(_ context.Context, reason string) error {
+	f.haltPhase, f.haltReason = HaltHalted, reason
+	return nil
+}
+func (f *fakeStore) ClearHalt(context.Context) error {
+	f.haltPhase, f.haltReason = HaltNone, ""
+	return nil
+}
 func (f *fakeStore) Halt(context.Context) (HaltState, error) {
-	return HaltState{Halted: f.halted, Reason: f.haltReason}, nil
+	return HaltState{Phase: f.haltPhase, Reason: f.haltReason}, nil
+}
+func (f *fakeStore) SetLifecycle(_ context.Context, s LifecycleState) error {
+	f.lifecycle = s
+	return nil
+}
+func (f *fakeStore) Lifecycle(context.Context) (LifecycleState, error) {
+	return f.lifecycle, nil
 }
 func (f *fakeStore) SetCounter(context.Context, Counter) error { return nil }
 func (f *fakeStore) Counter(_ context.Context, name string) (Counter, error) {
@@ -49,10 +65,17 @@ func (t fakeTx) ResolveIntent(context.Context, string, string) error            
 func (t fakeTx) LoadUnresolvedIntents(ctx context.Context) ([]Intent, error) {
 	return t.f.LoadUnresolvedIntents(ctx)
 }
+func (t fakeTx) MarkHaltPending(ctx context.Context, reason string) error {
+	return t.f.MarkHaltPending(ctx, reason)
+}
 func (t fakeTx) TripHalt(ctx context.Context, reason string) error { return t.f.TripHalt(ctx, reason) }
 func (t fakeTx) ClearHalt(ctx context.Context) error               { return t.f.ClearHalt(ctx) }
 func (t fakeTx) Halt(ctx context.Context) (HaltState, error)       { return t.f.Halt(ctx) }
-func (t fakeTx) SetCounter(context.Context, Counter) error         { return nil }
+func (t fakeTx) SetLifecycle(ctx context.Context, s LifecycleState) error {
+	return t.f.SetLifecycle(ctx, s)
+}
+func (t fakeTx) Lifecycle(ctx context.Context) (LifecycleState, error) { return t.f.Lifecycle(ctx) }
+func (t fakeTx) SetCounter(context.Context, Counter) error             { return nil }
 func (t fakeTx) Counter(ctx context.Context, name string) (Counter, error) {
 	return t.f.Counter(ctx, name)
 }
@@ -72,7 +95,7 @@ func TestFakeStoreSatisfiesSeam(t *testing.T) {
 		t.Fatalf("Atomically on fake: %v", err)
 	}
 	hs, _ := s.Halt(ctx)
-	if !hs.Halted || hs.Reason != "test" {
+	if hs.Phase != HaltHalted || hs.Reason != "test" {
 		t.Fatalf("fake halt = %+v, want halted/test", hs)
 	}
 }
