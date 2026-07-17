@@ -20,6 +20,7 @@ const validCodeowners = `# enforcement-integrity sacred invariant (ADR-0009) 의
 /docs/adr/0009-*.md @chnu-kim
 /docs/adr/0010-*.md @chnu-kim
 /docs/adr/0011-*.md @chnu-kim
+/docs/adr/0012-*.md @chnu-kim
 
 /.github/workflows/verdict-gate.yml @chnu-kim
 /internal/gate/ @chnu-kim
@@ -66,6 +67,27 @@ func TestCheckCodeowners_Missing0011FailsClosed(t *testing.T) {
 	got := CheckCodeowners(content)
 	if got.Satisfied {
 		t.Fatal("missing sacred path (0011) must not satisfy the check")
+	}
+}
+
+func TestCheckCodeowners_Missing0012FailsClosed(t *testing.T) {
+	// ADR-0012 declares protects: [live-execution-human-gate] and joins the
+	// sacred set (like ADR-0004). A CODEOWNERS that drops its line must fail
+	// check (a) — the twin-artifact rule (codex review finding on PR #59: the
+	// protects: declaration and the CODEOWNERS/sacredRequiredPaths registration
+	// must move together).
+	content := `/.github/workflows/ @chnu-kim
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+/docs/adr/0011-*.md @chnu-kim
+/.github/CODEOWNERS @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if got.Satisfied {
+		t.Fatal("missing sacred path (0012) must not satisfy the check")
 	}
 }
 
@@ -129,6 +151,7 @@ func TestCheckCodeowners_CommentsAndBlankLinesIgnored(t *testing.T) {
 /docs/adr/0009-*.md @chnu-kim
 /docs/adr/0010-*.md @chnu-kim
 /docs/adr/0011-*.md @chnu-kim
+/docs/adr/0012-*.md @chnu-kim
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
@@ -217,6 +240,7 @@ func TestCheckCodeowners_LaterEntryWithSameOwnerStillSatisfies(t *testing.T) {
 /docs/adr/0009-*.md @chnu-kim
 /docs/adr/0010-*.md @chnu-kim
 /docs/adr/0011-*.md @chnu-kim
+/docs/adr/0012-*.md @chnu-kim
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
@@ -248,6 +272,7 @@ func TestCheckCodeowners_MissingGateLogicPackage(t *testing.T) {
 /docs/adr/0009-*.md @chnu-kim
 /docs/adr/0010-*.md @chnu-kim
 /docs/adr/0011-*.md @chnu-kim
+/docs/adr/0012-*.md @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
@@ -267,6 +292,7 @@ func TestCheckCodeowners_GateArtifactOwnerStripped(t *testing.T) {
 /docs/adr/0009-*.md @chnu-kim
 /docs/adr/0010-*.md @chnu-kim
 /docs/adr/0011-*.md @chnu-kim
+/docs/adr/0012-*.md @chnu-kim
 /internal/gate/
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
@@ -294,6 +320,7 @@ func TestCheckCodeowners_NarrowerCarveOutOnOneGateFileNotCaught(t *testing.T) {
 /docs/adr/0009-*.md @chnu-kim
 /docs/adr/0010-*.md @chnu-kim
 /docs/adr/0011-*.md @chnu-kim
+/docs/adr/0012-*.md @chnu-kim
 /internal/gate/ @chnu-kim
 /internal/gate/sanity.go
 /cmd/verdict-gate/ @chnu-kim
@@ -322,6 +349,7 @@ func TestCheckCodeowners_PRCreationWorkflowCarveOutCaught(t *testing.T) {
 /docs/adr/0009-*.md @chnu-kim
 /docs/adr/0010-*.md @chnu-kim
 /docs/adr/0011-*.md @chnu-kim
+/docs/adr/0012-*.md @chnu-kim
 /.github/workflows/pr-creation.yml
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
@@ -344,6 +372,7 @@ docs/adr/0008-*.md @chnu-kim
 docs/adr/0009-*.md @chnu-kim
 docs/adr/0010-*.md @chnu-kim
 docs/adr/0011-*.md @chnu-kim
+docs/adr/0012-*.md @chnu-kim
 internal/gate/** @chnu-kim
 cmd/verdict-gate/** @chnu-kim
 configs/gate/** @chnu-kim

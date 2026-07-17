@@ -47,6 +47,11 @@ var sacredRequiredPaths = []string{
 	"docs/adr/0009-adr-autonomy-sacred-invariant.md",
 	"docs/adr/0010-adr-ssot-frontmatter-hybrid.md",
 	"docs/adr/0011-loop-pr-credential-flow.md",
+	// ADR-0012 declares protects: [live-execution-human-gate] — it defines the
+	// kill-switch durability/ordering contract (durable-before-visible, count-
+	// first order-failure), part of the sacred live-execution invariant set
+	// like ADR-0004. Same twin-artifact rule as the ADR-0011 registration.
+	"docs/adr/0012-killswitch-durability-ordering.md",
 	// Every non-test .go source file in internal/gate, individually — not
 	// just one representative file (codex:review [P2] finding on #48's PR:
 	// the privileged workflow compiles and executes the whole package via
