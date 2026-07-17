@@ -76,6 +76,10 @@ func TestCheckCodeowners_Missing0012FailsClosed(t *testing.T) {
 	// check (a) — the twin-artifact rule (codex review finding on PR #59: the
 	// protects: declaration and the CODEOWNERS/sacredRequiredPaths registration
 	// must move together).
+	// Otherwise-VALID sample with only the /docs/adr/0012-*.md line removed, so
+	// the check fails specifically because 0012 is missing (not because some
+	// other required owner is absent) — this is what actually guards the
+	// twin-artifact requirement (codex review [P3] on PR #59).
 	content := `/.github/workflows/ @chnu-kim
 /docs/adr/0004-*.md @chnu-kim
 /docs/adr/0007-*.md @chnu-kim
@@ -83,6 +87,9 @@ func TestCheckCodeowners_Missing0012FailsClosed(t *testing.T) {
 /docs/adr/0009-*.md @chnu-kim
 /docs/adr/0010-*.md @chnu-kim
 /docs/adr/0011-*.md @chnu-kim
+/internal/gate/ @chnu-kim
+/cmd/verdict-gate/ @chnu-kim
+/configs/gate/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
