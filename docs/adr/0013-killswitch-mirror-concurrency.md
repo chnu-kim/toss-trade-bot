@@ -19,7 +19,7 @@ verification:
     verdict: approved (grilling 수렴 — open forks 1·2·4 해소; 최종 하드닝 W-A/W-B refinement 반영)
   - reviewer: codex:github-bot (PR #63)
     date: 2026-07-17
-    verdict: bootHalt 배선 갭 2건 지적 → 반영. P2(수동 ClearHalt이 bootHalt를 clear 안 해 stuck-block) · P1(clean-shutdown 자격이 bootHalt를 빠뜨려 bootHalt-only halt 재시작 유실). 결정 불변, 배선 완결성 수정.
+    verdict: 3건 지적 → 전부 반영. P2(수동 ClearHalt이 bootHalt를 clear 안 해 stuck-block) · P1(clean-shutdown 자격이 bootHalt를 빠뜨려 bootHalt-only halt 재시작 유실) · P1(token 카운터 임계미달 persist 실패가 non-reconstructable인데 래치 안 걸려 영구 undercount → 에스컬레이션 우회) → 래치 스코프 기준을 decision-locus에서 '잃은 상태의 재구성 가능성'(ADR-0004 point 7)으로 정정. 결정 불변, 배선·스코프 완결성 수정.
 ---
 
 # ADR-0013: 킬 스위치 미러 정합성은 disjoint block-carrier로 확보한다 — 3값 durable 미러 + sticky 미영속-pending 래치 + 단조 in-flight 카운터를 단일 잠금 스냅샷으로 읽는다
@@ -56,7 +56,7 @@ inspection이 반복적으로 window를 놓쳤으므로, 이 ADR을 쓰기 **전
 ### 상태 (전부 `mu` 보호)
 
 1. **`durableHalt` ∈ {none, pending, halted}** — store `HaltState.Phase`의 in-process 미러. `halted`로 올림은 durable `TripHalt` commit **성공 뒤에만**(durable-before-visible, ADR-0012). `none`으로 내림은 `ClearHalt`이 durable clear commit 성공 뒤에만(수동 전용, ADR-0004 point 6). 기동 시 `store.Halt()`에서 로드하며 `pending` 또는 `halted`면 halted로 기동(persistence-wins).
-2. **`unpersistedPending` 래치 (bool + `haltReason`, sticky)** — durable `MarkHaltPending`까지 실패한 트립(store 완전 다운 순간) 중 **결정이 durable tx 이전/외부에 성립한 것**(= count-first order-failure를 제외한 모든 트립 — decision-locus 스코프, 아래 참조)을 담는다. `store.Halt().Phase==none`이라 store read로는 안 보이는 "메모리에만 있는 pending"이다. **오직 `FinalizePendingHalt` 성공 또는 수동 `ClearHalt`만 내린다 — 카운터 감소로는 절대 안 내려간다.** 이것이 상태-동치 증명이 요구하는 필수 sticky 슬롯이다(= 이전 구현의 `mirrorPhase==pending && durablePhase==none`).
+2. **`unpersistedPending` 래치 (bool + `haltReason`, sticky)** — durable-error로 잃은 상태가 **재시작에 재도출 불가**한 트립(store 완전 다운 순간의 halt 결정 또는 non-reconstructable 카운터 증분 — count-first order-failure만 예외, 아래 "재구성 가능성" 절 참조)을 담는다. `store.Halt().Phase==none`이라 store read로는 안 보이는 "메모리에만 있는 pending"이다. **오직 `FinalizePendingHalt` 성공 또는 수동 `ClearHalt`만 내린다 — 카운터 감소로는 절대 안 내려간다.** 이것이 상태-동치 증명이 요구하는 필수 sticky 슬롯이다(= 이전 구현의 `mirrorPhase==pending && durablePhase==none`).
 3. **`inflightTrips` — 단조 atomic 카운터** — in-flight 트립 block을 **disjoint하게** 나른다. 각 트립 유발 경로가 자기 `+1`/`-1` 하나씩만 소유한다(소유권 모호성 0). **같은 `mu` 스냅샷 안에서 읽는다**(lock-free 아님).
 4. **`scanComplete`(재생성 게이트) · `bootHalt`(보수적 부팅-halt, #36) · `perSymbolBlocked`(메모리 전용).**
 
@@ -75,7 +75,7 @@ CanSubmit(sym) blocked iff:
 - **트립 유발 경로**(manual Trip global · ambiguous 에스컬레이션 · `ReportOrderFailure` · `ReportTokenRefreshFailure`):
   1. `mu` 하에서 `inflightTrips++` — 어떤 slow 대기(`haltMu`·store)보다 **먼저**(I1 즉시성).
   2. `haltMu` 획득.
-  3. `durableHalt==halted`면 idempotent no-op. 아니면 `MarkHaltPending`→`TripHalt` commit; 성공 시 `durableHalt=halted`(I3). durable **에러**면 아래 "durable-error 래치는 decision-locus로 스코프한다"대로 처리(대부분 sticky 래치 set — count-first order-failure만 예외). count-first(`ReportOrderFailure`/`ReportTokenRefreshFailure`)는 카운터 read+증가를 **같은 store tx 안에서** 하고(단일 writer가 임계 판정 직렬화 — ADR-0005), 임계 도달 시에만 `TripHalt`.
+  3. `durableHalt==halted`면 idempotent no-op. 아니면 `MarkHaltPending`→`TripHalt` commit; 성공 시 `durableHalt=halted`(I3). durable **에러**면 아래 "durable-error 래치는 '잃은 상태의 재구성 가능성'으로 스코프한다"대로 처리(재구성 불가 신호는 sticky 래치 set — count-first order-failure만 래치 없이 re-count로 복구). count-first(`ReportOrderFailure`/`ReportTokenRefreshFailure`)는 카운터 read+증가를 **같은 store tx 안에서** 하고(단일 writer가 임계 판정 직렬화 — ADR-0005), 임계 도달 시에만 `TripHalt`.
   4. `haltMu` 해제.
   5. `inflightTrips--` — **자기 block-carrier를 발행한 뒤에만**(I7 발행-선행-감소). 균형 유지 = liveness. durable-error/panic arm의 block hold는 카운터가 아니라 래치(또는 `durableHalt=halted`)가 붙든다.
   - **panic 처리**: `inflightTrips` inc..dec span **내부**(worker recover 경계보다 안쪽)에 recover 경계를 두어, panic 포착 시 dec가 카운터를 놓기 **전에** 보수적 halt로 승격한다. 승격 대상은 **재량이 아니라 decision-locus로 결정**한다(W-B): count-first order-failure(결정이 tx 내부·재구성 가능)만 in-memory `bootHalt` 승격을 허용하고, **그 밖 모든 트립(수동·ambiguous 에스컬레이션·토큰 갱신 실패 — 결정이 tx 이전에 성립했거나 재구성 불가)은 sticky 래치를 set**해 durable-survivable하게 만든다. 이로써 stuck-block(dec 누락)·fail-open(무보호 defer dec)·lost-halt(bootHalt 유실) 세 horn을 동시에 닫는다.
@@ -85,12 +85,14 @@ CanSubmit(sym) blocked iff:
 - **clean-shutdown 자격 (제약 ③, #36 소비)**: store read로 안 보이는 **in-memory-only halt**는 둘이다 — 래치(`unpersistedPending && durableHalt==none`)와 `bootHalt`(in-memory halted, durable 없음). 따라서 **`HasUnpersistedPendingHalt = (unpersistedPending && durableHalt==none) || bootHalt`** 로 정의하고, 이게 참이면 #36은 clean sentinel을 기록하지 않는다. `bootHalt`를 빠뜨리면(래치만 보면) bootHalt-only halt를 가진 run이 스스로를 clean으로 인증해 재시작이 durable `none`을 믿고 재개방한다 — line "manual `ClearHalt`까지" 계약 위반(codex P1). (order-failure panic→`bootHalt` 케이스는 재시작 reconciler re-count가 별도로 복구하지만, #36 보수적-boot `bootHalt`는 operator clear만이 풀 수 있으므로 clean 차단이 필수다.)
 - **`FinalizePendingHalt`**: 래치의 `haltReason`으로 `MarkHaltPending`→`TripHalt` 재커밋; 성공 시 `durableHalt=halted`+래치 clear, 실패 시 래치 유지(→ #36이 clean sentinel 기록 거부). #36은 finalize **전에** 리포터 경로를 quiesce한다. (`FinalizePendingHalt`는 래치를 durable로 승격하지만 `bootHalt`는 in-memory 계약이라 finalize 대상이 아니다 — `bootHalt`가 서 있으면 위 자격 술어가 clean을 막는다.)
 
-### durable-error 래치는 decision-locus로 스코프한다 (Fork 1 + 최종 하드닝 W-A — ADR-0004 point 7 / ADR-0012 Decision 1(c)·3)
+### durable-error 래치는 '잃은 상태의 재구성 가능성'으로 스코프한다 (Fork 1 + 최종 하드닝 W-A + codex P1(token counter) — ADR-0004 point 7 / ADR-0012 Decision 1(c)·3)
 
-durable-error의 **런타임 핫패스는 모든 경우 fail-closed**다(in-flight 창은 `inflightTrips>0`, 그 뒤는 아래 carrier가 붙든다). 차이는 **어떤 durable-error가 sticky 래치를 set해 유실을 막느냐**이고, 그 기준은 **트리거 라벨이 아니라 decision-locus** — "트립 결정이 durable tx 이전/외부에 이미 성립했는가"다. (라벨로 스코프하면 '재구성 가능'으로 분류된 ambiguous 에스컬레이션의 `MarkHaltPending` 실패가 유실된다 — 최종 하드닝 W-A.)
+durable-error의 **런타임 핫패스는 모든 경우 fail-closed**다(in-flight 창은 `inflightTrips>0`). 차이는 **어떤 durable-error가 sticky 래치를 set해 유실을 막느냐**이고, 진짜 기준은 **트리거 라벨도 decision-locus도 아니라 "잃은 durable 상태가 재시작에 재도출되는가"**다(ADR-0004 point 7 재시작 비대칭). decision-locus는 그 근사였을 뿐이라 정밀하지 않다 — token 카운터처럼 결정이 tx 내부여도 재구성 불가한 케이스가 있다(codex P1).
 
-- **`MarkHaltPending` 실패(durable=none 유지) → count-first order-failure를 제외한 모든 트립은 sticky 래치를 set한다.** 수동 Trip·ambiguous 에스컬레이션·토큰 갱신 실패는 트립 결정이 durable tx **밖/이전**(in-memory `ambiguous` 빈도 판정 · operator 조작 · 토큰 매니저 신호)에 성립했으므로, durable write가 실패해도 그 결정이 무효화되지 않는다 — 균형 `inflightTrips`가 dec로 block을 놓으면 유실된다. 래치가 `HasUnpersistedPendingHalt`로 노출돼 #36이 clean 종료를 거부하고 보수적 halted 부팅한다. **ambiguous의 이 하위케이스가 특히 load-bearing이다**: persistence-wins는 durable `pending`/`halted`에서만 작동하는데 `MarkHaltPending` 실패면 durable=none이라 INERT하고, live reconciler가 `unresolved-ambiguous` intent를 resolve하면 재계산 evidence마저 소멸한다 → 래치 없이는 live fail-open + 재시작 유실이다(ADR-0012 1(c)의 ambiguous 봉쇄는 `MarkHaltPending` **성공**=durable pending 기록을 전제했다).
-- **유일한 예외 — count-first order-failure**: 트립 결정(임계 crossing)이 **durable tx 내부**에서 성립하고 tx 원자 롤백이 그 결정 자체를 무효화한다(카운터 N−1). 실패 intent는 unresolved journal에 남아 **reconciler re-count로 복구**(ADR-0012 Decision 3)되므로, 래치 없이 `inflightTrips--` 후 block 해제가 정상이고 clean 종료를 허용한다(아래 Consequences의 live 블록-해제 창·delayed-halt 비용 참조).
+- **재구성 가능 — count-first order-failure만**: 실패 intent가 unresolved journal에 남고 durable 카운터가 원자 롤백되므로 **어떤 durable-error도** reconciler re-count(ADR-0012 Decision 3)로 복구된다 — 임계 미달 counter-persist 실패는 re-count가 카운트를 재충전하고, 임계 도달 `TripHalt` 실패는 re-count가 재-trip한다. **래치 없이 `inflightTrips--` 후 block 해제가 정상**이고 clean 종료를 허용한다(Consequences의 delayed-halt 창 참조).
+- **재구성 불가 — 그 밖 모든 durable-error**: 잃은 상태를 재시작이 재도출할 수 없으므로 **sticky 래치를 set**한다(`HasUnpersistedPendingHalt` → #36 clean 거부 → 보수적 halted 부팅). 균형 `inflightTrips`는 무조건 dec되므로 이 hold는 래치가 붙든다. 구체적으로:
+  - **수동 Trip·ambiguous 에스컬레이션의 `MarkHaltPending` 실패(durable=none)** — 트립 결정이 durable tx 밖/이전에 성립했고 재도출 경로가 없다. **ambiguous가 load-bearing**: persistence-wins는 durable `pending`/`halted`에서만 작동하는데 durable=none이라 INERT하고, live reconciler가 `unresolved-ambiguous` intent를 resolve하면 재계산 evidence마저 소멸한다 → 래치 없이는 live fail-open + 재시작 유실이다(ADR-0012 1(c)의 ambiguous 봉쇄는 `MarkHaltPending` **성공**=durable pending 기록을 전제했다 — W-A).
+  - **`ReportTokenRefreshFailure`의 카운터 persist 실패 — 임계 미달 포함** — 토큰 갱신 실패는 journal 대응물이 없어 잃은 카운터 증분을 re-count할 수 없다(ADR-0004 point 7 재구성 불가). 따라서 **임계 도달 전이어도** counter-persist tx가 실패하면 래치를 set한다. 안 그러면 store-error/graceful-shutdown 루프가 증분을 계속 잃어 **임계를 영영 못 채우고 에스컬레이션을 우회**한다(ADR-0004 point 7이 명시적으로 기각한 "임계 도달 전 재시작이 카운터 리셋" fail-open — codex P1). (order 카운터 persist 실패는 위 재구성-가능 arm이라 래치 불요 — re-count가 복구.)
 - **`TripHalt`만 실패(`MarkHaltPending`은 성공, durable=`pending`)**: 래치 불요 — durable `pending`이 이미 기록됐고 ADR-0012 persistence-wins + `store.Halt()` read가 재시작을 덮는다(unclean recovery가 pending을 halted 취급). 미러 `durableHalt`도 `pending`이라 핫패스가 계속 blocked.
 
 ### 불변식 (refined)
@@ -110,8 +112,8 @@ durable-error의 **런타임 핫패스는 모든 경우 fail-closed**다(in-flig
 - **핫패스+모든 전이를 단일 lock으로** — 기각: durable store I/O를 lock 하에 들고 있으면 `CanSubmit`이 그 뒤에서 블로킹된다(ADR-0004 point 5 핫패스 값싸게 위반). durable I/O는 `haltMu`로 직렬화하되 핫패스는 `mu`만 잡는다.
 - **`inflightTrips`를 lock-free로(mu 밖) 읽기** — 기각: `durableHalt`와 카운터를 다른 시점에 읽어 torn-read("durableHalt 방금 none됐는데 카운터 아직 안 올라온" 또는 그 반대). 단일 `mu` 스냅샷이 ~0 비용으로 닫는다(래치가 이미 핫패스에 `mu`를 강제하므로 카운터가 같은 스냅샷에 공짜 합류).
 - **Reconfirm에 generation edge-detector 유지(Fork 4)** — 기각: 정당하게 clear된 halt를 과-차단한다(Reserve~Reconfirm 창 안 trip-then-clear는 ADR-0004 point 1 level 의미론상 "cleared → 진행"이 옳다). 카운터가 no-clobber를 담당하므로 level 재평가로 충분하다.
-- **count-first order-failure에도 sticky 래치 적용(Fork 1)** — 기각: order 연속 실패는 결정이 durable tx **내부**에서 성립하고(재구성 가능 — durable 카운터 롤백이 결정을 무효화 + reconciler re-count, ADR-0012 Decision 3), 래치·보수적 boot는 order 실패 중 일시적 store blip마다 불필요한 보수적 halted 부팅을 강제한다(무인성 비용). 래치는 **결정이 tx 이전/외부에 성립한 트립**(decision-locus)에만 — order-failure만 예외.
-- **래치를 '트리거 라벨(재구성 가능/불가)'로 스코프(초안 버전)** — 기각(최종 하드닝 W-A): ambiguous 에스컬레이션을 '재구성 가능'으로 분류해 래치를 안 걸면, 그 `MarkHaltPending` 실패 시 persistence-wins가 INERT(durable=none)하고 live reconciler가 evidence를 지워 live fail-open + 재시작 유실이 된다. 스코프 기준을 라벨이 아니라 **decision-locus**로 바꿔야 이 하위케이스가 닫힌다.
+- **count-first order-failure에도 sticky 래치 적용(Fork 1)** — 기각: order 연속 실패는 **재구성 가능**(durable 카운터 롤백 + unresolved journal intent + reconciler re-count, ADR-0012 Decision 3)이라 어떤 durable-error도 재시작에 복구된다. 래치·보수적 boot는 order 실패 중 일시적 store blip마다 불필요한 보수적 halted 부팅을 강제한다(무인성 비용). 래치는 **재구성 불가한 잃은 상태**에만 — order-failure만 예외.
+- **래치를 decision-locus로 스코프(중간 버전)** — 기각(codex P1): decision-locus("결정이 tx 밖/이전에 성립했나")는 근사일 뿐이다 — `ReportTokenRefreshFailure`는 결정이 tx 내부(임계 판정)여도 잃은 카운터 증분이 재구성 불가(journal 없음)라, 임계 미달 counter-persist 실패가 영구 undercount되어 에스컬레이션을 우회한다. 진짜 기준은 **잃은 durable 상태의 재구성 가능성**이다(ADR-0004 point 7). (그 전 '트리거 라벨' 스코프는 W-A로 이미 기각.)
 
 ## Consequences
 
