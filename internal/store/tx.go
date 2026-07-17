@@ -19,9 +19,20 @@ type Tx interface {
 	ResolveIntent(ctx context.Context, intentID, resolution string) error
 	LoadUnresolvedIntents(ctx context.Context) ([]Intent, error)
 
+	// MarkHaltPending transitions the global halt to pending (trip durably
+	// initiated but not completed). TripHalt completes it (→ halted); ClearHalt
+	// resets it (→ none). Halt loads the current phase. killswitch owns which
+	// transition to run and when (ADR-0012 Decision 1(c)/2).
+	MarkHaltPending(ctx context.Context, reason string) error
 	TripHalt(ctx context.Context, reason string) error
 	ClearHalt(ctx context.Context) error
 	Halt(ctx context.Context) (HaltState, error)
+
+	// SetLifecycle atomically sets the single-row clean-shutdown sentinel,
+	// overwriting the previous value in the same write. Lifecycle loads it. store
+	// is passive: it persists exactly what it is told and never auto-flips.
+	SetLifecycle(ctx context.Context, s LifecycleState) error
+	Lifecycle(ctx context.Context) (LifecycleState, error)
 
 	SetCounter(ctx context.Context, c Counter) error
 	Counter(ctx context.Context, name string) (Counter, error)
@@ -55,11 +66,20 @@ func (t *txn) ResolveIntent(ctx context.Context, intentID, resolution string) er
 func (t *txn) LoadUnresolvedIntents(ctx context.Context) ([]Intent, error) {
 	return loadUnresolvedIntents(ctx, t.q)
 }
+func (t *txn) MarkHaltPending(ctx context.Context, reason string) error {
+	return markHaltPending(ctx, t.q, reason)
+}
 func (t *txn) TripHalt(ctx context.Context, reason string) error {
 	return tripHalt(ctx, t.q, reason)
 }
 func (t *txn) ClearHalt(ctx context.Context) error         { return clearHalt(ctx, t.q) }
 func (t *txn) Halt(ctx context.Context) (HaltState, error) { return readHalt(ctx, t.q) }
+func (t *txn) SetLifecycle(ctx context.Context, s LifecycleState) error {
+	return setLifecycle(ctx, t.q, s)
+}
+func (t *txn) Lifecycle(ctx context.Context) (LifecycleState, error) {
+	return readLifecycle(ctx, t.q)
+}
 func (t *txn) SetCounter(ctx context.Context, c Counter) error {
 	return setCounter(ctx, t.q, c)
 }
@@ -194,9 +214,27 @@ func loadMarkers(ctx context.Context, q querier, intentID string) ([]Marker, err
 	return out, nil
 }
 
+// markHaltPending moves the global halt to the pending phase (ADR-0012 Decision
+// 1(c)). tripped_at is set on the first transition out of none and preserved
+// afterwards (COALESCE) so it records when the trip was initiated, not when it
+// completed. A clear resets tripped_at to NULL, so the next trip stamps a fresh
+// time.
+func markHaltPending(ctx context.Context, q querier, reason string) error {
+	if _, err := q.ExecContext(ctx,
+		`UPDATE halt SET state = 'pending', reason = ?, tripped_at = COALESCE(tripped_at, ?) WHERE id = 1`,
+		reason, time.Now().UnixNano(),
+	); err != nil {
+		return fmt.Errorf("store: mark halt pending: %w", err)
+	}
+	return nil
+}
+
+// tripHalt completes the trip (→ halted). It works both directly from none (the
+// count-first single-tx path, ADR-0012 Decision 3) and from pending, preserving
+// the trip-initiation tripped_at across pending→halted (COALESCE).
 func tripHalt(ctx context.Context, q querier, reason string) error {
 	if _, err := q.ExecContext(ctx,
-		`UPDATE halt SET halted = 1, reason = ?, tripped_at = ? WHERE id = 1`,
+		`UPDATE halt SET state = 'halted', reason = ?, tripped_at = COALESCE(tripped_at, ?) WHERE id = 1`,
 		reason, time.Now().UnixNano(),
 	); err != nil {
 		return fmt.Errorf("store: trip halt: %w", err)
@@ -206,7 +244,7 @@ func tripHalt(ctx context.Context, q querier, reason string) error {
 
 func clearHalt(ctx context.Context, q querier) error {
 	if _, err := q.ExecContext(ctx,
-		`UPDATE halt SET halted = 0, reason = '', tripped_at = NULL WHERE id = 1`,
+		`UPDATE halt SET state = 'none', reason = '', tripped_at = NULL WHERE id = 1`,
 	); err != nil {
 		return fmt.Errorf("store: clear halt: %w", err)
 	}
@@ -215,20 +253,41 @@ func clearHalt(ctx context.Context, q querier) error {
 
 func readHalt(ctx context.Context, q querier) (HaltState, error) {
 	var (
-		halted    int
+		state     string
 		reason    string
 		trippedAt sql.NullInt64
 	)
-	err := q.QueryRowContext(ctx, `SELECT halted, reason, tripped_at FROM halt WHERE id = 1`).
-		Scan(&halted, &reason, &trippedAt)
+	err := q.QueryRowContext(ctx, `SELECT state, reason, tripped_at FROM halt WHERE id = 1`).
+		Scan(&state, &reason, &trippedAt)
 	if err != nil {
 		return HaltState{}, fmt.Errorf("store: read halt: %w", err)
 	}
-	hs := HaltState{Halted: halted != 0, Reason: reason}
+	hs := HaltState{Phase: HaltPhase(state), Reason: reason}
 	if trippedAt.Valid {
 		hs.TrippedAt = time.Unix(0, trippedAt.Int64)
 	}
 	return hs, nil
+}
+
+// setLifecycle overwrites the single-row clean-shutdown sentinel in one write, so
+// the previous value cannot coexist with the new one (ADR-0012 Decision 1(c)).
+// An unknown value is rejected by the table CHECK, which surfaces as an error —
+// store returns truth or error, never a silently-coerced state.
+func setLifecycle(ctx context.Context, q querier, s LifecycleState) error {
+	if _, err := q.ExecContext(ctx,
+		`UPDATE lifecycle SET state = ? WHERE id = 1`, string(s),
+	); err != nil {
+		return fmt.Errorf("store: set lifecycle %q: %w", s, err)
+	}
+	return nil
+}
+
+func readLifecycle(ctx context.Context, q querier) (LifecycleState, error) {
+	var state string
+	if err := q.QueryRowContext(ctx, `SELECT state FROM lifecycle WHERE id = 1`).Scan(&state); err != nil {
+		return "", fmt.Errorf("store: read lifecycle: %w", err)
+	}
+	return LifecycleState(state), nil
 }
 
 func setCounter(ctx context.Context, q querier, c Counter) error {

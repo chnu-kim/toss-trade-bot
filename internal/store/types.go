@@ -55,15 +55,54 @@ type Marker struct {
 	At       time.Time
 }
 
-// HaltState is the persisted global halt (ADR-0004). It survives restarts so a
-// restart cannot become a safety-guard bypass. store persists and reads it;
-// killswitch owns the decision to trip and the manual-reset policy. TrippedAt
-// is zero when not halted.
+// HaltPhase is the durable lifecycle of the global halt (ADR-0012 Decision 1(c)).
+// It is a 2-phase trip so an unclean recovery can distinguish "a trip was durably
+// initiated but not completed" (pending) from "no trip" (none) — store exposes
+// the raw phase and the consumer (#32 killswitch / #36 cmd/bot) owns the judgment
+// of whether pending should be treated as halted. store never interprets it.
+type HaltPhase string
+
+const (
+	// HaltNone is the untripped state: no global halt is in effect.
+	HaltNone HaltPhase = "none"
+	// HaltPending means a trip has been durably initiated but TripHalt has not
+	// yet completed. Because store is writable while pending is durable, an
+	// unclean recovery reads pending and can treat it as halted (persistence-wins,
+	// ADR-0012 Decision 1(c)) — closing the window where the reconciler resolves
+	// away the reconstruction evidence before the halt is finalized.
+	HaltPending HaltPhase = "pending"
+	// HaltHalted is the completed global halt. It survives restarts and is cleared
+	// only by an explicit human reset (ADR-0004 point 6).
+	HaltHalted HaltPhase = "halted"
+)
+
+// HaltState is the persisted global halt (ADR-0004, ADR-0012). It survives
+// restarts so a restart cannot become a safety-guard bypass. store persists and
+// reads it; killswitch owns the decision to trip, the pending→halted judgment,
+// and the manual-reset policy. TrippedAt records when the trip was first
+// initiated (preserved across pending→halted) and is zero when Phase is none.
 type HaltState struct {
-	Halted    bool
+	Phase     HaltPhase
 	Reason    string
 	TrippedAt time.Time
 }
+
+// LifecycleState is the clean-shutdown sentinel (ADR-0012 Decision 1(c)). It is a
+// single durable lifecycle value, never two coexisting records, so a crash can
+// never leave a stale clean beside a running (sentinel fail-open #1). store
+// exposes an atomic set/get seam only; cmd/bot (#36) owns the eligibility rules
+// ("when may a clean be written", "unclean ⇒ conservative halted boot").
+type LifecycleState string
+
+const (
+	// LifecycleRunning is the conservative, not-known-clean value: set atomically
+	// at boot before submissions open, and the default for a fresh or migrated DB
+	// that has recorded no clean shutdown. An unclean exit leaves it running.
+	LifecycleRunning LifecycleState = "running"
+	// LifecycleClean is written only by a graceful shutdown that has no unresolved
+	// non-durable halt (the eligibility rule lives in the consumer, not store).
+	LifecycleClean LifecycleState = "clean"
+)
 
 // Counter is a reconstruction-resistant persistent counter (ADR-0004 point 7),
 // e.g. token-refresh failures a restart must not reset to zero. WindowStart is

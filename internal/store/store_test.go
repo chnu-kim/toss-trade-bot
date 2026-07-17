@@ -62,7 +62,8 @@ func TestDurabilityPragmas(t *testing.T) {
 }
 
 // TestMigrationVersion checks the migration framework: a fresh file lands at the
-// V1 user_version, and reopening is a no-op that leaves the version unchanged.
+// latest user_version, and reopening is a no-op that leaves the version
+// unchanged.
 func TestMigrationVersion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.db")
 
@@ -74,8 +75,8 @@ func TestMigrationVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("schemaVersion: %v", err)
 	}
-	if v != schemaVersionV1 {
-		t.Fatalf("schema version = %d, want %d", v, schemaVersionV1)
+	if v != schemaVersionV2 {
+		t.Fatalf("schema version = %d, want %d", v, schemaVersionV2)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -91,8 +92,8 @@ func TestMigrationVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("schemaVersion (reopen): %v", err)
 	}
-	if v2 != schemaVersionV1 {
-		t.Fatalf("schema version after reopen = %d, want %d", v2, schemaVersionV1)
+	if v2 != schemaVersionV2 {
+		t.Fatalf("schema version after reopen = %d, want %d", v2, schemaVersionV2)
 	}
 }
 
