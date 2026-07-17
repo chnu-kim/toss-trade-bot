@@ -97,7 +97,13 @@ type fakeAudit struct {
 	failClosedOn string // marker to fail-close on; "" = never
 }
 
-func (a *fakeAudit) EmitOrderLifecycle(_ context.Context, ev audit.OrderLifecycleEvent) (audit.Ack, error) {
+func (a *fakeAudit) EmitOrderLifecycle(ctx context.Context, ev audit.OrderLifecycleEvent) (audit.Ack, error) {
+	// Mirror the real *audit.Writer contract: it checks ctx.Err() first and returns
+	// it (a NON-fail-closed error) before writing anything. This is what makes a
+	// caller-cancelled emit skip the record — the fail-open the detach must close.
+	if err := ctx.Err(); err != nil {
+		return audit.Ack{}, err
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.events = append(a.events, ev)
@@ -105,6 +111,49 @@ func (a *fakeAudit) EmitOrderLifecycle(_ context.Context, ev audit.OrderLifecycl
 		return audit.Ack{}, &audit.FailClosedError{Op: "test", Err: errors.New("disk full")}
 	}
 	return audit.Ack{IdempotencyKey: ev.IntentID + ":" + ev.Marker}, nil
+}
+
+func (a *fakeAudit) hasMarker(marker string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, e := range a.events {
+		if e.Marker == marker {
+			return true
+		}
+	}
+	return false
+}
+
+// cancelAfterAppend is a journal decorator that cancels the caller ctx the instant
+// a chosen marker's own durable write succeeds, exercising the window between a
+// committed marker and its mandatory audit emit. The underlying marker write ran
+// on the (still-live) caller ctx and committed; only what comes AFTER sees the
+// cancellation.
+type cancelAfterAppend struct {
+	inner    journal
+	cancel   context.CancelFunc
+	onIntent bool             // cancel right after AppendIntent (the prepared marker)
+	onMarker store.MarkerKind // cancel right after this AppendMarker kind ("" = none)
+}
+
+func (c *cancelAfterAppend) AppendIntent(ctx context.Context, in store.Intent) error {
+	err := c.inner.AppendIntent(ctx, in)
+	if err == nil && c.onIntent {
+		c.cancel()
+	}
+	return err
+}
+
+func (c *cancelAfterAppend) AppendMarker(ctx context.Context, intentID string, kind store.MarkerKind, orderID string) error {
+	err := c.inner.AppendMarker(ctx, intentID, kind, orderID)
+	if err == nil && c.onMarker != "" && kind == c.onMarker {
+		c.cancel()
+	}
+	return err
+}
+
+func (c *cancelAfterAppend) LoadUnresolvedIntents(ctx context.Context) ([]store.Intent, error) {
+	return c.inner.LoadUnresolvedIntents(ctx)
 }
 
 func (a *fakeAudit) markers() []string {
@@ -633,6 +682,68 @@ func TestSubmitIntentAckSurvivesCallerCancel(t *testing.T) {
 	last := in.Markers[len(in.Markers)-1]
 	if last.Kind != store.MarkerAcked || last.OrderID != "ord-live" {
 		t.Fatalf("acked marker = %+v, want orderId ord-live durably recorded", last)
+	}
+}
+
+// TestSubmitIntentPreparedAuditSurvivesCallerCancel pins ADR-0006: the audit
+// record for a COMMITTED marker is mandatory and its absence must never be a
+// silent skip. Here the caller ctx is cancelled the instant the prepared marker is
+// durably committed; the prepared audit record must still be written (the emit is
+// cancellation-immune), and — since cancellation is not a durability failure — no
+// global halt trips. Without the detach this is a fail-open hole: a durable marker
+// with no audit and no halt.
+func TestSubmitIntentPreparedAuditSurvivesCallerCancel(t *testing.T) {
+	st := newStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fa := &fakeAudit{}
+	g := allowingGuard()
+	api := &stubAPI{resp: OrderResponse{OrderID: "ord-1"}}
+	j := &cancelAfterAppend{inner: st, cancel: cancel, onIntent: true}
+
+	sub, err := NewSubmitter(SubmitterConfig{
+		Journal: j, Audit: fa, Guard: g, API: api, AccountSeq: 1, Wake: func() {},
+	})
+	if err != nil {
+		t.Fatalf("NewSubmitter: %v", err)
+	}
+	// The submit itself will not complete (the caller ctx is cancelled right after
+	// prepared, so the later submit-attempted marker write aborts) — that is fine.
+	// What must hold is that the prepared marker's mandatory audit was NOT skipped.
+	_, _ = sub.SubmitIntent(ctx, Intent{IntentID: "i1", Request: validReq("AAPL")})
+
+	if !fa.hasMarker(string(store.MarkerPrepared)) {
+		t.Fatalf("prepared audit record missing after caller cancel — fail-open (committed marker, no audit)")
+	}
+	if g.tripCount() != 0 {
+		t.Fatalf("caller cancel tripped the halt %d time(s); cancellation is not a durability failure", g.tripCount())
+	}
+}
+
+// TestSubmitIntentSubmitAttemptedAuditSurvivesCallerCancel is the submit-attempted
+// twin of the prepared test above (same fail-open class).
+func TestSubmitIntentSubmitAttemptedAuditSurvivesCallerCancel(t *testing.T) {
+	st := newStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fa := &fakeAudit{}
+	g := allowingGuard()
+	api := &stubAPI{resp: OrderResponse{OrderID: "ord-1"}}
+	j := &cancelAfterAppend{inner: st, cancel: cancel, onMarker: store.MarkerSubmitAttempted}
+
+	sub, err := NewSubmitter(SubmitterConfig{
+		Journal: j, Audit: fa, Guard: g, API: api, AccountSeq: 1, Wake: func() {},
+	})
+	if err != nil {
+		t.Fatalf("NewSubmitter: %v", err)
+	}
+	_, _ = sub.SubmitIntent(ctx, Intent{IntentID: "i1", Request: validReq("AAPL")})
+
+	if !fa.hasMarker(string(store.MarkerSubmitAttempted)) {
+		t.Fatalf("submit-attempted audit record missing after caller cancel — fail-open")
+	}
+	if g.tripCount() != 0 {
+		t.Fatalf("caller cancel tripped the halt %d time(s); cancellation is not a durability failure", g.tripCount())
 	}
 }
 

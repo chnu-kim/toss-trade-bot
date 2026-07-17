@@ -204,14 +204,23 @@ func NewSubmitter(cfg SubmitterConfig) (*Submitter, error) {
 	}, nil
 }
 
-// ackPersistTimeout bounds the post-POST critical section that durably records an
-// accepted order's orderId (the acked marker + its audit emit). That section is
-// detached from the caller's ctx (ADR-0002 point 3 — the sole truth handle must
-// survive caller cancellation), but it is still bounded so a wedged disk cannot
+// These timeouts bound the two critical sections that must durably record an
+// irreversible fact regardless of caller cancellation (ADR-0002 point 3 /
+// ADR-0006). They are detached from the caller ctx (context.WithoutCancel) so a
+// cancelled caller cannot drop the record, yet bounded so a wedged disk cannot
 // hang the submit goroutine forever (unattended safety). A local fsync-durable
-// marker write plus an audit fsync finish well within this bound; it exists only
-// to cap a pathological stall.
-const ackPersistTimeout = 30 * time.Second
+// write finishes well within these bounds; they exist only to cap a pathological
+// stall.
+const (
+	// ackPersistTimeout bounds recording an accepted order's orderId (the acked
+	// marker write — the sole truth handle must survive caller cancellation).
+	ackPersistTimeout = 30 * time.Second
+	// auditPersistTimeout bounds each mandatory lifecycle-audit emit. emit always
+	// runs AFTER its marker is already durably committed, so the audit for a
+	// committed marker must not be skippable by caller cancellation — that would
+	// leave a durable marker with neither its mandatory audit nor a fail-closed halt.
+	auditPersistTimeout = 30 * time.Second
+)
 
 // SubmitIntent runs the fail-closed 2-marker write-ahead submit sequence for one
 // strategy intent, making at most one POST. The sequence (ADR-0002/0003/0004/
@@ -358,7 +367,10 @@ func (s *Submitter) SubmitIntent(ctx context.Context, intent Intent) (Outcome, e
 		return Outcome{Status: StatusUnresolved, IntentID: intent.IntentID, OrderID: resp.OrderID,
 			Reason: fmt.Sprintf("acked marker write failed: %v", err)}, nil
 	}
-	if err := s.emit(ackCtx, intent.IntentID, resp.OrderID, store.MarkerAcked); err != nil {
+	// emit is self-contained cancellation-immune (it detaches internally), so it
+	// takes the plain ctx; the acked MARKER write above needs the explicit ackCtx
+	// because its orderId persistence is a separate irreversible-handle concern.
+	if err := s.emit(ctx, intent.IntentID, resp.OrderID, store.MarkerAcked); err != nil {
 		// The order is placed and acked durably; the global halt tripped inside emit
 		// stops further submits. Surface the fail-closed error but report the orderId.
 		return Outcome{Status: StatusAcked, IntentID: intent.IntentID, OrderID: resp.OrderID,
@@ -406,7 +418,19 @@ func duplicateOutcome(in store.Intent) Outcome {
 // returns the wrapped error. A non-fail-closed emit error (ctx cancel, oversize
 // record) is returned WITHOUT a trip: it is not a durability-medium failure.
 func (s *Submitter) emit(ctx context.Context, intentID, orderID string, marker store.MarkerKind) error {
-	_, err := s.audit.EmitOrderLifecycle(ctx, audit.OrderLifecycleEvent{
+	// emit is ALWAYS invoked right after the marker's own durable commit succeeded
+	// (prepared←AppendIntent, submit-attempted/acked←AppendMarker). By ADR-0006 the
+	// audit record for a committed marker is MANDATORY, and a durable-write failure
+	// must fail-closed (point 6). This record must therefore not be skippable by
+	// caller cancellation: a committed marker with neither its audit nor a halt would
+	// be a fail-open hole. So detach from the caller ctx here — uniformly for all
+	// three transitions, mirroring the acked marker's own cancellation-immune
+	// persistence — bounded so a wedged disk cannot hang the submit goroutine. Only a
+	// genuine durability failure now reaches the fail-closed branch below; a cancelled
+	// caller no longer masquerades as a non-durable (silently skipped) emit.
+	auditCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), auditPersistTimeout)
+	defer cancel()
+	_, err := s.audit.EmitOrderLifecycle(auditCtx, audit.OrderLifecycleEvent{
 		IntentID:   intentID,
 		OrderID:    orderID,
 		Marker:     string(marker),
@@ -417,7 +441,7 @@ func (s *Submitter) emit(ctx context.Context, intentID, orderID string, marker s
 	}
 	if audit.IsFailClosed(err) {
 		reason := "audit-fail-closed:" + string(marker)
-		if tripErr := s.guard.Trip(ctx, killswitch.ScopeGlobal, "", reason, s.now()); tripErr != nil {
+		if tripErr := s.guard.Trip(auditCtx, killswitch.ScopeGlobal, "", reason, s.now()); tripErr != nil {
 			return fmt.Errorf("order: audit fail-closed at %s AND global trip failed: %w (trip: %v)", marker, err, tripErr)
 		}
 		return fmt.Errorf("order: audit fail-closed at %s, global halt tripped: %w", marker, err)
