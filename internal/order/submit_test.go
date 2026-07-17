@@ -90,10 +90,11 @@ func (g *fakeGuard) tripCount() int {
 func allowingGuard() *fakeGuard { return &fakeGuard{canOK: true, reconfirmOK: true} }
 
 // fakeAudit is an auditSink that records the marker of every lifecycle emit and
-// can be told to fail-closed on a specific marker.
+// every error emit, and can be told to fail-closed on a specific marker.
 type fakeAudit struct {
 	mu           sync.Mutex
 	events       []audit.OrderLifecycleEvent
+	errs         []audit.ErrorEvent
 	failClosedOn string // marker to fail-close on; "" = never
 }
 
@@ -113,6 +114,16 @@ func (a *fakeAudit) EmitOrderLifecycle(ctx context.Context, ev audit.OrderLifecy
 	return audit.Ack{IdempotencyKey: ev.IntentID + ":" + ev.Marker}, nil
 }
 
+func (a *fakeAudit) EmitError(ctx context.Context, ev audit.ErrorEvent) (audit.Ack, error) {
+	if err := ctx.Err(); err != nil {
+		return audit.Ack{}, err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.errs = append(a.errs, ev)
+	return audit.Ack{IdempotencyKey: ev.IntentID + ":" + ev.Operation}, nil
+}
+
 func (a *fakeAudit) hasMarker(marker string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -122,6 +133,47 @@ func (a *fakeAudit) hasMarker(marker string) bool {
 		}
 	}
 	return false
+}
+
+// preservedOrderID reports whether an ERROR audit record carrying orderID was
+// emitted — the orphan-orderId preservation on the independent audit medium.
+func (a *fakeAudit) preservedOrderID(orderID string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, e := range a.errs {
+		if e.OrderID == orderID {
+			return true
+		}
+	}
+	return false
+}
+
+// failOnAppend is a journal decorator that injects a durable-write error for a
+// chosen marker over a real underlying store, to exercise the store-failure
+// fail-closed paths.
+type failOnAppend struct {
+	inner      journal
+	failIntent bool             // fail AppendIntent (the prepared marker)
+	failMarker store.MarkerKind // fail this AppendMarker kind ("" = none)
+	err        error
+}
+
+func (f *failOnAppend) AppendIntent(ctx context.Context, in store.Intent) error {
+	if f.failIntent {
+		return f.err
+	}
+	return f.inner.AppendIntent(ctx, in)
+}
+
+func (f *failOnAppend) AppendMarker(ctx context.Context, intentID string, kind store.MarkerKind, orderID string) error {
+	if f.failMarker != "" && kind == f.failMarker {
+		return f.err
+	}
+	return f.inner.AppendMarker(ctx, intentID, kind, orderID)
+}
+
+func (f *failOnAppend) LoadUnresolvedIntents(ctx context.Context) ([]store.Intent, error) {
+	return f.inner.LoadUnresolvedIntents(ctx)
 }
 
 // cancelAfterAppend is a journal decorator that cancels the caller ctx the instant
@@ -744,6 +796,143 @@ func TestSubmitIntentSubmitAttemptedAuditSurvivesCallerCancel(t *testing.T) {
 	}
 	if g.tripCount() != 0 {
 		t.Fatalf("caller cancel tripped the halt %d time(s); cancellation is not a durability failure", g.tripCount())
+	}
+}
+
+// TestSubmitIntentAckedStoreFailureTripsGlobal pins ADR-0005 point 6 for the most
+// acute store failure: after the POST is ACCEPTED (order live, irreversible), a
+// genuine acked-marker durable-write failure must (a) preserve the orderId on the
+// independent audit medium, (b) trip the GLOBAL halt (not a per-symbol block — a
+// store medium failure is system-wide), (c) return a HARD error, and never
+// auto-resubmit. A real kill-switch (over a healthy store) observes the durable
+// trip; the acked write fails only through the order journal decorator.
+func TestSubmitIntentAckedStoreFailureTripsGlobal(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	ks := newKill(t, st)
+	fa := &fakeAudit{}
+	api := &stubAPI{resp: OrderResponse{OrderID: "ord-live"}}
+	var wake wakeSpy
+	j := &failOnAppend{inner: st, failMarker: store.MarkerAcked, err: errors.New("disk full")}
+
+	sub, err := NewSubmitter(SubmitterConfig{
+		Journal: j, Audit: fa, Guard: ks, API: api, AccountSeq: 1, Wake: wake.wake,
+	})
+	if err != nil {
+		t.Fatalf("NewSubmitter: %v", err)
+	}
+	out, err := sub.SubmitIntent(ctx, Intent{IntentID: "i1", Request: validReq("AAPL")})
+	if err == nil {
+		t.Fatalf("acked store failure returned nil error (fail-open); want a hard error")
+	}
+	if out.OrderID != "ord-live" {
+		t.Fatalf("outcome OrderID = %q, want ord-live carried through", out.OrderID)
+	}
+	// (a) orderId preserved on the independent audit channel.
+	if !fa.preservedOrderID("ord-live") {
+		t.Fatalf("orderId not preserved to the audit channel — the sole truth handle was lost")
+	}
+	// (b) global halt tripped, durably.
+	if allowed, _ := ks.CanSubmit("AAPL"); allowed {
+		t.Fatalf("global halt not tripped after acked store failure")
+	}
+	hs, herr := st.Halt(ctx)
+	if herr != nil {
+		t.Fatalf("Halt: %v", herr)
+	}
+	if hs.Phase != store.HaltHalted {
+		t.Fatalf("durable halt phase = %q, want halted", hs.Phase)
+	}
+	// no auto-resubmit.
+	if api.calls() != 1 {
+		t.Fatalf("POST calls = %d, want exactly 1 (no resubmit on store failure)", api.calls())
+	}
+}
+
+// TestSubmitIntentSubmitAttemptedStoreFailureTripsGlobal pins ADR-0005 point 6 for
+// the submit-attempted marker: a durable-write failure trips the global halt,
+// returns a hard error, and the POST never happens.
+func TestSubmitIntentSubmitAttemptedStoreFailureTripsGlobal(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	ks := newKill(t, st)
+	api := &stubAPI{resp: OrderResponse{OrderID: "ord-x"}}
+	j := &failOnAppend{inner: st, failMarker: store.MarkerSubmitAttempted, err: errors.New("disk full")}
+
+	sub, err := NewSubmitter(SubmitterConfig{
+		Journal: j, Audit: &fakeAudit{}, Guard: ks, API: api, AccountSeq: 1, Wake: func() {},
+	})
+	if err != nil {
+		t.Fatalf("NewSubmitter: %v", err)
+	}
+	if _, err := sub.SubmitIntent(ctx, Intent{IntentID: "i1", Request: validReq("AAPL")}); err == nil {
+		t.Fatalf("submit-attempted store failure returned nil error; want a hard error")
+	}
+	if allowed, _ := ks.CanSubmit("AAPL"); allowed {
+		t.Fatalf("global halt not tripped after submit-attempted store failure")
+	}
+	if api.calls() != 0 {
+		t.Fatalf("POST calls = %d, want 0 (fail-closed before the irreversible submit)", api.calls())
+	}
+}
+
+// TestSubmitIntentPreparedStoreFailureTripsGlobal pins ADR-0005 point 6 for the
+// prepared marker's GENUINE failure (distinct from the PK-race replay branch, which
+// stays a duplicate with no trip): it trips the global halt, returns a hard error,
+// and no POST happens.
+func TestSubmitIntentPreparedStoreFailureTripsGlobal(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	ks := newKill(t, st)
+	api := &stubAPI{resp: OrderResponse{OrderID: "ord-x"}}
+	j := &failOnAppend{inner: st, failIntent: true, err: errors.New("disk full")}
+
+	sub, err := NewSubmitter(SubmitterConfig{
+		Journal: j, Audit: &fakeAudit{}, Guard: ks, API: api, AccountSeq: 1, Wake: func() {},
+	})
+	if err != nil {
+		t.Fatalf("NewSubmitter: %v", err)
+	}
+	if _, err := sub.SubmitIntent(ctx, Intent{IntentID: "i1", Request: validReq("AAPL")}); err == nil {
+		t.Fatalf("prepared store failure returned nil error; want a hard error")
+	}
+	if allowed, _ := ks.CanSubmit("AAPL"); allowed {
+		t.Fatalf("global halt not tripped after prepared store failure")
+	}
+	if api.calls() != 0 {
+		t.Fatalf("POST calls = %d, want 0", api.calls())
+	}
+}
+
+// TestSubmitIntentCallerCancelAtSubmitAttemptedDoesNotTrip pins the counterpart to
+// the store-failure tests: a pre-POST marker write that fails because the CALLER
+// cancelled (not because the medium failed) is a clean abort — it returns a hard
+// error but must NOT trip the global halt (ADR-0005 point 6 escalates a durability
+// medium failure, not caller cancellation). Here the caller ctx is cancelled right
+// after prepared commits, so the subsequent submit-attempted write fails with
+// context.Canceled.
+func TestSubmitIntentCallerCancelAtSubmitAttemptedDoesNotTrip(t *testing.T) {
+	st := newStore(t)
+	ks := newKill(t, st)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	api := &stubAPI{}
+	j := &cancelAfterAppend{inner: st, cancel: cancel, onIntent: true}
+
+	sub, err := NewSubmitter(SubmitterConfig{
+		Journal: j, Audit: newAudit(t), Guard: ks, API: api, AccountSeq: 1, Wake: func() {},
+	})
+	if err != nil {
+		t.Fatalf("NewSubmitter: %v", err)
+	}
+	if _, err := sub.SubmitIntent(ctx, Intent{IntentID: "i1", Request: validReq("AAPL")}); err == nil {
+		t.Fatalf("expected an abort error when the caller cancels mid-submit")
+	}
+	if allowed, _ := ks.CanSubmit("AAPL"); !allowed {
+		t.Fatalf("caller cancellation tripped the global halt; a clean pre-POST abort must not (contrast store-failure)")
+	}
+	if api.calls() != 0 {
+		t.Fatalf("POST calls = %d, want 0", api.calls())
 	}
 }
 

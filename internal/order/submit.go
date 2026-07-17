@@ -3,6 +3,7 @@ package order
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -56,9 +57,12 @@ type journal interface {
 
 // auditSink is the synchronous-durable audit seam (ADR-0006). *audit.Writer
 // satisfies it; a FailClosedError from EmitOrderLifecycle is the non-durable
-// signal order escalates on.
+// signal order escalates on. EmitError durably preserves an orphaned orderId when
+// the journal itself fails (a diagnostic record on the audit's INDEPENDENT durable
+// medium — ADR-0006 point 6 — so the sole truth handle is not lost outright).
 type auditSink interface {
 	EmitOrderLifecycle(ctx context.Context, ev audit.OrderLifecycleEvent) (audit.Ack, error)
+	EmitError(ctx context.Context, ev audit.ErrorEvent) (audit.Ack, error)
 }
 
 // guard is the fail-closed kill-switch seam (ADR-0004). CanSubmit gates the edge
@@ -204,23 +208,15 @@ func NewSubmitter(cfg SubmitterConfig) (*Submitter, error) {
 	}, nil
 }
 
-// These timeouts bound the two critical sections that must durably record an
-// irreversible fact regardless of caller cancellation (ADR-0002 point 3 /
-// ADR-0006). They are detached from the caller ctx (context.WithoutCancel) so a
-// cancelled caller cannot drop the record, yet bounded so a wedged disk cannot
-// hang the submit goroutine forever (unattended safety). A local fsync-durable
-// write finishes well within these bounds; they exist only to cap a pathological
-// stall.
-const (
-	// ackPersistTimeout bounds recording an accepted order's orderId (the acked
-	// marker write — the sole truth handle must survive caller cancellation).
-	ackPersistTimeout = 30 * time.Second
-	// auditPersistTimeout bounds each mandatory lifecycle-audit emit. emit always
-	// runs AFTER its marker is already durably committed, so the audit for a
-	// committed marker must not be skippable by caller cancellation — that would
-	// leave a durable marker with neither its mandatory audit nor a fail-closed halt.
-	auditPersistTimeout = 30 * time.Second
-)
+// durablePersistTimeout bounds every detached "must persist despite caller
+// cancellation" operation on the submit path: recording an accepted order's orderId
+// (the acked marker), each mandatory lifecycle-audit emit, the orphan-orderId
+// preservation when the store fails, and the global-halt escalation trip. Each runs
+// on context.WithoutCancel so a cancelled caller cannot drop it, but bounded so a
+// wedged medium cannot hang the submit goroutine forever (unattended safety). A
+// local fsync-durable write finishes well within this bound; it only caps a
+// pathological stall.
+const durablePersistTimeout = 30 * time.Second
 
 // SubmitIntent runs the fail-closed 2-marker write-ahead submit sequence for one
 // strategy intent, making at most one POST. The sequence (ADR-0002/0003/0004/
@@ -273,6 +269,18 @@ func (s *Submitter) SubmitIntent(ctx context.Context, intent Intent) (Outcome, e
 	// this intentId is still in the unresolved set — a replay finds it here and
 	// returns its state without a second POST. (The intent_id PRIMARY KEY is the
 	// ultimate barrier; this scan also lets us return the existing state.)
+	//
+	// KNOWN LIMITATION (idempotency completeness, Finding B): lookup scans only the
+	// UNRESOLVED set. Once the reconciler (#35) begins resolving intents, a resolved
+	// intent's PK row remains, so re-submitting a resolved intentId is missed by both
+	// this preflight scan and the post-AppendIntent fallback — it surfaces as a PK
+	// collision hard error instead of returning the prior outcome. This is NOT a
+	// money-safety gap: the PK barrier still guarantees no duplicate POST; it is only
+	// the "return existing state" contract that is incomplete, and only after #35
+	// exists AND a strategy violates its contract by reusing a resolved intentId.
+	// Full idempotency (returning the prior outcome) needs a single-intent store read
+	// that includes resolved rows — a #35/store follow-up, out of #34's store-no-edit
+	// scope.
 	if existing, found, err := s.lookup(ctx, intent.IntentID); err != nil {
 		return Outcome{}, err
 	} else if found {
@@ -296,12 +304,21 @@ func (s *Submitter) SubmitIntent(ctx context.Context, intent Intent) (Outcome, e
 	if err := s.journal.AppendIntent(ctx, rec); err != nil {
 		// A concurrent submit for the same intentId may have won the PRIMARY-KEY
 		// race and created the row first. If the intent now exists, this is an
-		// idempotent replay (return existing state, no POST); otherwise the append
-		// genuinely failed — propagate, nothing was POSTed.
+		// idempotent replay (return existing state, no POST, no trip).
 		if existing, found, lerr := s.lookup(ctx, intent.IntentID); lerr == nil && found {
 			return duplicateOutcome(existing), nil
 		}
-		return Outcome{}, fmt.Errorf("order: append prepared intent %q: %w", intent.IntentID, err)
+		if isCallerCanceled(ctx, err) {
+			// The caller cancelled/timed out before anything was POSTed — a clean
+			// abort, not a durability-medium failure. Nothing durable was recorded;
+			// return the error without a halt (ADR-0005 point 6 escalates the medium
+			// failing, not the caller walking away).
+			return Outcome{}, fmt.Errorf("order: prepared append aborted for %q: %w", intent.IntentID, err)
+		}
+		// Otherwise the prepared append GENUINELY failed to durably record. If we
+		// cannot journal the intent we cannot safely submit — fail-closed (ADR-0005
+		// point 6), symmetric to the audit-failure escalation. Nothing was POSTed.
+		return Outcome{}, s.tripOnStoreFailure(ctx, store.MarkerPrepared, err)
 	}
 	if err := s.emit(ctx, intent.IntentID, "", store.MarkerPrepared); err != nil {
 		// audit fail-closed already tripped the global halt inside emit; the
@@ -323,7 +340,14 @@ func (s *Submitter) SubmitIntent(ctx context.Context, intent Intent) (Outcome, e
 	if err := s.journal.AppendMarker(ctx, intent.IntentID, store.MarkerSubmitAttempted, ""); err != nil {
 		// The marker is not durable, so the POST must not proceed (that would be a
 		// submit with no "POST may have happened" evidence). Leave prepared-only.
-		return Outcome{}, fmt.Errorf("order: append submit-attempted for %q: %w", intent.IntentID, err)
+		if isCallerCanceled(ctx, err) {
+			// Caller cancellation before the irreversible submit is a clean abort, not
+			// a durability-medium failure — no halt (ADR-0005 point 6).
+			return Outcome{}, fmt.Errorf("order: submit-attempted append aborted for %q: %w", intent.IntentID, err)
+		}
+		// A genuine store durability failure → fail-closed: trip the global halt and
+		// return a hard error (ADR-0005 point 6). No POST happened.
+		return Outcome{}, s.tripOnStoreFailure(ctx, store.MarkerSubmitAttempted, err)
 	}
 	if err := s.emit(ctx, intent.IntentID, "", store.MarkerSubmitAttempted); err != nil {
 		return Outcome{Status: StatusUnresolved, IntentID: intent.IntentID, Reason: "audit-fail-closed"}, err
@@ -356,16 +380,26 @@ func (s *Submitter) SubmitIntent(ctx context.Context, intent Intent) (Outcome, e
 	// bounded deadline. Everything up to and including the POST used the caller ctx
 	// (those steps are still cancellable — nothing irreversible had happened yet);
 	// the detach begins only now, once the irreversible act is done.
-	ackCtx, cancelAck := context.WithTimeout(context.WithoutCancel(ctx), ackPersistTimeout)
+	ackCtx, cancelAck := context.WithTimeout(context.WithoutCancel(ctx), durablePersistTimeout)
 	defer cancelAck()
 	if err := s.journal.AppendMarker(ackCtx, intent.IntentID, store.MarkerAcked, resp.OrderID); err != nil {
-		// A genuine durable failure (disk error, or the bounded deadline) — not
-		// caller cancellation, which the detach above rules out. Do NOT resubmit;
-		// leave it unresolved and wake the reconciler, which recovers the order by
-		// re-querying (ADR-0003). The orderId is reported on the Outcome for logging.
+		// A GENUINE durable failure (disk/deadline) — caller cancellation is excluded
+		// by the detach above. This is NOT an ADR-0003 ambiguous submit (that is a lost
+		// POST *response*): the POST succeeded and it is the store MEDIUM that failed, a
+		// system-wide durability problem → fail-closed GLOBAL halt (ADR-0005 point 6),
+		// not a per-symbol block. Order of operations:
+		//   (a) best-effort preserve resp.OrderID — the order's ONLY truth handle
+		//       (ADR-0002 point 3) — on the audit channel, an INDEPENDENT durable medium
+		//       (ADR-0006 point 6) that may persist when the store did not, so the live
+		//       order's handle is not lost outright;
+		//   (b) wake the reconciler to examine the dangling (prepared+submit-attempted)
+		//       intent;
+		//   (c) trip the global halt and return a HARD error (never nil — a nil here
+		//       would keep trading other symbols over a broken durability medium).
+		s.preserveOrphanOrderID(ctx, intent.IntentID, resp.OrderID, err)
 		s.wakeReconciler()
 		return Outcome{Status: StatusUnresolved, IntentID: intent.IntentID, OrderID: resp.OrderID,
-			Reason: fmt.Sprintf("acked marker write failed: %v", err)}, nil
+			Reason: "store-durable-failure:acked"}, s.tripOnStoreFailure(ctx, store.MarkerAcked, err)
 	}
 	// emit is self-contained cancellation-immune (it detaches internally), so it
 	// takes the plain ctx; the acked MARKER write above needs the explicit ackCtx
@@ -428,7 +462,7 @@ func (s *Submitter) emit(ctx context.Context, intentID, orderID string, marker s
 	// persistence — bounded so a wedged disk cannot hang the submit goroutine. Only a
 	// genuine durability failure now reaches the fail-closed branch below; a cancelled
 	// caller no longer masquerades as a non-durable (silently skipped) emit.
-	auditCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), auditPersistTimeout)
+	auditCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), durablePersistTimeout)
 	defer cancel()
 	_, err := s.audit.EmitOrderLifecycle(auditCtx, audit.OrderLifecycleEvent{
 		IntentID:   intentID,
@@ -447,6 +481,57 @@ func (s *Submitter) emit(ctx context.Context, intentID, orderID string, marker s
 		return fmt.Errorf("order: audit fail-closed at %s, global halt tripped: %w", marker, err)
 	}
 	return fmt.Errorf("order: audit emit at %s: %w", marker, err)
+}
+
+// isCallerCanceled reports whether a pre-POST marker-write failure is attributable
+// to the caller's ctx being cancelled or timed out (those writes run on the caller
+// ctx on purpose — a pre-POST cancel is a clean abort with nothing irreversible
+// done). Such a failure must NOT trip the global halt: ADR-0005 point 6 escalates a
+// durability MEDIUM failure (disk-full, fsync error), not the caller walking away.
+// The post-POST acked write is exempt because it runs on a detached ctx, so a caller
+// cancel can never reach it — any acked failure there is a genuine durability fault.
+func isCallerCanceled(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// tripOnStoreFailure escalates a store durable-append failure to a global halt
+// (fail-closed, ADR-0005 point 6), symmetric to the audit fail-closed escalation in
+// emit: if a marker cannot be durably recorded, the submit path cannot safely keep
+// running. The trip runs on the kill-switch's OWN durable path (never bound to an
+// order transaction — TripTx-free, ADR-0012 Decision 2), on a detached, bounded ctx
+// so the halt lands even when the caller ctx was cancelled or the medium is wedged
+// (killswitch owns durable-before-visible). It returns a wrapped HARD error — a
+// store durability failure is never a nil-error outcome.
+func (s *Submitter) tripOnStoreFailure(ctx context.Context, marker store.MarkerKind, cause error) error {
+	tripCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), durablePersistTimeout)
+	defer cancel()
+	reason := "store-durable-failure:" + string(marker)
+	if tripErr := s.guard.Trip(tripCtx, killswitch.ScopeGlobal, "", reason, s.now()); tripErr != nil {
+		return fmt.Errorf("order: durable %s write failed AND global trip failed: %w (trip error: %v)", marker, cause, tripErr)
+	}
+	return fmt.Errorf("order: durable %s write failed, global halt tripped (fail-closed): %w", marker, cause)
+}
+
+// preserveOrphanOrderID best-effort records an accepted order's orderId to the
+// audit channel when the journal could not durably record its acked marker. The
+// audit sink is an INDEPENDENT durable medium (ADR-0006 point 6), so it may persist
+// the sole truth handle (ADR-0002 point 3) even when the store medium failed —
+// keeping a real live order recoverable (by an operator or a future tool) instead of
+// losing its handle outright. It is best-effort: detached and bounded, and its own
+// failure is swallowed (the global trip that follows is the hard stop). It is
+// deliberately an ERROR/diagnostic record, not a forged lifecycle "acked" marker,
+// so it never fabricates journal-backed lifecycle state the reconciler would trust.
+func (s *Submitter) preserveOrphanOrderID(ctx context.Context, intentID, orderID string, cause error) {
+	emitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), durablePersistTimeout)
+	defer cancel()
+	_, _ = s.audit.EmitError(emitCtx, audit.ErrorEvent{
+		IntentID:   intentID,
+		OrderID:    orderID,
+		Operation:  "order.submit.acked",
+		ErrorClass: "store-durable-failure",
+		Message:    fmt.Sprintf("acked marker write failed; orderId %q preserved here as the store journal could not record it: %v", orderID, cause),
+		OccurredAt: s.now(),
+	})
 }
 
 // wakeReconciler fires the wake seam inside a recover boundary: a panicking or
