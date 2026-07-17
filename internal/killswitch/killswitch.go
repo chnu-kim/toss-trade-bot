@@ -345,6 +345,15 @@ func (g *Guard) evaluateLocked(symbol string) Decision {
 	if g.halted {
 		return Decision{Reason: "global halt: " + g.haltReason, symbol: symbol}
 	}
+	if g.recoveryFailed {
+		// A safety-state write could not be trusted (boot recovery failure,
+		// or a persist failure that only the mirror recorded). Fail closed
+		// independently of g.halted: a concurrent non-reload clear can remove
+		// the halt without resolving the recovery condition (codex review P1),
+		// and only a clear that goes through the recovery resync path
+		// (needReload) clears this flag.
+		return Decision{Reason: "kill-switch recovery failed: safety state uncertain", symbol: symbol}
+	}
 	if !g.gateOpen {
 		return Decision{
 			Reason: "startup replay gate closed: unresolved-intent scan not complete",

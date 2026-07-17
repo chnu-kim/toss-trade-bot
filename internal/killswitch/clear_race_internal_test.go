@@ -193,6 +193,43 @@ func reopenHalted(t *testing.T, db *store.DB, path string) bool {
 	return hs.Halted
 }
 
+// TestRecoveryFailedFailsClosedEvenIfHaltCleared covers codex review P1 on the
+// durability round: a Report*FailureTx counter write failure sets
+// recoveryFailed while an existing global halt is being cleared. Because the
+// Tx path cannot change haltGen, a concurrent non-reload ClearGlobalHalt
+// (which fences only on haltGen) can still commit halt=0 and set
+// halted=false. CanSubmit must then STILL fail closed on recoveryFailed, or a
+// failed safety-state write silently reopens submission.
+func TestRecoveryFailedFailsClosedEvenIfHaltCleared(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer db.Close()
+	authorizeForTest(t, ctx, db)
+
+	g := New(ctx, db, nil, Config{})
+	g.MarkReplayComplete()
+
+	// A Tx-scoped failure whose durable write is not owned by us marks the
+	// guard recovery-failed (safety-state write could not be trusted).
+	g.markRecoveryFailed()
+	// Simulate the concurrent non-reload clear that already removed the halt
+	// (it fenced on haltGen, which the Tx failure did not move).
+	g.mu.Lock()
+	g.halted = false
+	g.mu.Unlock()
+
+	// The guard must stay fail-closed on recoveryFailed despite halted=false.
+	if d := g.CanSubmit("AAPL"); d.Allowed {
+		t.Fatal("recoveryFailed must fail closed even when the halt was cleared concurrently")
+	}
+	if d := g.Reconfirm(Decision{Allowed: true, symbol: "AAPL", gen: 1}); d.Allowed {
+		t.Fatal("Reconfirm must also fail closed on recoveryFailed")
+	}
+}
+
 // --- Global trip racing the clear: clear must not release the halt ----------
 
 func TestClearGlobalTripRaceKeepsHalt(t *testing.T) {
