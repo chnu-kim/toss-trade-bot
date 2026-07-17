@@ -1,18 +1,27 @@
 ---
 id: "0012"
-status: Proposed
+status: Accepted
 date: 2026-07-17
 deciders: [chnu-kim]
 domain: [killswitch, order, persistence]
 protects: [live-execution-human-gate]
 supersedes: []
 superseded_by: null
-verification: []
+verification:
+  - reviewer: adversarial-panel (counter-atomicity / durable-first / hot-path / adr-conformance)
+    date: 2026-07-17
+    verdict: order-failure undercount 취약점 확증 → count-first ordering + reconciler re-count로 봉쇄 확인(원자 seam은 대안, 필수 아님)
+  - reviewer: codex:adversarial-review
+    date: 2026-07-17
+    verdict: approve (6 rounds — mirror-first→durable-first / order-failure undercount→count-first / durable-write 실패 arm→clean-shutdown sentinel 단일 lifecycle 상태 / stale-clean 공존→단일 상태 atomic 전환 / ambiguous halt durable-trip 실패+evidence 소멸→전역 halt 2단계 pending + persistence-wins)
+  - reviewer: chnu-kim
+    date: 2026-07-17
+    verdict: approved
 ---
 
 # ADR-0012: 킬 스위치 상태는 durable-before-visible이다 — 미러는 durable commit 뒤에만 halt를 노출하고, order-failure 카운트는 count-before-resolve로 크래시-세이프하다
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-07-17
 - **Deciders**: chnu-kim
 - **관련 이슈/PR**: #32 (killswitch 구현), #57 (재설계 시도)
