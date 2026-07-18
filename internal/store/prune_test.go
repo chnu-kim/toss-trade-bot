@@ -328,6 +328,38 @@ func TestPruneWindowAppliesToTheFullyAuditedTimestampToo(t *testing.T) {
 	}
 }
 
+// TestPruneWindowAppliesToTheResolvedTimestampToo covers the mirror image, and it
+// is the one case the rest of the suite cannot reach on its own.
+//
+// In every state store can produce, fully_audited_at >= resolved_at (finalize
+// refuses to run before resolution), so the window on fully_audited_at normally
+// implies the window on resolved_at and the latter looks redundant. It stops being
+// redundant the moment the wall clock steps BACKWARDS between the two writes — an
+// NTP correction between ResolveIntent and FinalizeFullyAudited is enough — because
+// then a row can carry an old fully_audited_at beside a resolution that is still
+// well inside the retention window. Checking only the flag timestamp would delete
+// it early; checking both keeps the window honest under a clock this code does not
+// control. A hand-edited or restored row can produce the same shape.
+//
+// (Mutation-checked: removing the resolved_at window conjunct turns this red.)
+func TestPruneWindowAppliesToTheResolvedTimestampToo(t *testing.T) {
+	db := openTemp(t)
+	ancient := time.Now().Add(-365 * 24 * time.Hour)
+	justNow := time.Now()
+
+	seedFullyAuditedIntent(t, db, "clock-stepped-back", ancient)
+	// resolved just now, but flagged with a pre-step (older) clock reading.
+	setIntentTimes(t, db, "clock-stepped-back", &justNow, &ancient)
+
+	stats, err := db.PruneTerminalIntents(context.Background(), time.Now().Add(-time.Hour), testBatch)
+	if err != nil {
+		t.Fatalf("PruneTerminalIntents: %v", err)
+	}
+	if stats.Intents != 0 || !intentExists(t, db, "clock-stepped-back") {
+		t.Fatalf("an intent resolved inside the retention window was pruned because its flag timestamp predated it (stats %+v)", stats)
+	}
+}
+
 // TestPruneLeavesHaltCountersAndLifecycleAlone is the "these are never prune
 // targets" guard from ADR-0005 point 6. The halt state and the persistent counters
 // are reconstruction-resistant: deleting them would turn a restart into a

@@ -79,17 +79,27 @@ var ErrPruneRaced = errors.New("store: intent stopped being prune-eligible mid-t
 //     journal is that record's only durable outbox (ADR-0006 point 4). Unset ⇒
 //     preserve; that is the fail-safe direction, and it is why a crash tail is safe
 //     even though it leaves rows behind forever until a reconciler re-emits them.
-//   - resolved_at <= cutoff — the retention window proper.
+//   - resolved_at <= cutoff — the retention window applied to the resolution. In
+//     every state this store can produce the NEXT conjunct already implies this one
+//     (finalize refuses to run before resolution, so fully_audited_at >=
+//     resolved_at), which makes it look redundant. It stops being redundant exactly
+//     when the wall clock steps BACKWARDS between the two writes — an NTP correction
+//     between ResolveIntent and FinalizeFullyAudited suffices — leaving an old flag
+//     timestamp beside a resolution that is still well inside the window. Keeping it
+//     means the window holds under a clock this package does not control.
 //   - fully_audited_at <= cutoff — the same window applied to the moment the gate
 //     opened. An intent can be resolved long ago and only be finalized now (a
 //     restart reconciler re-emitting a crash tail does precisely that). Without this
 //     conjunct such a row would become deletable the instant it was flagged, while
 //     the reconciler that flagged it may still be working through the same intent.
-//     With it, every intent gets the full window measured from the LATER of the two
-//     events, which is the conservative reading of "the retention window elapsed".
 //
-// The comparison is inclusive (<=): a cutoff of "now minus the window" means the
-// window has elapsed at exactly that instant.
+// Together the two window conjuncts measure from the LATER of the two events, which
+// is the conservative reading of "the retention window elapsed". The comparison is
+// inclusive (<=): a cutoff of "now minus the window" means the window has elapsed at
+// exactly that instant.
+//
+// Each conjunct is mutation-checked: removing any one of them turns a specific test
+// in prune_test.go red, so none of them is decorative.
 const pruneEligibleWhere = `resolved_at IS NOT NULL
 	AND fully_audited_at IS NOT NULL
 	AND resolved_at <= ?
