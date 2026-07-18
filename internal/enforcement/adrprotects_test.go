@@ -378,6 +378,41 @@ func TestADRProtectsCompleteness_RealRepo(t *testing.T) {
 	}
 }
 
+// TestADRProtectsCompleteness_GrantsNoAutonomy makes the trust-model boundary
+// executable rather than merely documented (codex adversarial-review on PR #74
+// raised the split-brain risk: a future reader treating this CI check as the
+// sacred-invariant guarantee that ADR-0010 point 4 says only CODEOWNERS +
+// branch protection can provide).
+//
+// Fully-wired ADR frontmatter must NOT make the real enforcement check pass. If
+// a later change ever routes frontmatter into CheckCodeowners' verdict, this
+// test fails — which is the moment an ADR amendment is required, per ADR-0010's
+// rejection of "protects 값을 CI가 읽고 merge 허용/차단을 직접 결정".
+func TestADRProtectsCompleteness_GrantsNoAutonomy(t *testing.T) {
+	decls, err := loadADRDecls(repoRootForTest)
+	if err != nil {
+		t.Fatalf("loadADRDecls() error = %v", err)
+	}
+	entries, err := loadRealCodeownersEntries()
+	if err != nil {
+		t.Fatalf("read real CODEOWNERS: %v", err)
+	}
+	// Precondition: the completeness invariant currently holds.
+	if problems := adrProtectsWiringProblems(decls, sacredRequiredPaths, entries); len(problems) > 0 {
+		t.Fatalf("precondition broken, completeness must be clean here: %v", problems)
+	}
+
+	// Despite that, a repository whose CODEOWNERS is empty or has lost the
+	// sacred entries must still fail the actual gate. The drift detector buys
+	// no credit toward it.
+	if got := CheckCodeowners(""); got.Satisfied {
+		t.Fatal("완결성이 green이어도 빈 CODEOWNERS는 통과해선 안 된다 — 이 체크는 게이트가 아니다")
+	}
+	if got := CheckCodeowners("/docs/adr/0004-*.md @chnu-kim\n"); got.Satisfied {
+		t.Fatal("완결성이 green이어도 불완전한 CODEOWNERS는 통과해선 안 된다 — 실제 강제는 CODEOWNERS+branch protection")
+	}
+}
+
 // TestADRProtectsCompleteness_RealRepoCoversKnownSacredADRs pins the currently
 // expected set so that an ADR quietly losing its protects: declaration (which
 // would make the generic check vacuously pass for it) is still caught.

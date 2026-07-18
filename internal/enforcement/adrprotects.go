@@ -28,6 +28,34 @@ import (
 // "declares nothing, so nothing is required" — a fail-open would let a mangled
 // sacred ADR drop silently out of the assertion, which is exactly the class of
 // silent hole this check exists to remove.
+//
+// # Trust-model boundary (read this before extending)
+//
+// This is a DRIFT DETECTOR, not an enforcer. Do not read a green build here as
+// "the sacred invariants are protected" — that guarantee comes from CODEOWNERS
+// plus branch protection and from nothing else (ADR-0009 point 4). Concretely:
+//
+//   - It never decides whether a PR may merge from the *semantic content* of a
+//     protects: value. It only asserts set equality between a declaration and
+//     its two registrations. ADR-0010 point 4 rejects the former ("status/
+//     protects 값 자체를 근거로 merge를 막거나 허용하는 판단은 CI가 하지 않는다"
+//     — circular, because CI is loop-editable) while explicitly assigning the
+//     latter to CI in the same sentence ("CI는 오직 구조적 정합성만 검증한다 —
+//     ... 참조 무결성"). A declaration with no matching registration is a
+//     dangling reference, the same species as supersedes/superseded_by
+//     referential integrity, and ADR-0010's Consequences anticipates exactly
+//     this ("향후 ... 자동 점검을 domain/protects 필드 기반으로 확장할 수 있다").
+//   - It is not load-bearing. Deleting these checks removes the alarm, not the
+//     protection: CODEOWNERS and branch protection stand unchanged, and the
+//     repo simply returns to the status quo in which this drift recurred six
+//     times unnoticed. That is why the circularity argument against
+//     CI-as-enforcer does not apply here — there is no protection to be
+//     circular about.
+//   - Consequently these helpers stay OUT of the presence-check pipeline: they
+//     produce no CheckResult and no exported Check* function consults them.
+//     CheckCodeowners' verdict is byte-for-byte unaffected by ADR frontmatter.
+//     Wiring frontmatter values into a runtime autonomy verdict WOULD be the
+//     rejected design, and would need an ADR amendment first.
 
 // adrDirRel is the repo-root-relative directory holding ADRs. It matches the
 // docs/adr/ prefix used by sacredRequiredPaths.
