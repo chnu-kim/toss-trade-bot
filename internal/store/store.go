@@ -181,20 +181,25 @@ func validateDBPath(path string) error {
 // unattended upgrade keeps booting rather than refusing to start); if a file cannot
 // be normalized Open fails closed rather than proceeding with the wrong mode.
 func secureDBFile(path string) error {
-	// Stat the main path FIRST — never open an existing entry for read before
-	// validating it. stat() does not block on a FIFO/socket the way open() does
-	// (so a misconfigured special path fails closed instead of hanging Open) and
-	// needs no read permission on the file itself (so an owner-unreadable 0o200/0o000
-	// DB is still reachable for the chmod repair below). Create the file only when
-	// it is genuinely absent.
-	switch info, err := os.Stat(path); {
+	// Lstat the main path FIRST — never open an existing entry for read before
+	// validating it. Lstat (not Stat) so a SYMLINK is reported as the link itself and
+	// rejected by the IsRegular check below: Stat would follow the link, letting a
+	// symlinked path (operator misconfig, or a co-tenant-planted link in a writable
+	// store dir — M-2's shared-host threat) redirect the chmod to an arbitrary target
+	// (CWE-59) and SQLite open through it at the wrong journal. Lstat also does not
+	// block on a FIFO/socket the way open() does (misconfigured special path fails
+	// closed instead of hanging Open) and needs no read permission on the file (an
+	// owner-unreadable 0o200/0o000 DB is still reachable for the chmod repair). Create
+	// the file only when it is genuinely absent.
+	switch info, err := os.Lstat(path); {
 	case err == nil:
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("store: %s is not a regular file (mode %s); refusing to open", path, info.Mode())
 		}
 	case os.IsNotExist(err):
-		// O_EXCL so that if a special file races into existence between the stat and
-		// here, we get a fail-closed EEXIST rather than opening (and blocking on) it.
+		// O_EXCL so that if a symlink or special file races into existence between the
+		// Lstat and here, we get a fail-closed EEXIST rather than following/opening it
+		// (POSIX: O_CREAT|O_EXCL fails EEXIST when the path names a symlink).
 		f, cerr := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if cerr != nil {
 			return fmt.Errorf("store: pre-create %s: %w", path, cerr)
@@ -207,12 +212,14 @@ func secureDBFile(path string) error {
 	}
 
 	// Normalize the main file and any pre-existing -wal/-shm sidecars to EXACTLY
-	// 0o600 via chmod (which needs ownership, not read access). Non-regular entries
-	// are rejected before chmod so a directory/FIFO is never damaged; absent sidecars
-	// are skipped (SQLite creates the real one 0o600-inherited) — never created here,
-	// because an empty -wal/-shm invented before open would corrupt WAL recovery.
+	// 0o600 via chmod (which needs ownership, not read access). Lstat rejects
+	// symlinks and other non-regular entries before chmod, so a directory/FIFO is
+	// never damaged and the chmod never follows a link to an arbitrary target; absent
+	// sidecars are skipped (SQLite creates the real one 0o600-inherited) — never
+	// created here, because an empty -wal/-shm invented before open would corrupt WAL
+	// recovery.
 	for _, p := range []string{path, path + "-wal", path + "-shm"} {
-		info, err := os.Stat(p)
+		info, err := os.Lstat(p)
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue

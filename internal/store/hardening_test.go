@@ -196,6 +196,66 @@ func TestSecureDBFileRejectsFifoWithoutHanging(t *testing.T) {
 	}
 }
 
+// TestSecureDBFileRejectsSymlinkedMainPath guards against symlink-following in the
+// permission-repair path (CWE-59): a symlinked DB path must be rejected without the
+// chmod redirecting to (and damaging) an arbitrary target, and without SQLite later
+// opening through the link at the wrong journal. This is exactly M-2's shared-host
+// threat model (a co-tenant with write access to the store directory could plant
+// the link).
+func TestSecureDBFileRejectsSymlinkedMainPath(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, nil, 0o644); err != nil {
+		t.Fatalf("seed target: %v", err)
+	}
+	path := filepath.Join(dir, "store.db")
+	if err := os.Symlink(target, path); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	if err := secureDBFile(path); err == nil {
+		t.Fatal("secureDBFile on a symlinked DB path returned nil, want error (must not follow symlink)")
+	}
+
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("stat target: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o644 {
+		t.Errorf("symlink target mode = %#o, want unchanged 0o644 (chmod must not follow a symlinked DB path to an arbitrary target)", perm)
+	}
+}
+
+// TestSecureDBFileRejectsSymlinkedSidecar guards the same CWE-59 vector via a
+// planted -wal/-shm sidecar symlink: it must be rejected without chmodding its
+// target.
+func TestSecureDBFileRejectsSymlinkedSidecar(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, nil, 0o644); err != nil {
+		t.Fatalf("seed target: %v", err)
+	}
+	path := filepath.Join(dir, "store.db")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatalf("seed db: %v", err)
+	}
+	if err := os.Symlink(target, path+"-wal"); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	if err := secureDBFile(path); err == nil {
+		t.Fatal("secureDBFile with a symlinked -wal sidecar returned nil, want error")
+	}
+
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("stat target: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o644 {
+		t.Errorf("sidecar symlink target mode = %#o, want unchanged 0o644 (chmod must not follow a symlinked sidecar)", perm)
+	}
+}
+
 // TestOpenRejectsNonRegularPathWithoutDamage guards the permission-repair path
 // against collateral damage: if the configured DB path (or a sidecar path) is
 // accidentally a directory or other non-regular entry, Open must fail closed
