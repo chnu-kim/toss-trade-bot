@@ -16,6 +16,16 @@ import (
 // ack facts (boolean/timestamp) and the coverage logic that forbids gating on the
 // terminal record alone.
 
+// ErrUnknownAuditRecord is returned by RecordAuditAck when recordKey does not
+// identify a lifecycle record that currently exists in the intent's journal state
+// — e.g. the terminal key before the intent is resolved, or a marker key with no
+// matching marker. Accepting such a key would let a stale/buggy caller pre-seed the
+// ack ledger so that a later-appearing record counts as durably acked without a
+// genuine ack, falsely satisfying the prune gate and losing audit evidence on the
+// next prune (ADR-0006 point 4 fail-open). Rejecting it makes bad wiring fail loudly
+// (fail-safe) instead of silently corrupting the gate.
+var ErrUnknownAuditRecord = errors.New("store: audit ack key is not a current lifecycle record")
+
 // terminalAckKey is the store-local ack key for an intent's terminal lifecycle
 // record. Marker records key on their durable append seq (markerAckKey); the
 // terminal has no marker seq, so it uses this fixed sentinel, which cannot collide
@@ -76,19 +86,23 @@ func ReconstructLifecycleRecords(in Intent) []LifecycleRecord {
 }
 
 // recordAuditAck idempotently records that the lifecycle record identified by
-// recordKey is durably acked for intentID. It first checks the intent exists so a
-// wiring bug (ack for a never-appended intent) surfaces as ErrIntentNotFound rather
-// than a raw FK error, then inserts the ack fact (record_key + time only — no audit
-// content). Re-recording the same key is a no-op (at-least-once re-emit, ADR-0006
-// point 3).
+// recordKey is durably acked for intentID. It validates recordKey against the
+// intent's CURRENT reconstructed lifecycle set — the same journal-derived set
+// finalizeFullyAudited scores coverage over — so an ack can only be recorded for a
+// record that genuinely exists now. A missing intent surfaces as ErrIntentNotFound;
+// a key that is not a current lifecycle record (e.g. a terminal ack before
+// resolution, or a bogus marker seq) is rejected with ErrUnknownAuditRecord rather
+// than silently persisted, which would otherwise let a later-appearing record be
+// counted as acked and falsely open the prune gate (ADR-0006 point 4 fail-open).
+// The ack fact only (record_key + time, no audit content) is stored; re-recording
+// the same valid key is a no-op (at-least-once re-emit, ADR-0006 point 3).
 func recordAuditAck(ctx context.Context, q querier, intentID, recordKey string) error {
-	var exists int
-	err := q.QueryRowContext(ctx, `SELECT 1 FROM intents WHERE intent_id = ?`, intentID).Scan(&exists)
-	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("%w: %q", ErrIntentNotFound, intentID)
-	}
+	in, err := loadIntentByID(ctx, q, intentID)
 	if err != nil {
-		return fmt.Errorf("store: record audit ack %q/%q: %w", intentID, recordKey, err)
+		return err // ErrIntentNotFound when the intent was never appended.
+	}
+	if !isCurrentLifecycleKey(in, recordKey) {
+		return fmt.Errorf("%w: intent %q key %q", ErrUnknownAuditRecord, intentID, recordKey)
 	}
 	if _, err := q.ExecContext(ctx,
 		`INSERT INTO audit_acks (intent_id, record_key, acked_at) VALUES (?, ?, ?)
@@ -98,6 +112,18 @@ func recordAuditAck(ctx context.Context, q querier, intentID, recordKey string) 
 		return fmt.Errorf("store: record audit ack %q/%q: %w", intentID, recordKey, err)
 	}
 	return nil
+}
+
+// isCurrentLifecycleKey reports whether recordKey identifies a lifecycle record that
+// exists in the intent's journal state right now (a marker present in the journal,
+// or the terminal record once resolved).
+func isCurrentLifecycleKey(in Intent, recordKey string) bool {
+	for _, rec := range ReconstructLifecycleRecords(in) {
+		if rec.Key == recordKey {
+			return true
+		}
+	}
+	return false
 }
 
 // finalizeFullyAudited sets the intent's fully-audited flag iff the intent is
@@ -180,6 +206,61 @@ func unackedLifecycleRecords(ctx context.Context, q querier, intentID string) ([
 		if _, ok := acked[rec.Key]; !ok {
 			out = append(out, rec)
 		}
+	}
+	return out, nil
+}
+
+// loadNotFullyAuditedIntents returns every intent whose fully-audited flag is unset
+// (fully_audited_at IS NULL), each with its markers — the complete recovery-candidate
+// set for the ADR-0006 point 4 restart loop. It deliberately includes BOTH still-open
+// intents and resolved-but-not-yet-finalized ones: a crash between ResolveIntent and
+// the terminal audit ack leaves a resolved intent that LoadUnresolvedIntents no longer
+// returns, so without this scan it would be undiscoverable and its missing lifecycle
+// audit could never be re-emitted (leaving the flag unset and prune blocked forever).
+// This exposes the discovery primitive only; the reconciler DRIVER that re-emits is
+// out of scope (ADR-0003). Ordering mirrors LoadUnresolvedIntents (creation order).
+func loadNotFullyAuditedIntents(ctx context.Context, q querier) ([]Intent, error) {
+	rows, err := q.QueryContext(ctx,
+		`SELECT intent_id, client_order_id, payload, created_at, resolved_at, resolution, fully_audited_at
+		 FROM intents WHERE fully_audited_at IS NULL ORDER BY created_at, intent_id`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("store: load not-fully-audited intents: %w", err)
+	}
+	// Fully drain and close before the per-intent marker queries: on a single
+	// connection two live result sets cannot coexist.
+	var out []Intent
+	for rows.Next() {
+		var (
+			in         Intent
+			createdAt  int64
+			resolvedAt sql.NullInt64
+			// fully_audited_at is NULL by the WHERE clause; scanned into a throwaway.
+			fullyAudited sql.NullInt64
+		)
+		if err := rows.Scan(&in.IntentID, &in.ClientOrderID, &in.Payload, &createdAt, &resolvedAt, &in.Resolution, &fullyAudited); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("store: scan intent: %w", err)
+		}
+		in.CreatedAt = time.Unix(0, createdAt)
+		if resolvedAt.Valid {
+			t := time.Unix(0, resolvedAt.Int64)
+			in.ResolvedAt = &t
+		}
+		out = append(out, in)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("store: iterate intents: %w", err)
+	}
+	rows.Close()
+
+	for i := range out {
+		markers, err := loadMarkers(ctx, q, out[i].IntentID)
+		if err != nil {
+			return nil, err
+		}
+		out[i].Markers = markers
 	}
 	return out, nil
 }

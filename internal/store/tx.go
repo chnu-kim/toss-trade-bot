@@ -58,6 +58,12 @@ type Tx interface {
 	// restart reconciler must re-emit (ADR-0006 point 4 recovery loop; the driver is
 	// out of scope). Deterministic.
 	UnackedLifecycleRecords(ctx context.Context, intentID string) ([]LifecycleRecord, error)
+	// LoadNotFullyAuditedIntents returns every intent whose fully-audited flag is
+	// unset (resolved-but-unfinalized crash orphans AND still-open intents), each
+	// with its markers — the discoverable recovery-candidate set for the restart
+	// loop, since resolved orphans leave LoadUnresolvedIntents. Discovery primitive
+	// only; the re-emit driver is out of scope (ADR-0003).
+	LoadNotFullyAuditedIntents(ctx context.Context) ([]Intent, error)
 }
 
 // querier is the read/write surface shared by *sql.Tx and *sql.DB, letting the
@@ -119,6 +125,9 @@ func (t *txn) FullyAudited(ctx context.Context, intentID string) (time.Time, boo
 }
 func (t *txn) UnackedLifecycleRecords(ctx context.Context, intentID string) ([]LifecycleRecord, error) {
 	return unackedLifecycleRecords(ctx, t.q, intentID)
+}
+func (t *txn) LoadNotFullyAuditedIntents(ctx context.Context) ([]Intent, error) {
+	return loadNotFullyAuditedIntents(ctx, t.q)
 }
 
 // --- shared query functions (work over any querier) ---

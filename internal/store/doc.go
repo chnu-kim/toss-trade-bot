@@ -50,7 +50,8 @@
 // the fully-audited flag this package now sets (#20 sets it, #14 reads it to gate
 // deletion), the audit/observability sink itself (ADR-0005 point 5, internal/audit),
 // the restart reconciler DRIVER that re-emits UnackedLifecycleRecords (ADR-0003;
-// this package exposes the reconstruction function, not the driver), disk-full →
+// this package exposes the discovery scan LoadNotFullyAuditedIntents and the
+// reconstruction function, but not the loop that re-emits and finalizes), disk-full →
 // halt wiring (killswitch, ADR-0004), and the durable-before-visible judgment/wiring
 // that consumes the halt phase and sentinel (#32/#36).
 package store

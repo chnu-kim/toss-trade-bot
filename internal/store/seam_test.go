@@ -66,6 +66,9 @@ func (f *fakeStore) FullyAudited(context.Context, string) (time.Time, bool, erro
 func (f *fakeStore) UnackedLifecycleRecords(context.Context, string) ([]LifecycleRecord, error) {
 	return nil, nil
 }
+func (f *fakeStore) LoadNotFullyAuditedIntents(context.Context) ([]Intent, error) {
+	return nil, nil
+}
 func (f *fakeStore) Close() error { return nil }
 
 type fakeTx struct{ f *fakeStore }
@@ -98,6 +101,9 @@ func (t fakeTx) FullyAudited(context.Context, string) (time.Time, bool, error) {
 	return time.Time{}, false, nil
 }
 func (t fakeTx) UnackedLifecycleRecords(context.Context, string) ([]LifecycleRecord, error) {
+	return nil, nil
+}
+func (t fakeTx) LoadNotFullyAuditedIntents(context.Context) ([]Intent, error) {
 	return nil, nil
 }
 

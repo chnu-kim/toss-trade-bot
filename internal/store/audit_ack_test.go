@@ -443,6 +443,136 @@ func TestV3AddsFullyAuditedColumnDefaultNull(t *testing.T) {
 	}
 }
 
+// TestRecordAuditAckRejectsPrematureTerminal is the codex fail-open guard: an ack
+// for a lifecycle record that does not yet exist in the journal (here, "terminal"
+// before the intent is resolved) must be rejected, not persisted. Otherwise the
+// stale row would later count as coverage once the record appears and falsely set
+// the prune-gate flag without a genuine durable audit ack (ADR-0006 point 4).
+func TestRecordAuditAckRejectsPrematureTerminal(t *testing.T) {
+	db := openTemp(t)
+	ctx := context.Background()
+
+	if err := db.AppendIntent(ctx, Intent{IntentID: "i1", ClientOrderID: "c1"}); err != nil {
+		t.Fatalf("AppendIntent: %v", err)
+	}
+	if err := db.AppendMarker(ctx, "i1", MarkerSubmitAttempted, ""); err != nil {
+		t.Fatalf("AppendMarker: %v", err)
+	}
+	if err := db.AppendMarker(ctx, "i1", MarkerAcked, "ord-1"); err != nil {
+		t.Fatalf("AppendMarker: %v", err)
+	}
+
+	// Not resolved yet: the terminal record does not exist. Recording it must fail.
+	if err := db.RecordAuditAck(ctx, "i1", terminalAckKey); !errors.Is(err, ErrUnknownAuditRecord) {
+		t.Fatalf("premature terminal ack err = %v, want ErrUnknownAuditRecord", err)
+	}
+
+	// After resolving and acking only the real marker records, the flag must NOT be
+	// set: the premature terminal ack was rejected, so terminal is still un-acked.
+	if err := db.ResolveIntent(ctx, "i1", "FILLED"); err != nil {
+		t.Fatalf("ResolveIntent: %v", err)
+	}
+	recs, err := db.UnackedLifecycleRecords(ctx, "i1")
+	if err != nil {
+		t.Fatalf("UnackedLifecycleRecords: %v", err)
+	}
+	for _, rec := range recs {
+		if rec.Terminal {
+			continue // deliberately leave the terminal un-acked
+		}
+		if err := db.RecordAuditAck(ctx, "i1", rec.Key); err != nil {
+			t.Fatalf("RecordAuditAck %q: %v", rec.Key, err)
+		}
+	}
+	if done, err := db.FinalizeFullyAudited(ctx, "i1"); err != nil || done {
+		t.Fatalf("FinalizeFullyAudited = %v, %v; want false (terminal never durably acked)", done, err)
+	}
+}
+
+// TestRecordAuditAckRejectsUnknownMarkerKey: a marker key with no matching marker
+// is rejected, so a typo'd/stale key cannot silently pad the ack ledger.
+func TestRecordAuditAckRejectsUnknownMarkerKey(t *testing.T) {
+	db := openTemp(t)
+	ctx := context.Background()
+	seedResolvedIntent(t, db, ctx, "i1", "ord-1", "FILLED")
+
+	if err := db.RecordAuditAck(ctx, "i1", "m:99999"); !errors.Is(err, ErrUnknownAuditRecord) {
+		t.Fatalf("bogus marker-key ack err = %v, want ErrUnknownAuditRecord", err)
+	}
+}
+
+// TestLoadNotFullyAuditedIntentsDiscoversResolvedOrphan is the codex recovery-seam
+// guard: after a crash between ResolveIntent and the terminal audit ack/finalize,
+// the resolved-but-unaudited intent leaves the unresolved set and is otherwise
+// undiscoverable. The recovery scan must surface it (and unresolved intents),
+// while excluding fully-audited ones, so a restart reconciler can re-emit the
+// missing lifecycle audits (ADR-0006 point 4 recovery loop; the driver stays out
+// of scope).
+func TestLoadNotFullyAuditedIntentsDiscoversResolvedOrphan(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.db")
+	ctx := context.Background()
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	// A: resolved but never finalized (crash-after-resolve orphan).
+	seedResolvedIntent(t, db, ctx, "A", "ord-A", "FILLED")
+	// B: resolved AND fully audited (must be excluded).
+	seedResolvedIntent(t, db, ctx, "B", "ord-B", "FILLED")
+	recsB, err := db.UnackedLifecycleRecords(ctx, "B")
+	if err != nil {
+		t.Fatalf("UnackedLifecycleRecords B: %v", err)
+	}
+	for _, rec := range recsB {
+		if err := db.RecordAuditAck(ctx, "B", rec.Key); err != nil {
+			t.Fatalf("RecordAuditAck B: %v", err)
+		}
+	}
+	if done, err := db.FinalizeFullyAudited(ctx, "B"); err != nil || !done {
+		t.Fatalf("finalize B = %v, %v; want true", done, err)
+	}
+	// C: still in flight (unresolved) — also a recovery candidate.
+	if err := db.AppendIntent(ctx, Intent{IntentID: "C", ClientOrderID: "c-C"}); err != nil {
+		t.Fatalf("AppendIntent C: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Restart: only A and C must surface; B (fully audited) must not.
+	db2, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db2.Close()
+
+	got, err := db2.LoadNotFullyAuditedIntents(ctx)
+	if err != nil {
+		t.Fatalf("LoadNotFullyAuditedIntents: %v", err)
+	}
+	ids := map[string]bool{}
+	for _, in := range got {
+		ids[in.IntentID] = true
+		if len(in.Markers) == 0 {
+			t.Errorf("intent %q returned without markers (reconciler needs them)", in.IntentID)
+		}
+	}
+	if !ids["A"] || !ids["C"] || ids["B"] {
+		t.Fatalf("recovery scan ids = %v, want A and C present, B absent", ids)
+	}
+
+	// The orphan A is now reachable for re-emit through the existing per-intent seam.
+	unacked, err := db2.UnackedLifecycleRecords(ctx, "A")
+	if err != nil {
+		t.Fatalf("UnackedLifecycleRecords A: %v", err)
+	}
+	if len(unacked) != 4 {
+		t.Fatalf("orphan A un-acked records = %d, want 4", len(unacked))
+	}
+}
+
 // TestConcurrentAuditAck runs the ack-record + finalize paths concurrently under
 // -race: single-writer serialization must let them converge to the flag set
 // exactly once, with no lost ack and no spurious error.

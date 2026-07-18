@@ -49,6 +49,7 @@ type Store interface {
 	FinalizeFullyAudited(ctx context.Context, intentID string) (bool, error)
 	FullyAudited(ctx context.Context, intentID string) (time.Time, bool, error)
 	UnackedLifecycleRecords(ctx context.Context, intentID string) ([]LifecycleRecord, error)
+	LoadNotFullyAuditedIntents(ctx context.Context) ([]Intent, error)
 
 	Close() error
 }
@@ -280,4 +281,17 @@ func (d *DB) UnackedLifecycleRecords(ctx context.Context, intentID string) ([]Li
 	}
 	defer tx.Rollback() //nolint:errcheck // read-only; Rollback just releases the snapshot
 	return unackedLifecycleRecords(ctx, tx, intentID)
+}
+
+// LoadNotFullyAuditedIntents returns every intent whose fully-audited flag is unset,
+// each with its markers — the restart recovery-candidate scan (ADR-0006 point 4).
+// Like LoadUnresolvedIntents it runs in one read transaction so the intent list and
+// every per-intent marker query share one SQLite snapshot (no mixed-state skew).
+func (d *DB) LoadNotFullyAuditedIntents(ctx context.Context) ([]Intent, error) {
+	tx, err := d.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("store: begin read tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // read-only; Rollback just releases the snapshot
+	return loadNotFullyAuditedIntents(ctx, tx)
 }
