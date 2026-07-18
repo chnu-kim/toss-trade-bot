@@ -24,7 +24,14 @@
 //     (V3, issue #20): boolean/timestamp bookkeeping that gates prune on "every
 //     lifecycle audit record durably acked", never on the terminal alone
 //     (ADR-0006 point 4). It holds ack facts only, no audit content — the audit
-//     history stays in the sink (ADR-0005 point 5).
+//     history stays in the sink (ADR-0005 point 5),
+//   - the retention/prune loop (issue #14, prune.go): the package's ONLY deletion
+//     path, which keeps the store bounded to "in-flight orders + a few state rows"
+//     so a full disk can never block the submit-attempted append that ADR-0002's
+//     crash safety rests on. It deletes an intent only when it is terminal, has the
+//     fully-audited flag set, and both durable timestamps are past the retention
+//     cutoff (ADR-0005 point 6); anything unresolved or un-flagged is preserved,
+//     and halt/sentinel/counters are not addressable by it at all.
 //
 // store is substrate only: it exposes the halt phase and sentinel value plus the
 // atomic transitions, but the judgment logic — when pending becomes halted, when
@@ -52,12 +59,11 @@
 //     connection so concurrent Atomically callers serialize instead of racing
 //     into a spurious SQLITE_BUSY fail-closed (ADR-0005 follow-up).
 //
-// Out of scope for this package: the retention/prune loop (issue #14) that READS
-// the fully-audited flag this package now sets (#20 sets it, #14 reads it to gate
-// deletion), the audit/observability sink itself (ADR-0005 point 5, internal/audit),
-// the restart reconciler DRIVER that re-emits UnackedLifecycleRecords (ADR-0003;
-// this package exposes the discovery scan LoadNotFullyAuditedIntents and the
-// reconstruction function, but not the loop that re-emits and finalizes), disk-full →
-// halt wiring (killswitch, ADR-0004), and the durable-before-visible judgment/wiring
+// Out of scope for this package: the audit/observability sink itself (ADR-0005
+// point 5, internal/audit), the restart reconciler DRIVER that re-emits
+// UnackedLifecycleRecords (ADR-0003 — this package exposes the discovery scan
+// LoadNotFullyAuditedIntents and the reconstruction function; the loop that
+// re-emits and finalizes lives in internal/reconciler, #35), disk-full → halt
+// wiring (killswitch, ADR-0004), and the durable-before-visible judgment/wiring
 // that consumes the halt phase and sentinel (#32/#36).
 package store
