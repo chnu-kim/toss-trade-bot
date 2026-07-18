@@ -85,6 +85,11 @@ type tokenManager struct {
 	now           func() time.Time
 	issue         issueFunc
 	logger        *slog.Logger
+
+	// onRefreshFailure escalates a failed issuance attempt to the kill switch
+	// (ADR-0004 point 7). It fires once per FLIGHT, not per waiter: issuance is
+	// single-flight, so one failure shared by N waiters is one refresh failure.
+	onRefreshFailure func(occurredAt time.Time)
 }
 
 func newTokenManager(issue issueFunc) *tokenManager {
@@ -107,6 +112,44 @@ func (m *tokenManager) setLogger(l *slog.Logger) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.logger = l
+}
+
+// setRefreshFailureHook registers the escalation seam described on
+// Client.SetTokenRefreshFailureHook. Safe to call concurrently, though it is
+// meant for boot-time wiring.
+func (m *tokenManager) setRefreshFailureHook(fn func(occurredAt time.Time)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onRefreshFailure = fn
+}
+
+// notifyRefreshFailure invokes the escalation hook for one failed issuance.
+//
+// Two properties are deliberate and load-bearing:
+//
+//   - It runs OUTSIDE m.mu and after the flight's waiters have been released.
+//     The production hook performs a durable store write; holding the manager
+//     lock across an fsync would stall every token caller, and running it before
+//     the waiters are released would put that fsync on the critical path of
+//     every request waiting for a token.
+//   - It has its own recover boundary. The hook calls out into the kill switch,
+//     and an unattended process must not die because an escalation callback
+//     panicked (the panic would otherwise escape the flight goroutine, which has
+//     already used up its own recover).
+func (m *tokenManager) notifyRefreshFailure(at time.Time) {
+	m.mu.Lock()
+	hook := m.onRefreshFailure
+	logger := m.logger
+	m.mu.Unlock()
+	if hook == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("toss: token refresh failure hook panicked", "panic", r)
+		}
+	}()
+	hook(at)
 }
 
 // get returns a valid token. It has three regimes, by cache state:
@@ -278,8 +321,14 @@ func (m *tokenManager) startFlightLocked(ctx context.Context) *issuance {
 			}
 			m.mu.Lock()
 			m.finishLocked(fl)
+			failedAt := m.now()
 			m.mu.Unlock()
 			close(fl.done)
+			// Escalate AFTER the waiters are released and the lock is dropped:
+			// the hook does durable I/O and must not sit on the token path.
+			if fl.err != nil {
+				m.notifyRefreshFailure(failedAt)
+			}
 		}()
 		fl.token, fl.ttl, fl.err = m.issue(ictx)
 		switch {

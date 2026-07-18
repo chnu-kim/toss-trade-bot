@@ -140,6 +140,27 @@ func (c *Client) SetLogger(l *slog.Logger) {
 	c.tokens.setLogger(l)
 }
 
+// SetTokenRefreshFailureHook registers fn to be called once for every FAILED
+// token issuance attempt, with the time the failure was observed.
+//
+// This is the escalation seam for "we can no longer authenticate" (ADR-0004
+// point 7). Token-refresh failure is non-reconstructable — unlike an ambiguous
+// order it leaves no journal evidence a restart could replay — so the kill
+// switch counts it in a persisted window. #36 wires this to
+// killswitch.ReportTokenRefreshFailure; it deliberately does NOT wire a direct
+// global trip, which would bypass the counting/threshold contract killswitch
+// owns.
+//
+// Contract for fn: it is invoked from the issuance goroutine after that
+// issuance's waiters have been released and never while the token lock is held,
+// so it may block on a durable write without stalling token callers. A panic in
+// fn is recovered and logged. It fires once per refresh ATTEMPT (issuance is
+// single-flight), not once per waiting caller, so a burst of callers sharing one
+// failure counts as one failure. Passing nil disables the hook.
+func (c *Client) SetTokenRefreshFailureHook(fn func(occurredAt time.Time)) {
+	c.tokens.setRefreshFailureHook(fn)
+}
+
 // Format, String and GoString use VALUE receivers on purpose: with pointer
 // receivers only *Client satisfies fmt.Stringer, so formatting a Client value
 // (logging `*client`, or embedding Client in a struct printed with %+v) would

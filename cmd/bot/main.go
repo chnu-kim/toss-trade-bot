@@ -1,7 +1,11 @@
 // Command bot is the 24/7 unattended entry point for the Toss trading bot.
 //
-// main stays thin: load config, wire dependencies, and run until a shutdown
-// signal arrives. All business logic lives under internal/.
+// main stays thin: load config, assemble dependencies, run until a shutdown
+// signal arrives. Every ordering rule that matters — the clean-shutdown sentinel
+// boot/shutdown judgment (ADR-0012 Decision 1(c)) and the replay gate opening
+// only after the reconciler scan (ADR-0004 point 3) — lives in internal/runtime,
+// where it is unit-testable against a real store. All business logic lives under
+// internal/.
 package main
 
 import (
@@ -9,17 +13,10 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/chnu-kim/toss-trade-bot/internal/config"
 	"github.com/chnu-kim/toss-trade-bot/internal/runtime"
-	"github.com/chnu-kim/toss-trade-bot/internal/toss"
 )
-
-// shutdownTimeout bounds how long we wait for supervised goroutines to drain
-// after a shutdown signal, so an unattended restart is never blocked forever by
-// a stuck loop.
-const shutdownTimeout = 10 * time.Second
 
 func main() {
 	logger := runtime.NewLogger(os.Stdout)
@@ -31,30 +28,20 @@ func main() {
 	}
 
 	// Stop the world cleanly on SIGINT/SIGTERM so an unattended restart
-	// (systemd, container orchestrator, etc.) is graceful, not abrupt.
+	// (systemd, container orchestrator, ...) is graceful, not abrupt — and so
+	// the run gets its chance to certify itself clean, which is what keeps the
+	// next boot from coming up conservatively halted.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Every long-lived loop launches via sup.Go so a panic in one is logged
-	// and contained instead of crashing the process. No loops exist yet; the
-	// supervisor is the boundary they will attach to as strategy/order logic
-	// lands.
-	sup := runtime.NewSupervisor(logger)
-
-	client, err := toss.NewClient(cfg.BaseURL, cfg.ClientID, cfg.ClientSecret.Reveal())
+	app, err := runtime.Assemble(ctx, cfg, logger)
 	if err != nil {
-		logger.Error("failed to construct toss client", "err", err)
+		logger.Error("failed to assemble the bot", "err", err)
 		os.Exit(1)
 	}
-	client.SetLogger(logger)
-	_ = client // wired into the trading loop as strategy/order logic lands.
 
-	logger.Info("toss-trade-bot starting", "base_url", cfg.BaseURL)
-
-	<-ctx.Done()
-	logger.Info("shutting down", "drain_timeout", shutdownTimeout.String())
-	if !sup.Wait(shutdownTimeout) {
-		logger.Warn("shutdown timed out with goroutines still running", "drain_timeout", shutdownTimeout.String())
+	if err := app.Run(ctx); err != nil {
+		logger.Error("bot exited with an error", "err", err)
+		os.Exit(1)
 	}
-	logger.Info("shutdown complete")
 }
