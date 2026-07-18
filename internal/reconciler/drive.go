@@ -180,16 +180,17 @@ func (r *Reconciler) applyVerdict(ctx context.Context, l lookup, inDoubt []time.
 		// Once the intent is resolved it leaves the unresolved set, so its reset is
 		// applied at most once.
 		if !r.resolve(ctx, v, ResolutionFilled) {
-			// The resolution did not durably land. Abandon this fill's reset for good:
-			// by the time the resolve succeeds on a later cycle, a newer failure may
-			// already be counted, and this reset would erase it. Leaving the counter
-			// high is the over-halt direction, which ADR-0012 point 4 explicitly
-			// sanctions ("a reset failure is overcount-safe").
-			r.abandonReset(v.intent.IntentID)
 			return
 		}
-		if r.resetAbandoned(v.intent.IntentID) {
-			r.logger.Warn("success reset abandoned: this fill's resolution needed a retry, so the reset may be stale; leaving the failure counter high (over-halt)",
+		// A reset must never be applied on top of an already-counted NEWER failure.
+		// The in-doubt guard above only orders this fill against OLDER intents; it
+		// does not stop a fill from being established a cycle LATE (a slow lookup)
+		// and then zeroing a streak that a newer rejection has since contributed to.
+		// The streak means "failures since the last success in submit order", so a
+		// reset older than a counted failure is stale and is dropped. Dropping it only
+		// leaves the counter high — the over-halt direction ADR-0012 point 4 sanctions.
+		if r.newerFailureCounted(v.orderingAt()) {
+			r.logger.Warn("success reset dropped as stale: a newer order failure is already counted; leaving the failure counter high (over-halt)",
 				"intent_id", v.intent.IntentID, "order_id", v.orderID)
 			return
 		}
@@ -223,6 +224,9 @@ func (r *Reconciler) applyVerdict(ctx context.Context, l lookup, inDoubt []time.
 				"intent_id", v.intent.IntentID, "order_id", v.orderID, "error", err)
 			return
 		}
+		// Remember how new the newest counted failure is, so a fill that is only
+		// established later cannot reset the streak back over it.
+		r.noteCountedFailure(v.orderingAt())
 		_ = r.resolve(ctx, v, ResolutionRejected)
 	}
 }
@@ -320,28 +324,33 @@ func (r *Reconciler) resolve(ctx context.Context, v intentView, resolution strin
 	return true
 }
 
-// abandonReset permanently gives up a fill's pending success reset (see the
-// verdictFilled branch). Skipping a reset only ever leaves the failure counter
-// high, which is the over-halt direction.
-//
-// The bookkeeping is in-memory, and that is sound because of a reachability
-// pairing rather than durability: the ONLY caller is a journal durability failure
-// on a fill's resolve, and that same failure trips a DURABLE global halt. A
-// restart in that window therefore inherits a standing, human-clear-only block —
-// the stale reset cannot become new exposure, and a human must look at the bot
-// before it trades again. (#35 cannot add a durable per-intent marker: store and
-// killswitch are consume-only here.) TestAbandonedResetAlwaysPairsWithADurableHalt
-// pins the pairing, so a change that abandons a reset without a durable halt fails
-// a test rather than silently becoming a restart fail-open.
-func (r *Reconciler) abandonReset(intentID string) {
+// noteCountedFailure records how new the newest durably-counted order failure is,
+// in submit order.
+func (r *Reconciler) noteCountedFailure(at time.Time) {
 	r.mu.Lock()
-	r.abandonedResets[intentID] = struct{}{}
+	if at.After(r.newestCountedFailureAt) {
+		r.newestCountedFailureAt = at
+	}
 	r.mu.Unlock()
 }
 
-func (r *Reconciler) resetAbandoned(intentID string) bool {
+// newerFailureCounted reports whether a durably-counted failure is at least as
+// new as at, which makes a success reset for at stale. Equal timestamps count as
+// stale: two intents stamped in the same instant cannot be ordered, so the
+// conservative reading (keep the counter high) wins.
+//
+// KNOWN RESIDUAL (restart): this bookkeeping is in-process. #35 consumes store and
+// killswitch without modifying them, and neither offers a durable per-intent
+// "reset already superseded" marker, so a restart starts with an empty memory. A
+// fill that was established before a crash, and whose resolve never landed, can
+// therefore reset a streak on the next boot that a newer rejection had already
+// contributed to — an undercount bounded by the failures counted in that window.
+// The direction is a DELAYED escalation, never a lost block: per-symbol floors and
+// the ambiguous backlog escalation are re-derived from the journal and are
+// unaffected. Closing it fully needs durable state that belongs to a store or
+// killswitch change (a follow-up), not to this package.
+func (r *Reconciler) newerFailureCounted(at time.Time) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	_, ok := r.abandonedResets[intentID]
-	return ok
+	return !r.newestCountedFailureAt.IsZero() && !r.newestCountedFailureAt.Before(at)
 }

@@ -74,7 +74,12 @@
 //     path, for the same reason. A reset that ran before its own resolve stays
 //     replayable while that resolve keeps failing, so a NEWER rejection counted in
 //     between would be erased on the next cycle. Closing the intent first makes the
-//     reset at-most-once, and a fill whose resolve had to be retried abandons its
-//     reset for good. Every skipped reset only leaves the counter high, which
-//     over-halts — the safe direction ADR-0012 point 4 sanctions.
+//     reset at-most-once. On top of that, a reset is dropped as stale whenever a
+//     NEWER failure has already been counted — the in-doubt guard only orders a
+//     fill against OLDER intents, so a slow lookup could otherwise let an older
+//     fill zero a streak a newer rejection had already contributed to. Every
+//     skipped reset only leaves the counter high, which over-halts — the safe
+//     direction ADR-0012 point 4 sanctions. (The stale-reset bookkeeping is
+//     in-process; see newerFailureCounted for the restart residual and why closing
+//     it needs durable state outside this package.)
 package reconciler

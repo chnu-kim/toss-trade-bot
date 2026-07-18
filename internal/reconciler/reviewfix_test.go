@@ -252,41 +252,88 @@ func TestBootScanCancellationDoesNotPromoteFailClosed(t *testing.T) {
 	}
 }
 
-// TestAbandonedResetAlwaysPairsWithADurableHalt is the reachability argument that
-// keeps the abandoned-reset bookkeeping safe even though it is in-memory only
-// (codex review round 2 [P1]).
+// TestSuccessResetSkippedWhenANewerFailureIsAlreadyCounted — codex adversarial
+// review round 2 [high], generalized.
 //
-// The map cannot be made durable here — #35 does not modify store or killswitch,
-// and there is no per-intent durable marker for "this reset was abandoned". What
-// makes that acceptable is that the ONLY way to set it is a journal durability
-// failure on a fill's resolve, and that same failure trips a DURABLE global halt.
-// So a restart in that window inherits a standing, human-clear-only block: the
-// stale reset cannot produce new exposure, and a human has to look at the bot
-// before it trades again.
+// The in-doubt guard is one-sided: it defers a fill's reset behind OLDER
+// undetermined intents, but nothing stopped a fill's reset from landing after a
+// NEWER intent's failure had already been counted. That needs no crash and no
+// resolve failure at all — an older fill whose lookup was slow is simply
+// established a cycle later than a newer rejection:
 //
-// This test pins that pairing. If a future change ever lets a reset be abandoned
-// WITHOUT a durable halt standing, the in-memory map stops being sufficient and
-// the residual becomes a genuine restart fail-open.
-func TestAbandonedResetAlwaysPairsWithADurableHalt(t *testing.T) {
-	r := newRig(t)
-	seedAcked(t, r.db, "i-fill", "AAA", "ord-1")
-	r.api.setOrder(order.Order{
-		OrderID: "ord-1", Symbol: "AAA", Status: order.OrderStatusFilled,
-		Execution: order.OrderExecution{FilledQuantity: "1"},
+//	cycle 1: older A's lookup fails (undetermined); newer B is REJECTED → counted.
+//	cycle 2: A is FILLED → its reset would zero the streak, erasing B.
+//
+// The streak's meaning is "failures since the last success in submit order", so a
+// reset that is older than an already-counted failure must be dropped. Dropping it
+// only leaves the counter high — the over-halt direction.
+func TestSuccessResetSkippedWhenANewerFailureIsAlreadyCounted(t *testing.T) {
+	db, path := openStore(t)
+	sw := newSwitch(t, db, killswitch.Config{
+		OrderFailureThreshold: 5,
+		TokenRefreshThreshold: 5,
+		TokenRefreshWindow:    time.Minute,
 	})
-	r.journal.failResolve("i-fill", errors.New("durable medium failure"))
+	r := newRigWith(t, db, path, sw)
+
+	seedAcked(t, r.db, "i-1", "AAA", "ord-1") // older, lookup fails first
+	seedAcked(t, r.db, "i-2", "AAA", "ord-2") // newer, rejected
+	r.api.fail("ord-1", errors.New("lookup exhausted"))
+	r.api.set("ord-2", order.OrderStatusRejected, "AAA")
 
 	if err := r.boot(); err != nil {
 		t.Fatalf("boot: %v", err)
 	}
+	if got := orderFailureCount(t, r.db); got != 1 {
+		t.Fatalf("counter = %d after the newer rejection, want 1", got)
+	}
 
-	if !r.rec.resetAbandoned("i-fill") {
-		t.Fatal("a fill whose resolve failed did not abandon its success reset")
+	// The older fill is only established now — after that newer failure was counted.
+	r.api.clearFail("ord-1")
+	r.api.setOrder(order.Order{
+		OrderID: "ord-1", Symbol: "AAA", Status: order.OrderStatusFilled,
+		Execution: order.OrderExecution{FilledQuantity: "1"},
+	})
+	if err := r.cycle(); err != nil {
+		t.Fatalf("cycle: %v", err)
 	}
-	if got := haltPhase(t, r.db); got != store.HaltHalted {
-		t.Fatalf("halt phase = %q; an abandoned reset must always be paired with a durable halt, otherwise the in-memory bookkeeping is not restart-safe", got)
+
+	assertResolution(t, r.path, "i-1", ResolutionFilled)
+	if got := orderFailureCount(t, r.db); got != 1 {
+		t.Fatalf("counter = %d — an older fill's reset erased an already-counted newer rejection", got)
 	}
-	if allowed, _ := r.canSubmit("AAA"); allowed {
-		t.Fatal("submissions were allowed in the window where a stale reset can exist")
+	if r.log.contains("report-order-success") {
+		t.Fatal("the stale success reset was applied")
+	}
+}
+
+// TestSuccessResetStillAppliesAfterOnlyOlderFailures is the other side: a fill
+// that is genuinely the newest outcome MUST reset the streak (ADR-0012 point 4).
+// The guard must not degrade into "never reset".
+func TestSuccessResetStillAppliesAfterOlderFailures(t *testing.T) {
+	db, path := openStore(t)
+	sw := newSwitch(t, db, killswitch.Config{
+		OrderFailureThreshold: 5,
+		TokenRefreshThreshold: 5,
+		TokenRefreshWindow:    time.Minute,
+	})
+	r := newRigWith(t, db, path, sw)
+
+	seedAcked(t, r.db, "i-1", "AAA", "ord-1") // older, rejected
+	seedAcked(t, r.db, "i-2", "AAA", "ord-2") // newer, filled
+	r.api.set("ord-1", order.OrderStatusRejected, "AAA")
+	r.api.setOrder(order.Order{
+		OrderID: "ord-2", Symbol: "AAA", Status: order.OrderStatusFilled,
+		Execution: order.OrderExecution{FilledQuantity: "1"},
+	})
+
+	if err := r.boot(); err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+	if !r.log.contains("report-order-success") {
+		t.Fatal("a fill that is the newest outcome did not reset the streak")
+	}
+	if got := orderFailureCount(t, r.db); got != 0 {
+		t.Fatalf("counter = %d, want the newest fill to have reset the streak", got)
 	}
 }
