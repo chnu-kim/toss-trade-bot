@@ -37,10 +37,11 @@ section() { printf '\n=== %s ===\n' "$1"; }
 #   naive한 "${REF[@]}"는 bash 4.4 미만(macOS 기본 /bin/bash 3.2)에서 unbound variable
 #   오류를 내고, 그 오류가 명령 치환 서브셸에서 삼켜지면 모든 scan()이 매치 0건처럼 되어
 #   전체 fail-open했다(L-11). 안전 확장으로 어떤 bash에서도 정상 동작한다.
-scan() { # $1=설명  $2=패턴  $3(opt)=제외 grep -vE 패턴  $4(opt)=추가 git grep 플래그(예: -i)
-  local out rc extra="${4:-}"
+scan() { # $1=설명 $2=패턴 $3(opt)=제외 grep -vE 패턴 $4(opt)=git grep 플래그(예: -i) $5(opt)=추가 제외 pathspec
+  local out rc extra="${4:-}" xpath="${5:-}"
   # 이 스킬 자기 정의 디렉토리는 탐지 패턴·예시를 문서로 담고 있어 항상 걸린다 → 제외.
-  out=$(git grep ${REF[@]+"${REF[@]}"} -nIE $extra "$2" -- . ':!.claude/skills/opensource-maintainer' 2>/dev/null)
+  # $5가 있으면 추가 제외 pathspec(예: ':!*.go')을 붙인다.
+  out=$(git grep ${REF[@]+"${REF[@]}"} -nIE $extra "$2" -- . ':!.claude/skills/opensource-maintainer' ${xpath:+"$xpath"} 2>/dev/null)
   rc=$?
   if [ "$rc" -gt 1 ]; then
     echo "❌ 내부 오류: '$1' 스캔의 git grep 실패(exit $rc) — 게이트 fail-closed." >&2
@@ -55,15 +56,22 @@ scan() { # $1=설명  $2=패턴  $3(opt)=제외 grep -vE 패턴  $4(opt)=추가 
 echo "🔎 opensource-maintainer 스캔 ($SCOPE)"
 
 # 1) 시크릿 — 키워드 뒤에 대입되는 실값. 구분자는 `:`·`=`뿐 아니라 Go의 `:=`도 매칭한다.
-#    값이 따옴표로 감싼 리터럴이면(의도적 하드코딩) 12자+ 무엇이든 후보로 본다. 따옴표 없는
-#    값은 "숫자 1개 이상 + 충분한 길이"를 요구한다 — 실제 시크릿(토큰·키)은 거의 항상 숫자를
-#    포함하는 반면, `field: identifier`(예: Go 구조체의 `clientSecret: clientSecret`) 같은
-#    일반 코드 식별자 대입은 숫자가 없어 과검출되지 않게 하기 위함이다. 나머지 과검출은
-#    아래 제외 목록·모델 판단이 흡수한다(놓치는 것보다 과검출이 안전한 방향).
-scan "시크릿 의심 (키=값 대입)" \
-  '(client_secret|client_id|api[_-]?key|secret_key|access_token|refresh_token|secret|token|password|passwd)["'"'"'`]?[[:space:]]*(:=|[:=])[[:space:]]*(["'"'"'`][A-Za-z0-9._/+-]{12,}|[A-Za-z0-9._/+-]*[0-9][A-Za-z0-9._/+-]{7,})' \
+#  (A) 따옴표 리터럴(모든 파일): 의도적 하드코딩. 12자+ 값을 후보로 본다.
+#  (B) 따옴표 없는 값(비-Go 파일): YAML/env 등 설정의 따옴표 없는 시크릿(`client_secret: 실값`).
+#      Go는 문자열 리터럴이 항상 따옴표라 `.go`의 따옴표 없는 RHS는 코드 식별자(예: 구조체
+#      필드 `clientSecret: clientSecret`)일 뿐 시크릿일 수 없으므로 `*.go`를 제외한다. 이렇게
+#      하면 식별자 대입 과검출 없이도 따옴표 없는 실제 시크릿을 숫자 유무·위치와 무관하게
+#      잡는다(숫자 휴리스틱은 끝자리 숫자·무숫자 토큰을 놓쳐 false-green 위험이라 폐기).
+#  과검출은 아래 제외 목록·모델 판단이 흡수한다(놓치는 것보다 과검출이 안전한 방향).
+scan "시크릿 의심 (따옴표 리터럴)" \
+  '(client_secret|client_id|api[_-]?key|secret_key|access_token|refresh_token|secret|token|password|passwd)["'"'"'`]?[[:space:]]*(:=|[:=])[[:space:]]*["'"'"'`][A-Za-z0-9._/+-]{12,}' \
   'getenv|os\.Getenv|process\.env|example|placeholder|<.*>|YOUR_|xxx+|\$\{' \
   '-i'
+scan "시크릿 의심 (따옴표 없는 값, 비-Go)" \
+  '(client_secret|client_id|api[_-]?key|secret_key|access_token|refresh_token|secret|token|password|passwd)["'"'"'`]?[[:space:]]*(:=|[:=])[[:space:]]*[A-Za-z0-9._/+-]{12,}' \
+  'getenv|os\.Getenv|process\.env|example|placeholder|<.*>|YOUR_|xxx+|\$\{' \
+  '-i' \
+  ':!*.go'
 scan "AWS 액세스 키" 'AKIA[0-9A-Z]{16}'
 scan "개인키 블록" 'BEGIN[ A-Z]*PRIVATE KEY'
 scan "Bearer 토큰 하드코딩" 'Authorization:[[:space:]]*Bearer[[:space:]]+[A-Za-z0-9._-]{16,}'
