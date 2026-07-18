@@ -179,7 +179,15 @@ func (r *Reconciler) applyVerdict(ctx context.Context, l lookup, inDoubt []time.
 		// (permanent undercount, the fail-open the count ordering exists to prevent).
 		// Once the intent is resolved it leaves the unresolved set, so its reset is
 		// applied at most once.
-		if !r.resolve(ctx, v, ResolutionFilled) {
+		switch r.resolve(ctx, v, ResolutionFilled) {
+		case resolveFailed:
+			return
+		case resolveConflicted:
+			// The journal closed this intent with another verdict, so this fill did not
+			// win and must not reset the streak on its behalf. The conflict is already
+			// logged and written to the durable audit medium inside resolve.
+			r.logger.Warn("success reset skipped: the journal recorded a different verdict for this intent",
+				"intent_id", v.intent.IntentID, "order_id", v.orderID)
 			return
 		}
 		// A reset must never be applied on top of an already-counted NEWER failure.
@@ -241,6 +249,10 @@ func (r *Reconciler) applyVerdict(ctx context.Context, l lookup, inDoubt []time.
 		// Remember how new the newest counted failure is, so a fill that is only
 		// established later cannot reset the streak back over it.
 		r.noteCountedFailure(v.orderingAt())
+		// Deliberately asymmetric with the fill branch: count-before-resolve requires
+		// the failure to be durable BEFORE this resolve is attempted, so a conflict
+		// discovered here leaves an overcount rather than letting it be avoided. That
+		// direction over-halts, which is the safe one.
 		_ = r.resolve(ctx, v, ResolutionRejected)
 	}
 }
@@ -298,9 +310,27 @@ func (r *Reconciler) emitFillDelta(ctx context.Context, l lookup) bool {
 	return true
 }
 
+// resolveOutcome distinguishes the three ways a resolve can land, because the
+// caller's follow-up differs for each.
+type resolveOutcome int
+
+const (
+	// resolveFailed means the intent is still open: retry on a later cycle.
+	resolveFailed resolveOutcome = iota
+	// resolveCommitted means this verdict is the one the journal recorded, so this
+	// verdict's side effects (e.g. the success reset) may be applied.
+	resolveCommitted
+	// resolveConflicted means the intent IS closed, but with a DIFFERENT verdict —
+	// this reconciler lost the race and the first resolution is never overwritten.
+	// The audit trail still converges, but the attempted verdict's side effects must
+	// NOT be applied: resetting the failure streak for an order the journal does not
+	// call a fill would corrupt a durable safety counter.
+	resolveConflicted
+)
+
 // resolve terminally closes an intent and immediately converges its audit trail
-// (which is what emits the terminal lifecycle record). It reports whether the
-// intent is now durably closed.
+// (which is what emits the terminal lifecycle record). It reports which of the
+// three outcomes above happened.
 //
 // A store.ErrResolutionConflict is NEVER swallowed (#28): it means two
 // components reached contradictory verdicts about the same order, and the journal
@@ -315,27 +345,29 @@ func (r *Reconciler) emitFillDelta(ctx context.Context, l lookup) bool {
 // marker-write failure this way (ADR-0005 point 6), and the same reasoning holds
 // here, so it escalates to a global halt. Caller cancellation is excluded — a
 // shutdown is not a medium failure (fail-closed-wrong-direction).
-func (r *Reconciler) resolve(ctx context.Context, v intentView, resolution string) bool {
+func (r *Reconciler) resolve(ctx context.Context, v intentView, resolution string) resolveOutcome {
+	outcome := resolveCommitted
 	err := r.journal.ResolveIntent(ctx, v.intent.IntentID, resolution)
 	switch {
 	case err == nil:
 		r.logger.Info("intent resolved", "intent_id", v.intent.IntentID, "resolution", resolution)
 	case errors.Is(err, store.ErrResolutionConflict):
+		outcome = resolveConflicted
 		r.logger.Error("journal resolution CONFLICT: the intent was already closed with a different verdict",
 			"intent_id", v.intent.IntentID, "attempted_resolution", resolution, "error", err)
 		r.emitErrorRecord(ctx, v.intent.IntentID, v.orderID, "reconciler.resolve", "resolution-conflict", err.Error())
 	case ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
 		r.logger.Info("resolve aborted by shutdown; intent left unresolved for the next run",
 			"intent_id", v.intent.IntentID, "resolution", resolution, "error", err)
-		return false
+		return resolveFailed
 	default:
 		r.logger.Error("resolve intent failed on the journal medium; left unresolved and escalating fail-closed",
 			"intent_id", v.intent.IntentID, "resolution", resolution, "error", err)
 		r.tripGlobal(ctx, reasonJournalDurability, r.now())
-		return false
+		return resolveFailed
 	}
 	r.syncAudit(ctx, v.intent.IntentID)
-	return true
+	return outcome
 }
 
 // noteCountedFailure records how new the newest durably-counted order failure is,

@@ -409,3 +409,56 @@ func TestFillSubmittedInThisProcessResetsTheStreak(t *testing.T) {
 		t.Fatalf("counter = %d, want the streak reset by a fully-ordered fill", got)
 	}
 }
+
+// TestResolutionConflictDoesNotApplyTheAttemptedVerdictsSideEffects — codex review
+// round 3 [P2].
+//
+// A resolution conflict means the journal recorded a DIFFERENT verdict and the
+// first one is never overwritten — this reconciler lost the race. Treating the
+// attempted verdict as if it won would then apply that verdict's durable counter
+// side effect: a fill that the journal does not call a fill would still reset the
+// consecutive-failure streak. The conflict must be reported and audited (it is),
+// but its side effects must not fire.
+//
+// The rejection path is deliberately asymmetric: count-before-resolve requires the
+// failure to be durable BEFORE the resolve is attempted, so a conflict discovered
+// afterwards leaves an overcount. That direction over-halts, which is the safe one.
+func TestResolutionConflictDoesNotApplyTheAttemptedVerdictsSideEffects(t *testing.T) {
+	r := newRig(t)
+	if err := r.db.SetCounter(context.Background(), store.Counter{Name: counterOrderFailureName, Value: 2}); err != nil {
+		t.Fatalf("seed counter: %v", err)
+	}
+	seedAcked(t, r.db, "i-conflict", "AAA", "ord-1")
+	r.api.setOrder(order.Order{
+		OrderID: "ord-1", Symbol: "AAA", Status: order.OrderStatusFilled,
+		Execution: order.OrderExecution{FilledQuantity: "1"},
+	})
+
+	// Something else closed it first, with a different verdict.
+	if err := r.db.ResolveIntent(context.Background(), "i-conflict", ResolutionCanceled); err != nil {
+		t.Fatalf("pre-resolve: %v", err)
+	}
+	r.journal.Journal = conflictingJournal{Journal: r.journal.Journal, intentID: "i-conflict"}
+
+	if err := r.cycle(); err != nil {
+		t.Fatalf("cycle: %v", err)
+	}
+
+	if r.log.contains("report-order-success") {
+		t.Fatal("a lost resolution race still applied the fill's counter reset")
+	}
+	if got := orderFailureCount(t, r.db); got != 2 {
+		t.Fatalf("counter = %d, want the durable streak untouched by a verdict that did not win", got)
+	}
+	// The conflict itself is still surfaced, never swallowed (#28).
+	var audited bool
+	for _, ev := range r.sink.errorEvents() {
+		if ev.ErrorClass == "resolution-conflict" && ev.IntentID == "i-conflict" {
+			audited = true
+		}
+	}
+	if !audited {
+		t.Fatal("the resolution conflict was not recorded on the durable audit medium")
+	}
+	assertResolution(t, r.path, "i-conflict", ResolutionCanceled)
+}
