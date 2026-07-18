@@ -70,6 +70,14 @@ var sacredRequiredPaths = []string{
 	// amendment; a later, narrower CODEOWNERS entry stripping its protection would
 	// let the loop quietly rewrite the gate-activation contract. Same twin-artifact rule.
 	"docs/adr/0015-loop-pr-amendment-bootstrap-activation.md",
+	// The Phase B entry runbook (#50) holds the *executable* activation steps
+	// (credential narrowing order, App-key provisioning, flip-and-verify-or-
+	// rollback, bootstrap prechecks) that ADR-0015 governs by reference. Per
+	// ADR-0011 point 4(b) ("main에 있음 ≠ 보호됨"), a gate-defining operational
+	// doc must be CODEOWNERS-protected exactly like the ADR — otherwise a later
+	// loop PR could reorder provisioning ahead of narrowing or drop rollback
+	// without tripping the code-owner gate that protects ADR-0015 itself.
+	"docs/runbooks/phase-b-entry.md",
 	// Every non-test .go source file in internal/gate, individually — not
 	// just one representative file (codex:review [P2] finding on #48's PR:
 	// the privileged workflow compiles and executes the whole package via

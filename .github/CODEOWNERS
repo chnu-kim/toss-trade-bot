@@ -43,6 +43,11 @@
 # [enforcement-integrity, live-execution-human-gate] — 게이트 활성화 절차·flip 트랜잭션을
 # 정의하므로 조용한 개정이 enforcement를 약화(ADR-0015).
 /docs/adr/0015-*.md @chnu-kim
+# Phase B 진입 절차서(#50) — narrowing 순서·flip-and-verify-or-rollback·부트스트랩 프리체크 등
+# 활성화의 *실행* 단계를 담은 gate-defining 문서. ADR-0015가 이를 지배 절차로 참조하므로,
+# 이 파일이 무보호면 loop가 App key 프로비저닝을 narrowing 앞으로 옮기거나 rollback을 빼는 식으로
+# 보호된 ADR을 우회해 활성화 경로를 조용히 약화할 수 있다("main에 있음 ≠ 보호됨", ADR-0011 point 4(b)).
+/docs/runbooks/phase-b-entry.md @chnu-kim
 
 # ADR-0008 verdict 게이트 workflow(이슈 #48) — 특권 verdict-생성 잡의 트리거·
 # 인젝션 하드닝·적격 가드·머지 스텝 정의. /.github/workflows/ 디렉터리 규칙에
