@@ -8,6 +8,29 @@ import (
 	"time"
 )
 
+// ErrHaltRowMissing is returned by the halt writers (MarkHaltPending, TripHalt,
+// ClearHalt) when the halt singleton row (id = 1) is absent, so their UPDATE
+// matches zero rows. Without this check the UPDATE returns no error and the caller
+// gets a false durable-ack: killswitch believes a global halt is persisted when
+// nothing was written, and a restart boots un-halted — the exact silent fail-open
+// ADR-0004 forbids (and the PR#22 "false durable-ack" class). The row can only
+// vanish via a botched migration rebuild, a backup restore, or manual tampering,
+// so surfacing it (fail-closed) beats silently recreating it and masking the
+// anomaly.
+var ErrHaltRowMissing = errors.New("store: halt singleton row (id=1) missing")
+
+// ErrResolutionConflict is returned by ResolveIntent when an already-terminally-
+// resolved intent is re-resolved with a DIFFERENT resolution than the one durably
+// recorded. Re-resolving with the SAME resolution is genuinely idempotent (nil);
+// a conflicting one is a strong signal of a journal-consistency bug (e.g. the
+// killswitch closed the intent aborted-before-submit while the reconciler tries to
+// close it filled). store surfaces it as a sentinel so the consumer (#35
+// reconciler) can log/alert on the contradiction instead of silently dropping the
+// second verdict — the journal is the audit and restart-recovery ground truth, so
+// a swallowed conflict makes a real inconsistency undetectable. The first-recorded
+// resolution is never overwritten.
+var ErrResolutionConflict = errors.New("store: intent already resolved with a different resolution")
+
 // Tx is the atomic-write seam handed to an Atomically callback. Its methods run
 // inside the enclosing transaction, so a logical event that must change several
 // areas together (journal + halt/counter) either fully commits or fully rolls
@@ -172,14 +195,24 @@ func resolveIntent(ctx context.Context, q querier, intentID, resolution string) 
 		return fmt.Errorf("store: resolve intent %q: %w", intentID, err)
 	}
 	if n == 0 {
-		// Either the intent does not exist, or it was already resolved
-		// (idempotent). Distinguish so a missing intent surfaces as a bug.
-		var exists int
-		if err := q.QueryRowContext(ctx, `SELECT 1 FROM intents WHERE intent_id = ?`, intentID).Scan(&exists); err != nil {
+		// Zero rows updated: the intent is either absent or already terminally
+		// resolved (an existing UNRESOLVED intent would have matched the
+		// resolved_at IS NULL clause, so n would be 1). Read the stored resolution
+		// to distinguish the three cases: absent (ErrIntentNotFound), already
+		// resolved with the SAME verdict (genuine idempotency → nil), or already
+		// resolved with a DIFFERENT verdict (journal-consistency conflict →
+		// ErrResolutionConflict). Both the UPDATE and this SELECT run on the same
+		// connection/transaction, so no concurrent writer can interleave between
+		// them.
+		var stored string
+		if err := q.QueryRowContext(ctx, `SELECT resolution FROM intents WHERE intent_id = ?`, intentID).Scan(&stored); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return fmt.Errorf("%w: %q", ErrIntentNotFound, intentID)
 			}
 			return fmt.Errorf("store: resolve intent %q: %w", intentID, err)
+		}
+		if stored != resolution {
+			return fmt.Errorf("%w: %q resolved as %q, cannot re-resolve as %q", ErrResolutionConflict, intentID, stored, resolution)
 		}
 	}
 	return nil
@@ -263,33 +296,45 @@ func loadMarkers(ctx context.Context, q querier, intentID string) ([]Marker, err
 // completed. A clear resets tripped_at to NULL, so the next trip stamps a fresh
 // time.
 func markHaltPending(ctx context.Context, q querier, reason string) error {
-	if _, err := q.ExecContext(ctx,
+	return execHaltSingleton(ctx, q, "mark halt pending",
 		`UPDATE halt SET state = 'pending', reason = ?, tripped_at = COALESCE(tripped_at, ?) WHERE id = 1`,
 		reason, time.Now().UnixNano(),
-	); err != nil {
-		return fmt.Errorf("store: mark halt pending: %w", err)
-	}
-	return nil
+	)
 }
 
 // tripHalt completes the trip (→ halted). It works both directly from none (the
 // count-first single-tx path, ADR-0012 Decision 3) and from pending, preserving
 // the trip-initiation tripped_at across pending→halted (COALESCE).
 func tripHalt(ctx context.Context, q querier, reason string) error {
-	if _, err := q.ExecContext(ctx,
+	return execHaltSingleton(ctx, q, "trip halt",
 		`UPDATE halt SET state = 'halted', reason = ?, tripped_at = COALESCE(tripped_at, ?) WHERE id = 1`,
 		reason, time.Now().UnixNano(),
-	); err != nil {
-		return fmt.Errorf("store: trip halt: %w", err)
-	}
-	return nil
+	)
 }
 
 func clearHalt(ctx context.Context, q querier) error {
-	if _, err := q.ExecContext(ctx,
+	return execHaltSingleton(ctx, q, "clear halt",
 		`UPDATE halt SET state = 'none', reason = '', tripped_at = NULL WHERE id = 1`,
-	); err != nil {
-		return fmt.Errorf("store: clear halt: %w", err)
+	)
+}
+
+// execHaltSingleton runs a halt-table UPDATE and enforces that it matched the
+// singleton row exactly once. SQLite counts every WHERE-matched row for an UPDATE
+// (a zero-change re-trip still reports 1), so RowsAffected != 1 means the id=1 row
+// is absent and the write would otherwise be a false durable-ack (ErrHaltRowMissing,
+// L-1). This closes the halt-write side of the fail-open the same way readHalt
+// already fails closed on a missing row on the read side.
+func execHaltSingleton(ctx context.Context, q querier, what, query string, args ...any) error {
+	res, err := q.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("store: %s: %w", what, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: %s: %w", what, err)
+	}
+	if n != 1 {
+		return fmt.Errorf("store: %s: %w (rows affected = %d)", what, ErrHaltRowMissing, n)
 	}
 	return nil
 }

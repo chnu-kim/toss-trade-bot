@@ -3,12 +3,26 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
+	"os"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver, registered as "sqlite"
 )
+
+// ErrUnsafeDBPath is returned by Open when the database path contains a character
+// that would corrupt the SQLite URI DSN. openConn builds the DSN as
+// "file:" + path + "?" + query, so a '#' in the path is read as a URI fragment
+// boundary — SQLite then silently opens a *truncated, different* file (verified:
+// ".../data#prod/store.db" opens ".../data") — a '?' misparses the pragma query
+// (durability pragmas can be lost), and a raw '%' is misread as a percent-escape
+// introducer. Because "reopen the SAME journal" is load-bearing for restart
+// recovery (ADR-0003/0005), a path that could point the engine at a different
+// file must fail closed at Open, not silently degrade.
+var ErrUnsafeDBPath = errors.New("store: database path contains characters unsafe for the SQLite URI DSN (#, ?, or %)")
 
 // Store is the consumer-facing seam. order/killswitch/reconciler depend on this
 // interface and fake it for unit tests; store's own durability, crash, and
@@ -70,6 +84,19 @@ var _ Store = (*DB)(nil)
 // migrations. Durability is fixed at synchronous=FULL + WAL and must not be
 // relaxed (ADR-0005 point 4).
 func Open(path string) (*DB, error) {
+	// Fail closed BEFORE touching the filesystem if the path would corrupt the URI
+	// DSN (silent wrong-file / lost pragmas — L-8), so no stray file is pre-created
+	// for a path we are about to reject.
+	if err := validateDBPath(path); err != nil {
+		return nil, err
+	}
+	// Pre-create the main file owner-only so the .db and its WAL/SHM sidecars are
+	// never group/other-readable (M-2). This runs before openConn because SQLite
+	// keeps an existing file's mode.
+	if err := secureDBFile(path); err != nil {
+		return nil, err
+	}
+
 	writeDB, err := openConn(path, true)
 	if err != nil {
 		return nil, err
@@ -116,6 +143,51 @@ func openConn(path string, write bool) (*sql.DB, error) {
 		return nil, fmt.Errorf("store: ping %s: %w", path, err)
 	}
 	return db, nil
+}
+
+// validateDBPath rejects paths whose characters break the "file:PATH?query" URI
+// DSN grammar (see ErrUnsafeDBPath). Rejection (rather than escaping) is chosen
+// deliberately: SQLite URI percent-decoding rules are subtle and a mis-escape
+// would reintroduce the very silent-wrong-file hazard this guards against, so a
+// loud fail-closed refusal at startup is the robust choice. os.Stat-after-open
+// verification is not sufficient on its own here because secureDBFile pre-creates
+// the intended path, so the intended path always exists even when SQLite opened a
+// different (truncated) file.
+func validateDBPath(path string) error {
+	if i := strings.IndexAny(path, "#?%"); i >= 0 {
+		return fmt.Errorf("%w: %q (offending %q at index %d)", ErrUnsafeDBPath, path, string(path[i]), i)
+	}
+	return nil
+}
+
+// secureDBFile ensures the main database file exists with owner-only permissions
+// (0o600) BEFORE SQLite opens it, so neither the .db nor its WAL/SHM sidecars
+// (which inherit the main file's mode) are readable by other accounts on a shared
+// host — the DB holds order intents, client_order_ids, and halt reasons, i.e. the
+// account's whole trading activity (M-2). A freshly created file is made 0o600
+// (0o600 has no group/other bits, so any umask only tightens it further); an
+// existing file that is group/other-accessible is tightened in place — a fail-safe
+// repair so an unattended upgrade from a pre-hardening 0o644 database keeps booting
+// instead of refusing to start — and if it cannot be tightened Open fails closed
+// rather than proceeding with world-readable trading data.
+func secureDBFile(path string) error {
+	f, err := os.OpenFile(path, os.O_CREATE, 0o600)
+	if err != nil {
+		return fmt.Errorf("store: pre-create %s: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("store: pre-create %s: %w", path, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("store: stat %s: %w", path, err)
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		if err := os.Chmod(path, 0o600); err != nil {
+			return fmt.Errorf("store: tighten permissions on %s (mode %#o is group/other-accessible): %w", path, perm, err)
+		}
+	}
+	return nil
 }
 
 // Close closes both handles. It is safe to call once.
