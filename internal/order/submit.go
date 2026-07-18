@@ -322,9 +322,17 @@ func (s *Submitter) SubmitIntent(ctx context.Context, intent Intent) (Outcome, e
 		// idempotency limitation noted above (Finding B): the global escalation of a
 		// genuine prepared durability failure (ADR-0005 point 6) is deferred to the same
 		// store follow-up (a single-intent read incl. resolved, or a collision sentinel)
-		// that would let order distinguish the two. NB submit-attempted/acked have no
-		// such ambiguity — their markers table uses an autoincrement PK, so those
-		// AppendMarker calls cannot PK-collide and DO fail-closed on durability failure.
+		// that would let order distinguish the two. NB the submit-attempted/acked
+		// AppendMarker calls below still fail closed on a durability failure. Since #29
+		// they CAN also fail with a protocol sentinel (store.ErrDuplicateMarker /
+		// ErrMarkerAfterTerminal) rather than only a medium failure, but not on any path
+		// reachable from here: a second Submit for the same intentId is caught by the
+		// AppendIntent primary-key collision above and returns before reaching them,
+		// whether the prior attempt is still live (duplicate replay) or already resolved
+		// (hard error). If a future change opens such a path, those two errors must be
+		// split out of the tripOnStoreFailure branches — treating a duplicate marker as
+		// a durability failure would halt the whole bot over a replay
+		// (fail-closed-wrong-direction), which is a policy call for that change to make.
 		return Outcome{}, fmt.Errorf("order: prepared append for %q failed (no POST made; not escalated — cannot distinguish a duplicate replay from a durability failure without store support): %w", intent.IntentID, err)
 	}
 	if err := s.emit(ctx, intent.IntentID, "", store.MarkerPrepared); err != nil {

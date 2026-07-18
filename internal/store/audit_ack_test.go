@@ -427,13 +427,15 @@ func TestRecordAuditAckUnknownIntentIsNotFound(t *testing.T) {
 	}
 }
 
-// TestV3AddsFullyAuditedColumnDefaultNull: a fresh store lands at V3 and a
-// just-appended (unresolved) intent has no fully-audited flag set.
+// TestV3AddsFullyAuditedColumnDefaultNull: a fresh store lands at the latest
+// migration (V3 or later) and a just-appended (unresolved) intent has no
+// fully-audited flag set. The version is asserted as len(migrations) — "at least
+// V3, and current" — so appending a later migration does not disturb it.
 func TestV3AddsFullyAuditedColumnDefaultNull(t *testing.T) {
 	db := openTemp(t)
 	ctx := context.Background()
-	if v, err := db.schemaVersion(ctx); err != nil || v != schemaVersionV3 {
-		t.Fatalf("schema version = %d, err %v, want %d", v, err, schemaVersionV3)
+	if v, err := db.schemaVersion(ctx); err != nil || v != len(migrations) || v < schemaVersionV3 {
+		t.Fatalf("schema version = %d, err %v, want %d (the latest migration, at or past V3)", v, err, len(migrations))
 	}
 	if err := db.AppendIntent(ctx, Intent{IntentID: "i1", ClientOrderID: "c1"}); err != nil {
 		t.Fatalf("AppendIntent: %v", err)

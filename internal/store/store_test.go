@@ -75,8 +75,11 @@ func TestMigrationVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("schemaVersion: %v", err)
 	}
-	if v != schemaVersionV3 {
-		t.Fatalf("schema version = %d, want %d", v, schemaVersionV3)
+	// The assertion is "a fresh Open lands at the LATEST migration", so it is
+	// expressed as len(migrations) rather than a pinned version number — otherwise
+	// every appended migration drags this test along for no reason.
+	if v != len(migrations) {
+		t.Fatalf("schema version = %d, want %d (the latest migration)", v, len(migrations))
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -92,8 +95,8 @@ func TestMigrationVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("schemaVersion (reopen): %v", err)
 	}
-	if v2 != schemaVersionV3 {
-		t.Fatalf("schema version after reopen = %d, want %d", v2, schemaVersionV3)
+	if v2 != len(migrations) {
+		t.Fatalf("schema version after reopen = %d, want %d (the latest migration)", v2, len(migrations))
 	}
 }
 
