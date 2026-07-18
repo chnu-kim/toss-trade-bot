@@ -194,6 +194,20 @@ func (r *Reconciler) applyVerdict(ctx context.Context, l lookup, inDoubt []time.
 				"intent_id", v.intent.IntentID, "order_id", v.orderID)
 			return
 		}
+		// The same ordering question, asked across the restart boundary. In-process
+		// bookkeeping cannot see failures a PREVIOUS process counted, and those
+		// intents are gone from the journal once resolved, so for a fill submitted
+		// before this process started scanning there is no way to prove no newer
+		// failure was already counted. The streak is durable precisely so a restart
+		// cannot reset it (ADR-0004 point 7), so guessing here would be a permanent
+		// undercount of a safety counter. Withhold instead: it only leaves the
+		// counter high, and it self-corrects at the next fill this process orders
+		// end to end.
+		if !v.orderingAt().After(r.processWatermark()) {
+			r.logger.Warn("success reset withheld: this fill predates this process, so a newer failure may already be durably counted; leaving the failure counter high (over-halt)",
+				"intent_id", v.intent.IntentID, "order_id", v.orderID)
+			return
+		}
 		if err := r.guard.ReportOrderSuccess(ctx); err != nil {
 			// The counter simply stays high — conservative, and outside the count
 			// ordering contract (ADR-0012 point 4). The intent is already closed, so
@@ -339,16 +353,9 @@ func (r *Reconciler) noteCountedFailure(at time.Time) {
 // stale: two intents stamped in the same instant cannot be ordered, so the
 // conservative reading (keep the counter high) wins.
 //
-// KNOWN RESIDUAL (restart): this bookkeeping is in-process. #35 consumes store and
-// killswitch without modifying them, and neither offers a durable per-intent
-// "reset already superseded" marker, so a restart starts with an empty memory. A
-// fill that was established before a crash, and whose resolve never landed, can
-// therefore reset a streak on the next boot that a newer rejection had already
-// contributed to — an undercount bounded by the failures counted in that window.
-// The direction is a DELAYED escalation, never a lost block: per-symbol floors and
-// the ambiguous backlog escalation are re-derived from the journal and are
-// unaffected. Closing it fully needs durable state that belongs to a store or
-// killswitch change (a follow-up), not to this package.
+// This covers ordering WITHIN this process. The restart boundary is covered
+// separately by processWatermark, because in-process memory cannot see what a
+// previous process counted.
 func (r *Reconciler) newerFailureCounted(at time.Time) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()

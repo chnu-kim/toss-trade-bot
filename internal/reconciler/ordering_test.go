@@ -210,9 +210,10 @@ func TestAmbiguousDoesNotDeferForever(t *testing.T) {
 	if err := r.boot(); err != nil {
 		t.Fatalf("boot: %v", err)
 	}
-	if !r.log.contains("report-order-success") {
-		t.Fatal("a permanently unresolvable ambiguous intent deferred a later fill forever")
-	}
+	// The fill is ESTABLISHED and closed rather than deferred forever. (Its counter
+	// reset is separately withheld here because the clock jump makes both intents
+	// predate this process's first scan — see TestPreexistingFillDoesNotResetTheStreak.
+	// What matters for THIS test is that the ambiguous intent did not block it.)
 	assertResolution(t, r.path, "i-2", ResolutionFilled)
 	if r.log.contains("report-order-failure") {
 		t.Fatal("an ambiguous submit must never be reported to the order-failure counter (double counting)")

@@ -337,3 +337,75 @@ func TestSuccessResetStillAppliesAfterOlderFailures(t *testing.T) {
 		t.Fatalf("counter = %d, want the newest fill to have reset the streak", got)
 	}
 }
+
+// TestPreexistingFillDoesNotResetTheStreak — codex adversarial review round 3
+// [high].
+//
+// In-process ordering cannot survive a restart, and the consecutive-failure
+// streak is DURABLE precisely so a restart cannot reset it (ADR-0004 point 7). A
+// fill that predates this process may therefore be older than failures a previous
+// process already counted, and this process has no way to prove otherwise —
+// resolved intents are gone from the journal.
+//
+// So a fill whose submit predates this process's first scan does not reset the
+// streak at all. Withholding only leaves the counter high (over-halt, the
+// direction ADR-0012 point 4 sanctions) and it self-corrects on the next fill this
+// process actually orders. The alternative — resetting on a guess — is a permanent
+// undercount of a durable safety counter.
+func TestPreexistingFillDoesNotResetTheStreak(t *testing.T) {
+	r := newRig(t)
+	// A previous process durably counted two failures.
+	if err := r.db.SetCounter(context.Background(), store.Counter{Name: counterOrderFailureName, Value: 2}); err != nil {
+		t.Fatalf("seed counter: %v", err)
+	}
+	seedAcked(t, r.db, "i-old", "AAA", "ord-old")
+	r.api.setOrder(order.Order{
+		OrderID: "ord-old", Symbol: "AAA", Status: order.OrderStatusFilled,
+		Execution: order.OrderExecution{FilledQuantity: "1"},
+	})
+	// The process starts AFTER those intents were written — i.e. they are the
+	// crash-recovery population, not something this process submitted.
+	r.clock.Advance(time.Minute)
+
+	if err := r.boot(); err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+	assertResolution(t, r.path, "i-old", ResolutionFilled)
+	if got := orderFailureCount(t, r.db); got != 2 {
+		t.Fatalf("counter = %d — a fill that predates this process reset a durable streak it cannot order itself against", got)
+	}
+	if r.log.contains("report-order-success") {
+		t.Fatal("a replayed (pre-existing) fill applied a success reset")
+	}
+}
+
+// TestFillSubmittedInThisProcessResetsTheStreak is the self-correction half: once
+// a fill's whole lifetime is inside this process, its ordering IS known, so the
+// reset applies normally and the withheld state does not become permanent.
+func TestFillSubmittedInThisProcessResetsTheStreak(t *testing.T) {
+	r := newRig(t)
+	if err := r.db.SetCounter(context.Background(), store.Counter{Name: counterOrderFailureName, Value: 2}); err != nil {
+		t.Fatalf("seed counter: %v", err)
+	}
+	if err := r.boot(); err != nil { // nothing pre-existing
+		t.Fatalf("boot: %v", err)
+	}
+
+	// A submit that happens while this process is running.
+	seedAcked(t, r.db, "i-new", "AAA", "ord-new")
+	r.api.setOrder(order.Order{
+		OrderID: "ord-new", Symbol: "AAA", Status: order.OrderStatusFilled,
+		Execution: order.OrderExecution{FilledQuantity: "1"},
+	})
+	if err := r.cycle(); err != nil {
+		t.Fatalf("cycle: %v", err)
+	}
+
+	assertResolution(t, r.path, "i-new", ResolutionFilled)
+	if !r.log.contains("report-order-success") {
+		t.Fatal("a fill this process ordered end to end did not reset the streak")
+	}
+	if got := orderFailureCount(t, r.db); got != 0 {
+		t.Fatalf("counter = %d, want the streak reset by a fully-ordered fill", got)
+	}
+}

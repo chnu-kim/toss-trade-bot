@@ -704,6 +704,16 @@ func newRigWith(t *testing.T, db *store.DB, path string, sw *killswitch.Switch, 
 	}
 }
 
+// NOTE on the injected clock and the process watermark: the reconciler records
+// when it FIRST scanned the journal, and a fill submitted at or before that point
+// is treated as belonging to a previous process (its counter reset is withheld —
+// see TestPreexistingFillDoesNotResetTheStreak). In these tests that distinction
+// is expressed by where the clock sits when boot() runs: seeds land with wall-clock
+// marker times just after baseTime, so a test that advances the clock BEFORE
+// booting is declaring "this process started later, these intents are crash
+// recovery", while a test that boots at baseTime is declaring "this process
+// submitted them". Both are exercised deliberately.
+
 // pastSettle moves the clock past the settle window so every seeded
 // submit-attempted intent is unambiguously ambiguous.
 func (r *rig) pastSettle() {

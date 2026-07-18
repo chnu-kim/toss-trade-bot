@@ -50,6 +50,7 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 	}
 
 	now := r.now()
+	r.markWatermark(now)
 	views := make([]intentView, 0, len(intents))
 	for _, in := range intents {
 		views = append(views, classify(in, now, r.settleWindow))
@@ -145,6 +146,30 @@ func (r *Reconciler) reconcileSymbolBlocks(needBlock map[string]struct{}) {
 		r.guard.ClearSymbol(sym)
 		r.logger.Info("per-symbol block auto-cleared: zero residual blocking evidence", "symbol", sym)
 	}
+}
+
+// markWatermark records when this process first looked at the journal, and
+// processWatermark reads it back.
+//
+// It divides intents into two populations with different orderability. An intent
+// submitted AFTER the watermark cannot be older than any failure a previous
+// process counted (those are all for intents that already existed), so this
+// process can order its fill exactly. An intent submitted at or before it might
+// be, and the evidence is unrecoverable — a resolved intent leaves the journal.
+// The success path treats the second population conservatively (see the
+// verdictFilled branch).
+func (r *Reconciler) markWatermark(at time.Time) {
+	r.mu.Lock()
+	if r.watermark.IsZero() {
+		r.watermark = at
+	}
+	r.mu.Unlock()
+}
+
+func (r *Reconciler) processWatermark() time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.watermark
 }
 
 // isBlocked reports whether THIS reconciler currently holds a block on symbol.

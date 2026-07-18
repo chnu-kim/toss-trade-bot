@@ -211,6 +211,11 @@ type Reconciler struct {
 	// ever releases a symbol in this set, so it can never open a block some other
 	// component established.
 	blocked map[string]struct{}
+	// watermark is when this process first scanned the journal. Fills submitted at
+	// or before it cannot be ordered against failures a PREVIOUS process counted,
+	// so their success reset is withheld (see markWatermark / the verdictFilled
+	// branch).
+	watermark time.Time
 	// newestCountedFailureAt is the submit-order time of the newest order failure
 	// this process has durably counted. A fill older than it cannot reset the
 	// streak (see newerFailureCounted, which documents the restart residual).

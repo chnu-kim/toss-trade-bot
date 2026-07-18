@@ -79,7 +79,9 @@
 //     fill against OLDER intents, so a slow lookup could otherwise let an older
 //     fill zero a streak a newer rejection had already contributed to. Every
 //     skipped reset only leaves the counter high, which over-halts — the safe
-//     direction ADR-0012 point 4 sanctions. (The stale-reset bookkeeping is
-//     in-process; see newerFailureCounted for the restart residual and why closing
-//     it needs durable state outside this package.)
+//     direction ADR-0012 point 4 sanctions. Across a RESTART the same question
+//     cannot be answered at all — a resolved intent has left the journal, and the
+//     streak is durable precisely so a restart cannot reset it (ADR-0004 point 7) —
+//     so a fill that predates this process's first scan withholds its reset
+//     entirely and self-corrects at the next fill this process orders end to end.
 package reconciler
