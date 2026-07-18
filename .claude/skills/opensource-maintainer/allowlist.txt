@@ -18,3 +18,12 @@
 # allowlist 하지 말고 제거·회전한다.
 
 internal/config/config_test.go|raw-test-secret-do-not-log|L-9(로그 유출 금지) 검증용 합성 상수 — 실제 시크릿 아님
+
+# 스캐너 본체·스킬 문서의 자기참조 줄(탐지 패턴과 그 설명 자체). 이 두 파일은 통째로
+# 제외하지 않고 스캔하며, 아래 줄만 좁게 허용한다. 리터럴은 그 줄의 고유한 산문을 쓴다
+# — 패턴 문자열 자체를 리터럴로 적으면 이 매니페스트가 스스로 후보로 잡히기 때문이다.
+.claude/skills/opensource-maintainer/scripts/scan.sh|시크릿일 수 없으므로|Go 식별자 대입 예시를 설명하는 주석
+.claude/skills/opensource-maintainer/scripts/scan.sh|커밋되면 서명 키|개인 도구 식별자 탐지 사유를 설명하는 주석
+.claude/skills/opensource-maintainer/scripts/scan.sh|scan "환경 의존|환경 의존 탐지 패턴 정의 줄
+.claude/skills/opensource-maintainer/SKILL.md|홈 절대경로(|무엇을 차단하는지 설명하는 문서 줄
+.claude/skills/opensource-maintainer/SKILL.md|특정 OS/머신 가정(|무엇을 차단하는지 설명하는 문서 줄

@@ -152,6 +152,21 @@ OUT=$(run_scan bash "$D" --all); RC=$?
 [ "$RC" -eq 0 ] && pass "값 자체가 placeholder면 제외 유지(exit 0)" || { fail "placeholder 값 과검출(exit=$RC)"; printf '%s\n' "$OUT"; }
 rm -rf "$D"
 
+echo "== 스캐너 디렉토리도 스캔한다 (회귀 스위트 1개 파일만 예외) =="
+# 디렉토리를 통째로 빼면 '보호는 되지만 검사되지 않는' 사각지대가 생겨, 거기 실제
+# 자격증명이 들어가도 CI가 초록으로 통과한다.
+D=$(make_repo \
+  '.claude/skills/opensource-maintainer/SKILL.md|client_secret: RealLeakInDocs123456' \
+  '.claude/skills/opensource-maintainer/allowlist.txt|# 주석뿐인 매니페스트' \
+  '.claude/skills/opensource-maintainer/newfile.md|client_secret: RealLeakInNewFile1234' \
+  '.claude/skills/opensource-maintainer/scripts/scan_test.sh|client_secret: FixtureValueIgnored12')
+OUT=$(run_scan bash "$D" --all); RC=$?
+grep -q 'SKILL.md' <<<"$OUT" && pass "스킬 문서의 시크릿은 검출됨" || fail "스킬 문서가 사각지대(false-green)"
+grep -q 'newfile.md' <<<"$OUT" && pass "디렉토리에 새로 생긴 파일도 검출됨" || fail "새 파일이 사각지대(false-green)"
+{ ! grep -q 'scan_test.sh' <<<"$OUT"; } && pass "회귀 스위트 파일만 예외로 제외" || fail "회귀 스위트가 제외되지 않음(항상 red)"
+[ "$RC" -eq 1 ] && pass "스캐너 디렉토리 유출 시 exit 1" || fail "exit=$RC (1 기대)"
+rm -rf "$D"
+
 echo "== --content-only: 커밋 설정 점검만 건너뛰고 내용 스캔은 유지 =="
 # CI 러너엔 user.email이 없어 설정 점검이 항상 실패한다 → --content-only로 그 절만 건너뛴다.
 # 단, 내용(시크릿) 스캔이 함께 약해지면 안 된다.
