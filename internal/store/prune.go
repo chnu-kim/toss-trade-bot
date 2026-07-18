@@ -195,16 +195,22 @@ func pruneTerminalIntents(ctx context.Context, q querier, before time.Time, limi
 	return stats, nil
 }
 
+// pruneCandidateQuery selects one bounded, deterministic batch of eligible intents.
+//
+// It is a named constant because its shape is a CONTRACT with idx_intents_prunable
+// (schemaV5): the index exists to serve exactly these predicates and this ordering,
+// and TestPruneCandidateSelectionUsesTheIndex asserts the planner actually uses it.
+// Changing the predicate or the ORDER BY here without moving the index would
+// silently reintroduce a full scan plus a sort under the write lock.
+const pruneCandidateQuery = `SELECT intent_id FROM intents WHERE ` + pruneEligibleWhere + `
+	ORDER BY resolved_at, intent_id LIMIT ?`
+
 // selectPruneCandidates returns the ids of at most limit eligible intents, oldest
 // resolution first. Draining the result set completely before any DELETE is
 // required, not stylistic: the pass runs on the single write connection, where a
 // live result set and a write cannot coexist.
 func selectPruneCandidates(ctx context.Context, q querier, cutoff int64, limit int) ([]string, error) {
-	rows, err := q.QueryContext(ctx,
-		`SELECT intent_id FROM intents WHERE `+pruneEligibleWhere+`
-		 ORDER BY resolved_at, intent_id LIMIT ?`,
-		cutoff, cutoff, limit,
-	)
+	rows, err := q.QueryContext(ctx, pruneCandidateQuery, cutoff, cutoff, limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: select prune candidates: %w", err)
 	}

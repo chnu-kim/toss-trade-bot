@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -494,6 +495,55 @@ func TestPruneRejectsNonPositiveBatch(t *testing.T) {
 		if _, err := db.PruneTerminalIntents(context.Background(), time.Now(), limit); err == nil {
 			t.Fatalf("PruneTerminalIntents(limit=%d) err = nil, want a fail-closed error", limit)
 		}
+	}
+}
+
+// TestPruneCandidateSelectionUsesTheIndex is an availability guard, and it is the
+// reason schemaV5 exists.
+//
+// The prune pass opens the single write transaction and only THEN selects its
+// candidates. Without an index matching the predicate and the ordering, that
+// selection is a full scan of intents plus a temp-B-tree sort — while holding the
+// one connection every writer shares. The batch limit bounds how many rows are
+// deleted, but it does not bound the scan, so on a large journal a retention pass
+// would stall AppendMarker, and a stalled submit-attempted append is exactly the
+// hazard the retention loop exists to prevent. Growing backlogs are also precisely
+// when prune runs hardest, so the failure mode compounds itself.
+//
+// Reading the planner's output is the only way to assert this: a functional test
+// passes just as happily against a full scan.
+func TestPruneCandidateSelectionUsesTheIndex(t *testing.T) {
+	db := openTemp(t)
+	cutoff := time.Now().UnixNano()
+
+	rows, err := db.readDB.QueryContext(context.Background(),
+		`EXPLAIN QUERY PLAN `+pruneCandidateQuery, cutoff, cutoff, testBatch)
+	if err != nil {
+		t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
+	}
+	defer rows.Close()
+
+	var plan string
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatalf("scan query plan: %v", err)
+		}
+		plan += detail + "\n"
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate query plan: %v", err)
+	}
+
+	if !strings.Contains(plan, pruneIndexName) {
+		t.Fatalf("prune candidate selection does not use %s — it scans the journal under the write lock.\nplan:\n%s",
+			pruneIndexName, plan)
+	}
+	// A temp B-tree means the planner sorted the rows itself, i.e. it had to visit
+	// every candidate before the LIMIT could apply.
+	if strings.Contains(plan, "TEMP B-TREE") {
+		t.Fatalf("prune candidate selection sorts in a temp B-tree; the index no longer serves the ORDER BY.\nplan:\n%s", plan)
 	}
 }
 
