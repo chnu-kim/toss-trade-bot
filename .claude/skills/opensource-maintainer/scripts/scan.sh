@@ -98,14 +98,12 @@ EOF
 #   전체 fail-open했다(L-11). 안전 확장으로 어떤 bash에서도 정상 동작한다.
 scan() { # $1=설명 $2=패턴 $3(opt)=제외 grep -vE 패턴 $4(opt)=git grep 플래그(예: -i) $5(opt)=추가 제외 pathspec
   local out rc extra="${4:-}" xpath="${5:-}"
-  # 제외는 회귀 스위트 파일 **하나**뿐이다. 그 파일은 존재 목적 자체가 합성 시크릿
-  # 픽스처라 스캔하면 항상 빨갛다. 반대로 스캐너 본체(scan.sh)·스킬 문서(SKILL.md)·
-  # allowlist 매니페스트·이 디렉토리에 새로 생길 파일은 **전부 스캔한다** — 디렉토리를
-  # 통째로 빼면 보호는 되지만 검사되지 않는 사각지대가 생겨, 거기에 실제 자격증명이
-  # 들어가도 CI가 초록으로 통과한다. 본체·문서의 자기참조 몇 줄은 allowlist 매니페스트로
-  # 좁게 pin 한다.
+  # 파일 단위 제외는 없다. 스캐너 본체·회귀 스위트·스킬 문서·allowlist 매니페스트까지
+  # 전부 스캔한다 — 어떤 파일이든 통째로 빼면 '보호는 되지만 검사되지 않는' 사각지대가
+  # 되어, 거기 실제 자격증명이 들어가도 CI가 초록으로 통과한다. 회귀 스위트는 픽스처
+  # 값을 변수로 조립해 소스에 자격증명 형태를 남기지 않는 방식으로 스캔 대상에 남는다.
   # $5가 있으면 추가 제외 pathspec(예: ':!*.go')을 붙인다.
-  out=$(git grep ${REF[@]+"${REF[@]}"} -nIE $extra "$2" -- . ':!.claude/skills/opensource-maintainer/scripts/scan_test.sh' ${xpath:+"$xpath"} 2>/dev/null)
+  out=$(git grep ${REF[@]+"${REF[@]}"} -nIE $extra "$2" -- . ${xpath:+"$xpath"} 2>/dev/null)
   rc=$?
   if [ "$rc" -gt 1 ]; then
     echo "❌ 내부 오류: '$1' 스캔의 git grep 실패(exit $rc) — 게이트 fail-closed." >&2
