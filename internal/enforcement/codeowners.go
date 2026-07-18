@@ -111,6 +111,44 @@ var sacredRequiredPaths = []string{
 	"internal/gate/verdict.go",
 	"cmd/verdict-gate/main.go",
 	"configs/gate/risk-classification.json",
+	// This package itself (#64). The checker that decides whether the sacred
+	// paths are protected was, until now, the one gate-defining component with
+	// no protection of its own: neither .github/CODEOWNERS nor this slice
+	// mentioned internal/enforcement. That is a hollow gate — a loop able to
+	// edit this code can delete an entry from this very slice, or weaken
+	// CheckCodeowners/effectiveOwner, and thereby open the code-owner gate for
+	// everything else without a single code-owner review. ADR-0009 point 3's
+	// adversarial-loop threat model is exactly this case, and it is the same
+	// class as (but more fundamental than) the internal/gate, phase-b-entry
+	// runbook and scripts/ registrations: "main에 있음 ≠ 보호됨"
+	// (ADR-0011 point 4(b)).
+	//
+	// This is NOT circular self-approval. The slice only asserts "does
+	// CODEOWNERS still keep these paths owned by RequiredOwner" — it grants no
+	// merge right, approves nothing, and cannot let a PR through. The actual
+	// blocking power stays where ADR-0009 point 4 put it: GitHub branch
+	// protection plus a human code-owner review, layers a loop cannot edit.
+	// This check can only ever report that protection is gone; it can never
+	// supply protection to itself.
+	//
+	// Listed file-by-file rather than leaning on the /internal/enforcement/
+	// directory rule alone, following the internal/gate precedent: ownership
+	// resolves last-match-wins, so a later, narrower ownerless entry can strip
+	// exactly one file while the directory rule still looks protective.
+	// TestSacredRequiredPaths_CoversEveryEnforcementSourceFile keeps this list
+	// complete as the package grows.
+	"internal/enforcement/adrprotects.go",
+	"internal/enforcement/branchprotection.go",
+	"internal/enforcement/codeowners.go",
+	"internal/enforcement/codeowners_pattern.go",
+	"internal/enforcement/doc.go",
+	"internal/enforcement/github_client.go",
+	"internal/enforcement/identity.go",
+	"internal/enforcement/presence.go",
+	"internal/enforcement/pullrequest.go",
+	"internal/enforcement/repocontent.go",
+	"internal/enforcement/result.go",
+	"internal/enforcement/workflowrevision.go",
 }
 
 // codeownersEntry is one non-comment, non-blank CODEOWNERS line: a path

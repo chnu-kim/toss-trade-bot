@@ -32,6 +32,7 @@ const validCodeowners = `# enforcement-integrity sacred invariant (ADR-0009) 의
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
+/internal/enforcement/ @chnu-kim
 
 /.github/CODEOWNERS @chnu-kim
 `
@@ -134,6 +135,7 @@ func TestCheckCodeowners_MissingPhaseBRunbookFailsClosed(t *testing.T) {
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
+/internal/enforcement/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
@@ -166,6 +168,7 @@ func TestCheckCodeowners_MissingNarrowingScriptFailsClosed(t *testing.T) {
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
+/internal/enforcement/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
@@ -243,6 +246,7 @@ func TestCheckCodeowners_CommentsAndBlankLinesIgnored(t *testing.T) {
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
+/internal/enforcement/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
@@ -337,6 +341,7 @@ func TestCheckCodeowners_LaterEntryWithSameOwnerStillSatisfies(t *testing.T) {
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
+/internal/enforcement/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 /.github/workflows/ci.yml @chnu-kim
 /.github/workflows/verdict-gate.yml @chnu-kim
@@ -399,6 +404,7 @@ func TestCheckCodeowners_GateArtifactOwnerStripped(t *testing.T) {
 /internal/gate/
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
+/internal/enforcement/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
@@ -433,11 +439,85 @@ func TestCheckCodeowners_NarrowerCarveOutOnOneGateFileNotCaught(t *testing.T) {
 /internal/gate/sanity.go
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
+/internal/enforcement/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
 	if got.Satisfied {
 		t.Fatal("a narrower ownerless entry stripping protection from internal/gate/sanity.go specifically must not satisfy the check, even though riskclassification.go (and the directory pattern) still look protected")
+	}
+}
+
+// TestSacredRequiredPaths_CoversEveryEnforcementSourceFile keeps the checker's
+// own self-registration from drifting, the same way sacredADRRegistry keeps the
+// ADR roster from drifting: a .go file added to this package later must be
+// registered too, or it becomes an unprotected hole in the checker.
+//
+// Files are registered INDIVIDUALLY rather than relying on the
+// /internal/enforcement/ directory rule alone, following the internal/gate
+// precedent: GitHub resolves ownership by last-match-wins, so a later, narrower
+// ownerless entry can strip exactly one file while the directory rule still
+// looks protective.
+func TestSacredRequiredPaths_CoversEveryEnforcementSourceFile(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	registered := map[string]bool{}
+	for _, p := range sacredRequiredPaths {
+		registered[p] = true
+	}
+
+	var found int
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		found++
+		path := "internal/enforcement/" + name
+		if !registered[path] {
+			t.Errorf("%s가 sacredRequiredPaths에 미등재 — 검사기 자신의 파일이 무보호면 presence-check 전체가 공동화된다. 같은 PR에서 .github/CODEOWNERS와 함께 등재하라", path)
+		}
+	}
+	if found == 0 {
+		t.Fatal("enforcement 소스 파일을 하나도 찾지 못함 — 경로 해석 오류로 보임")
+	}
+}
+
+// TestCheckCodeowners_EnforcementFileCarveOutCaught is the fail-closed
+// regression for that self-registration: a later, narrower ownerless entry that
+// strips protection from exactly one enforcement source file must be caught.
+// Without it, a loop could silently take ownership of the very code that
+// decides whether the sacred paths are protected — weaken CheckCodeowners or
+// delete an entry from sacredRequiredPaths with no code-owner review.
+func TestCheckCodeowners_EnforcementFileCarveOutCaught(t *testing.T) {
+	content := `/.github/workflows/ @chnu-kim
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+/docs/adr/0011-*.md @chnu-kim
+/docs/adr/0012-*.md @chnu-kim
+/docs/adr/0013-*.md @chnu-kim
+/docs/adr/0014-*.md @chnu-kim
+/docs/adr/0015-*.md @chnu-kim
+/docs/runbooks/phase-b-entry.md @chnu-kim
+/scripts/ @chnu-kim
+/internal/gate/ @chnu-kim
+/cmd/verdict-gate/ @chnu-kim
+/configs/gate/ @chnu-kim
+/internal/enforcement/ @chnu-kim
+/internal/enforcement/adrprotects.go
+/.github/CODEOWNERS @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if got.Satisfied {
+		t.Fatal("enforcement 파일 하나만 벗겨내는 후행 ownerless 항목이 통과해선 안 된다 — 디렉터리 규칙이 여전히 보호처럼 보여도 last-match-wins로 그 파일은 무보호다")
+	}
+	if !strings.Contains(got.Reason, "adrprotects.go") {
+		t.Fatalf("실패 사유가 벗겨진 파일을 지목하지 않음: %q", got.Reason)
 	}
 }
 
@@ -467,6 +547,7 @@ func TestCheckCodeowners_PRCreationWorkflowCarveOutCaught(t *testing.T) {
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
+/internal/enforcement/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
@@ -494,6 +575,7 @@ scripts/** @chnu-kim
 internal/gate/** @chnu-kim
 cmd/verdict-gate/** @chnu-kim
 configs/gate/** @chnu-kim
+internal/enforcement/** @chnu-kim
 .github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
