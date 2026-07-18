@@ -117,6 +117,7 @@ func TestCheckCodeowners_Missing0013FailsClosed(t *testing.T) {
 /docs/adr/0010-*.md @chnu-kim
 /docs/adr/0011-*.md @chnu-kim
 /docs/adr/0012-*.md @chnu-kim
+/docs/adr/0014-*.md @chnu-kim
 /.github/workflows/verdict-gate.yml @chnu-kim
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
