@@ -20,16 +20,20 @@ var ErrSchemaTooNew = errors.New("store: database schema is newer than this bina
 // that together gate prune on "every lifecycle audit record durably acked"
 // (ADR-0006 point 4). This issue SETS that flag; the retention/prune loop (#14)
 // READS it to decide eligibility and does not touch the schema — so V3 and #14
-// do not collide on this file.
+// do not collide on this file. V4 (issue #29) enforces the ADR-0002 2-marker
+// protocol's integrity in the schema itself (UNIQUE + shape CHECKs on markers).
 //
 // The version number is the shared contract that keeps concurrently-open store
 // issues from colliding: whichever merges first claims the next number and the
-// others rebase onto it (issue #60 "공유 접점"). This issue was originally
-// planned as V2 but rebased onto V3 after #60 merged first and took V2.
+// others rebase onto it (issue #60 "공유 접점"). Issue #20 was originally planned
+// as V2 but rebased onto V3 after #60 merged first and took V2; issue #29 was in
+// turn drafted as V3 and rebased onto V4 for the same reason. Derive the next
+// number from this list, never from an issue body.
 const (
 	schemaVersionV1 = 1
 	schemaVersionV2 = 2
 	schemaVersionV3 = 3
+	schemaVersionV4 = 4
 )
 
 // migrations is the ordered migration list. Index i migrates the schema from
@@ -39,6 +43,7 @@ var migrations = []string{
 	schemaV1,
 	schemaV2,
 	schemaV3,
+	schemaV4,
 }
 
 // schemaV1 creates the three areas of live state: the order journal (intents +
@@ -145,6 +150,128 @@ CREATE TABLE audit_acks (
 );
 `
 
+// schemaV4 enforces the ADR-0002 2-marker protocol's integrity in the schema
+// (issue #29, audit finding M-7). Until now the markers table had no UNIQUE or
+// CHECK constraint, so every protocol violation was accepted with err=nil: a
+// second submit-attempted, an acked with no orderId, a second acked binding a
+// different orderId. Because submit-attempted is appended BEFORE the irreversible
+// POST (write-ahead), enforcing this at the engine catches a duplicate-submit bug
+// or race while it is still free — before money moves — and it cannot be forgotten
+// by a future writer the way a store-layer check can.
+//
+// It is additive (no shipped migration is edited) and adds three rules:
+//
+//   - UNIQUE (intent_id, kind): each ADR-0002 transition happens at most once per
+//     intent. Uniqueness is per (intent, kind), so different intents of course
+//     still carry their own full progression.
+//   - kind IN (...): the marker vocabulary is fixed by ADR-0002 and must not
+//     drift. An unrecognized kind would persist and then fall through the
+//     reconciler's branch (ADR-0003), leaving the intent unclassified forever.
+//   - the acked ⇔ order_id biconditional: acked exists precisely to persist the
+//     orderId, which is the only post-hoc truth handle (ADR-0002 point 3), so an
+//     empty one is a lie; and order_id on any other kind is invisible corruption,
+//     because ReconstructLifecycleRecords silently drops it.
+//
+// SQLite cannot ADD a CONSTRAINT to a live table, so markers is rebuilt the same
+// way V2 rebuilt halt. Two properties of that rebuild are load-bearing:
+//
+//   - seq is copied EXPLICITLY, not regenerated. audit_acks.record_key is
+//     "m:<seq>" (V3), so renumbering would dangle every recorded ack and silently
+//     break the prune gate (ADR-0006 point 4). Copying explicit rowids into an
+//     AUTOINCREMENT table also carries the sqlite_sequence high-water mark across,
+//     so a new marker never reuses a seq an ack already refers to.
+//   - No table has a foreign key pointing AT markers, so dropping and renaming it
+//     under foreign_keys=ON re-targets nothing. The FK from markers to intents is
+//     restated on the new table.
+//
+// idx_markers_intent is deliberately not recreated: ux_markers_intent_kind leads
+// with intent_id, so it already serves every "markers for this intent" lookup, and
+// a second index on the same prefix is dead weight on the write path.
+//
+// If rows already on disk violate these rules, the migration FAILS (surfaced as
+// ErrMigrationDataViolation) rather than repairing them — see that sentinel for
+// why deleting the evidence of a duplicate submit is not an option.
+//
+// The migration validates every invariant V4 introduces, not only the three the
+// table constraints can express — exactly where the stored data proves the rule,
+// and best-effort where it does not (see the post-terminal probe below, whose
+// limits are stated rather than papered over). The other two are cross-row rules
+// enforced
+// by appendMarker (no marker after terminal; no transition before its
+// predecessor), and an upgrade that admitted rows violating them would leave the
+// database in a state the running code declares impossible. Since a CHECK cannot
+// span rows, they are pre-checked by probing for offending rows into a throwaway
+// guard table whose NAMED constraints reject the probe — so a violation surfaces
+// as "CHECK constraint failed: markers_v4_marker_order", which names the broken
+// invariant, and a clean journal inserts nothing and drops an empty table.
+//
+// The ordering probe requires the predecessor to have a LOWER seq, not merely to
+// exist. seq is the durable append order that loadMarkers and
+// ReconstructLifecycleRecords replay in, so a journal holding acked at an earlier
+// seq than its submit-attempted is a state appendMarker can never produce (a new
+// marker's AUTOINCREMENT seq is always above every existing one, which is why the
+// live guard can settle for a plain EXISTS) and would otherwise be imported
+// unchallenged. Unlike the post-terminal probe this needs no timestamp proxy —
+// seq is exact.
+//
+// The post-terminal probe is different in kind: it is BEST-EFFORT, not a proof,
+// and the claim above is bounded accordingly. It compares markers.at against
+// intents.resolved_at, a wall-clock proxy for the causal rule ("was this row
+// inserted while the intent was still unresolved") that the schema simply does
+// not record — pre-V4 rows carry no shared append sequence spanning marker writes
+// and resolutions. It is exact while the wall clock is monotonic across the two
+// writes; ties are read as legal. It therefore has BOTH error directions:
+//
+//   - false positive (a backwards clock step across a legal marker/resolve pair):
+//     a loud refusal to boot, the direction this store already chooses for
+//     ErrUnsafeDBPath/ErrSchemaTooNew;
+//   - false negative (a genuinely post-terminal marker whose at ties or predates
+//     the resolution): silently imported.
+//
+// Adding a durable resolution sequence to intents would NOT close the false
+// negative, because legacy rows have no such value to reconstruct — it would only
+// re-prove what appendMarker already enforces exactly for new writes. So the real
+// choice is a best-effort probe or none, and a probe that catches the realistic
+// cases strictly dominates: its misses are bounded to bookkeeping in the fail-safe
+// direction. An imported post-terminal marker yields one extra reconstructed
+// lifecycle record, which keeps fully_audited_at unset and therefore makes prune
+// PRESERVE the intent (#14); it cannot resurrect a resolved intent into the live
+// set, because liveness is read from intents.resolved_at and not from markers.
+// TestUpgradeImportsPostTerminalMarkerWithNonLaterTimestamp pins this limitation
+// so it stays visible rather than becoming folklore.
+const schemaV4 = `
+CREATE TABLE markers_v4_precheck (
+	violation INTEGER NOT NULL,
+	CONSTRAINT markers_v4_no_marker_after_terminal CHECK (violation != 1),
+	CONSTRAINT markers_v4_marker_order CHECK (violation != 2)
+);
+INSERT INTO markers_v4_precheck (violation)
+	SELECT 1 FROM markers m JOIN intents i ON i.intent_id = m.intent_id
+	WHERE i.resolved_at IS NOT NULL AND m.at > i.resolved_at;
+INSERT INTO markers_v4_precheck (violation)
+	SELECT 2 FROM markers m WHERE
+		(m.kind = 'submit-attempted' AND NOT EXISTS (
+			SELECT 1 FROM markers p
+			WHERE p.intent_id = m.intent_id AND p.kind = 'prepared' AND p.seq < m.seq))
+		OR (m.kind = 'acked' AND NOT EXISTS (
+			SELECT 1 FROM markers p
+			WHERE p.intent_id = m.intent_id AND p.kind = 'submit-attempted' AND p.seq < m.seq));
+DROP TABLE markers_v4_precheck;
+CREATE TABLE markers_v4 (
+	seq       INTEGER PRIMARY KEY AUTOINCREMENT,
+	intent_id TEXT NOT NULL REFERENCES intents(intent_id),
+	kind      TEXT NOT NULL CHECK (kind IN ('prepared', 'submit-attempted', 'acked')),
+	order_id  TEXT NOT NULL DEFAULT '',
+	at        INTEGER NOT NULL,
+	CHECK ((kind = 'acked' AND order_id != '') OR (kind != 'acked' AND order_id = ''))
+);
+INSERT INTO markers_v4 (seq, intent_id, kind, order_id, at)
+	SELECT seq, intent_id, kind, order_id, at FROM markers ORDER BY seq;
+DROP TABLE markers;
+ALTER TABLE markers_v4 RENAME TO markers;
+CREATE UNIQUE INDEX ux_markers_intent_kind ON markers(intent_id, kind);
+`
+
 // migrate brings the database up to the latest migration, running each pending
 // step in its own transaction and advancing PRAGMA user_version transactionally.
 // It is idempotent: reopening an up-to-date database is a no-op.
@@ -171,6 +298,17 @@ func applyMigration(ctx context.Context, db *sql.DB, index int, ddl string) erro
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
 	if _, err := tx.ExecContext(ctx, ddl); err != nil {
+		// A constraint violation here is categorically different from a medium
+		// failure: it means rows ALREADY on disk contradict an invariant this
+		// migration introduces (e.g. a journal that already holds two
+		// submit-attempted markers for one intent). Surface it as its own sentinel
+		// so the operator gets a diagnosable "your journal violates the protocol"
+		// instead of an opaque driver string, and so a caller can never mistake it
+		// for a transient disk problem worth retrying. The transaction rolls back,
+		// so the offending rows and the old user_version both survive for inspection.
+		if _, isConstraint := constraintCode(err); isConstraint {
+			return fmt.Errorf("store: apply migration %d: %w: %v", index+1, ErrMigrationDataViolation, err)
+		}
 		return fmt.Errorf("store: apply migration %d: %w", index+1, err)
 	}
 	// PRAGMA user_version cannot be parameterized; index+1 is an int constant.

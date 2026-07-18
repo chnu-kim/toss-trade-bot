@@ -4,7 +4,13 @@
 // store and one transaction boundary:
 //
 //   - the write-ahead order journal (outbox) with its 2-marker progression
-//     prepared → submit-attempted → acked (ADR-0002),
+//     prepared → submit-attempted → acked (ADR-0002), whose protocol invariants
+//     are enforced by the SCHEMA (V4, issue #29) rather than by the discipline of
+//     the layers above it: each transition is unique per intent, an acked marker
+//     must carry the orderId and no other kind may, and no marker may be appended
+//     once the intent is terminally resolved. Because submit-attempted is written
+//     BEFORE the irreversible POST, a duplicate-submit bug or race is refused at
+//     the durability layer while it is still free — before money moves,
 //   - the global halt as a durable none→pending→halted→none lifecycle that
 //     survives restarts (ADR-0004, ADR-0012 Decision 1(c)); pending records a
 //     trip durably initiated but not completed so an unclean recovery can treat

@@ -172,12 +172,53 @@ func appendIntent(ctx context.Context, q querier, in Intent) error {
 	return appendMarker(ctx, q, in.IntentID, MarkerPrepared, "")
 }
 
+// appendMarker durably appends one 2-marker journal transition, enforcing the
+// ADR-0002 protocol invariants (issue #29). Uniqueness per (intent, kind) and the
+// marker's shape are enforced by the V4 schema, so this function only has to
+// translate the engine's verdict into a sentinel (classifyMarkerErr).
+//
+// Two of the rules span ROWS, which a CHECK cannot: the intent must still be
+// unresolved (no marker after terminal), and the preceding transition must
+// already exist (no acked without submit-attempted). Both are folded into the
+// INSERT's SELECT rather than done as a read-then-insert, so the engine evaluates
+// them as part of the same statement and a concurrent resolve cannot land in the
+// window between a check and the write.
 func appendMarker(ctx context.Context, q querier, intentID string, kind MarkerKind, orderID string) error {
-	if _, err := q.ExecContext(ctx,
-		`INSERT INTO markers (intent_id, kind, order_id, at) VALUES (?, ?, ?, ?)`,
+	pred := requiredPredecessor(kind)
+	res, err := q.ExecContext(ctx,
+		`INSERT INTO markers (intent_id, kind, order_id, at)
+		 SELECT ?, ?, ?, ? FROM intents
+		 WHERE intent_id = ? AND resolved_at IS NULL
+		   AND (? = '' OR EXISTS (SELECT 1 FROM markers WHERE intent_id = ? AND kind = ?))`,
 		intentID, string(kind), orderID, time.Now().UnixNano(),
-	); err != nil {
+		intentID, string(pred), intentID, string(pred),
+	)
+	if err != nil {
+		return fmt.Errorf("store: append marker %s for %q: %w", kind, intentID, classifyMarkerErr(err))
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
 		return fmt.Errorf("store: append marker %s for %q: %w", kind, intentID, err)
+	}
+	if n == 0 {
+		// The SELECT matched no row, so exactly one of the row-spanning guards
+		// refused: the intent is absent, it is already terminally resolved, or the
+		// predecessor transition is missing. Report which — collapsing them would send
+		// a caller chasing the wrong bug, since "never journaled", "closed while I was
+		// mid-flight", and "the journal skipped a step" call for opposite responses.
+		// Every statement here runs on the same connection/transaction, so no writer
+		// can interleave between them.
+		var resolvedAt sql.NullInt64
+		switch err := q.QueryRowContext(ctx, `SELECT resolved_at FROM intents WHERE intent_id = ?`, intentID).Scan(&resolvedAt); {
+		case errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf("store: append marker %s: %w: %q", kind, ErrIntentNotFound, intentID)
+		case err != nil:
+			return fmt.Errorf("store: append marker %s for %q: %w", kind, intentID, err)
+		case resolvedAt.Valid:
+			return fmt.Errorf("store: append marker %s for %q: %w", kind, intentID, ErrMarkerAfterTerminal)
+		}
+		return fmt.Errorf("store: append marker %s for %q: %w (requires an existing %s marker)",
+			kind, intentID, ErrMarkerOutOfOrder, pred)
 	}
 	return nil
 }
