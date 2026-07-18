@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -517,7 +518,7 @@ func TestPruneCandidateSelectionUsesTheIndex(t *testing.T) {
 	cutoff := time.Now().UnixNano()
 
 	rows, err := db.readDB.QueryContext(context.Background(),
-		`EXPLAIN QUERY PLAN `+pruneCandidateQuery, cutoff, cutoff, testBatch)
+		`EXPLAIN QUERY PLAN `+pruneCandidateQuery, cutoff, testBatch)
 	if err != nil {
 		t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
 	}
@@ -540,11 +541,60 @@ func TestPruneCandidateSelectionUsesTheIndex(t *testing.T) {
 		t.Fatalf("prune candidate selection does not use %s — it scans the journal under the write lock.\nplan:\n%s",
 			pruneIndexName, plan)
 	}
+	// Using the index is NOT enough, and this is the subtle half. If the index led on
+	// plain resolved_at, the planner would still report "USING INDEX" while bounding
+	// on resolved_at alone and then walking every older row to test the second cutoff
+	// — so a backlog of old-resolved-but-recently-finalized rows (what a reconciler
+	// draining a crash tail produces) would be an unbounded prefix examined on every
+	// pass. SQLite reports a real range constraint as a bound in parentheses, e.g.
+	// "(<expr><?)"; its absence means the traversal is not bounded by the cutoff.
+	if !strings.Contains(plan, "SEARCH") || !strings.Contains(plan, "<?") {
+		t.Fatalf("prune candidate selection is not range-bounded by the retention cutoff; "+
+			"it walks the index until LIMIT is satisfied, under the write lock.\nplan:\n%s", plan)
+	}
 	// A temp B-tree means the planner sorted the rows itself, i.e. it had to visit
 	// every candidate before the LIMIT could apply.
 	if strings.Contains(plan, "TEMP B-TREE") {
 		t.Fatalf("prune candidate selection sorts in a temp B-tree; the index no longer serves the ORDER BY.\nplan:\n%s", plan)
 	}
+}
+
+// TestPruneSkipsRecentlyFinalizedBacklogCorrectly is the functional companion to the
+// query-plan test, in the shape the adversarial review called out: a large backlog of
+// intents resolved long ago but finalized moments ago (what a reconciler draining a
+// crash tail produces), sitting ahead of a few genuinely eligible rows in resolution
+// order. The pass must return only the eligible rows.
+func TestPruneSkipsRecentlyFinalizedBacklogCorrectly(t *testing.T) {
+	db := openTemp(t)
+	ctx := context.Background()
+	ancient := time.Now().Add(-365 * 24 * time.Hour)
+	justFinalized := time.Now()
+
+	// Ancient resolutions, finalized just now ⇒ NOT eligible, and they sort FIRST by
+	// resolved_at — the ordering a naive index would traverse.
+	for i := 0; i < 50; i++ {
+		id := fmt.Sprintf("backlog-%02d", i)
+		seedFullyAuditedIntent(t, db, id, ancient)
+		setIntentTimes(t, db, id, &ancient, &justFinalized)
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	for i := 0; i < 3; i++ {
+		seedFullyAuditedIntent(t, db, fmt.Sprintf("eligible-%d", i), old)
+	}
+
+	stats, err := db.PruneTerminalIntents(ctx, time.Now().Add(-time.Hour), testBatch)
+	if err != nil {
+		t.Fatalf("PruneTerminalIntents: %v", err)
+	}
+	if stats.Intents != 3 {
+		t.Fatalf("pruned %d intents, want exactly the 3 past-window rows", stats.Intents)
+	}
+	for i := 0; i < 50; i++ {
+		if !intentExists(t, db, fmt.Sprintf("backlog-%02d", i)) {
+			t.Fatal("a recently-finalized intent was pruned inside its retention window")
+		}
+	}
+	assertReferentialIntegrity(t, db)
 }
 
 // TestPruneKeepsMarkerSeqMonotonic pins an interaction with #29/#20 that is easy to

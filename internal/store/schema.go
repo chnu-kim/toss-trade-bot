@@ -302,20 +302,32 @@ const pruneIndexName = "idx_intents_prunable"
 // The index mirrors pruneCandidateQuery exactly:
 //
 //   - the partial WHERE matches the query's two IS NOT NULL conjuncts, so SQLite's
-//     planner can prove the index covers the query. It also keeps the index SMALL
-//     and, more importantly, keeps it off the hot path: a newly appended intent has
-//     resolved_at NULL and is therefore not indexed at all, so the submit path pays
-//     nothing for it. Only ResolveIntent and finalizeFullyAudited touch it, once
-//     each, on rows that are never written again.
-//   - (resolved_at, intent_id) is the ORDER BY prefix, so the oldest-first batch is
-//     read straight off the index and the LIMIT stops the scan early — no sort.
-//   - fully_audited_at trails as a payload column, which makes the index covering:
-//     the second cutoff comparison is answered without touching the table.
+//     planner can prove the index applies. It also keeps the index SMALL and, more
+//     importantly, keeps it off the hot path: a newly appended intent has resolved_at
+//     NULL and is therefore not indexed at all, so the submit path pays nothing for
+//     it. Only ResolveIntent and finalizeFullyAudited touch it, once each, on rows
+//     that are never written again.
+//   - the leading key is the EXPRESSION MAX(resolved_at, fully_audited_at) — the same
+//     expression the query filters and orders by — which is what makes the scan
+//     genuinely bounded. An index leading on plain resolved_at would look right and
+//     still be wrong: the planner could range-bound only that column and would then
+//     walk every older row testing the second cutoff, so a backlog of
+//     old-resolved-but-recently-finalized rows (precisely what a reconciler draining
+//     a crash tail creates) would be an unbounded prefix examined on every pass. With
+//     the expression as the key, eligibility is one monotone value and the scan stops
+//     at the first row past the cutoff. Verified through the planner rather than
+//     assumed: TestPruneCandidateSelectionUsesTheIndex asserts the range bound is
+//     present, not merely that the index is used.
+//   - intent_id trails it to complete the ORDER BY, so the batch is read out in order
+//     with no temp B-tree, and LIMIT ends the traversal.
+//
+// SQLite's two-argument MAX() is the scalar function (the aggregate is the one-arg
+// form) and is deterministic, so it is legal in an index expression.
 //
 // Adding an index is not a data-shape change, so unlike V4 this migration cannot
 // fail on pre-existing rows.
 const schemaV5 = `
-CREATE INDEX idx_intents_prunable ON intents(resolved_at, intent_id, fully_audited_at)
+CREATE INDEX idx_intents_prunable ON intents(MAX(resolved_at, fully_audited_at), intent_id)
 	WHERE resolved_at IS NOT NULL AND fully_audited_at IS NOT NULL;
 `
 

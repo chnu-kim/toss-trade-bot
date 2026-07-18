@@ -74,36 +74,47 @@ var ErrPruneRaced = errors.New("store: intent stopped being prune-eligible mid-t
 //   - resolved_at IS NOT NULL — terminal only. This is what keeps an in-flight
 //     intent (prepared, submit-attempted awaiting settlement, unresolved-ambiguous)
 //     out of reach of deletion no matter how old it is (ADR-0005 point 6, ADR-0003).
+//
 //   - fully_audited_at IS NOT NULL — the prune gate. Unset means at least one
 //     lifecycle audit record has not been durably acked, and while that is true the
 //     journal is that record's only durable outbox (ADR-0006 point 4). Unset ⇒
 //     preserve; that is the fail-safe direction, and it is why a crash tail is safe
 //     even though it leaves rows behind forever until a reconciler re-emits them.
-//   - resolved_at <= cutoff — the retention window applied to the resolution. In
-//     every state this store can produce the NEXT conjunct already implies this one
-//     (finalize refuses to run before resolution, so fully_audited_at >=
-//     resolved_at), which makes it look redundant. It stops being redundant exactly
-//     when the wall clock steps BACKWARDS between the two writes — an NTP correction
-//     between ResolveIntent and FinalizeFullyAudited suffices — leaving an old flag
-//     timestamp beside a resolution that is still well inside the window. Keeping it
-//     means the window holds under a clock this package does not control.
-//   - fully_audited_at <= cutoff — the same window applied to the moment the gate
-//     opened. An intent can be resolved long ago and only be finalized now (a
-//     restart reconciler re-emitting a crash tail does precisely that). Without this
-//     conjunct such a row would become deletable the instant it was flagged, while
-//     the reconciler that flagged it may still be working through the same intent.
 //
-// Together the two window conjuncts measure from the LATER of the two events, which
-// is the conservative reading of "the retention window elapsed". The comparison is
-// inclusive (<=): a cutoff of "now minus the window" means the window has elapsed at
-// exactly that instant.
+//   - MAX(resolved_at, fully_audited_at) <= cutoff — the retention window, measured
+//     from the LATER of the two durable events. Both halves matter and neither is
+//     implied by the other:
 //
-// Each conjunct is mutation-checked: removing any one of them turns a specific test
-// in prune_test.go red, so none of them is decorative.
+//     The fully_audited_at half is what stops a just-finalized intent from being
+//     deletable the instant its gate opened. An intent can be resolved long ago and
+//     only be finalized now — a restart reconciler re-emitting a crash tail does
+//     precisely that — and the reconciler that flagged it may still be working
+//     through the same intent.
+//
+//     The resolved_at half looks redundant, because in every state this store can
+//     produce fully_audited_at >= resolved_at (finalize refuses to run before
+//     resolution). It stops being redundant exactly when the wall clock steps
+//     BACKWARDS between the two writes — one NTP correction between ResolveIntent
+//     and FinalizeFullyAudited suffices — leaving an old flag timestamp beside a
+//     resolution still well inside the window.
+//
+//     Writing it as a single MAX() rather than two comparisons is not cosmetic. It
+//     turns eligibility into ONE monotone key, which is what lets idx_intents_prunable
+//     (schemaV5) range-bound the candidate scan: the scan stops at the first row past
+//     the cutoff instead of walking every older row to test a second, unindexed
+//     comparison. With two separate conjuncts the planner can only bound on the
+//     leading column, so a backlog of old-resolved-but-recently-finalized rows — the
+//     exact shape a crash tail produces — becomes an unbounded prefix examined under
+//     the write lock on every pass.
+//
+// The comparison is inclusive (<=): a cutoff of "now minus the window" means the
+// window has elapsed at exactly that instant.
+//
+// Every guard here is mutation-checked: removing any one of them turns a specific
+// test in prune_test.go red, so none of them is decorative.
 const pruneEligibleWhere = `resolved_at IS NOT NULL
 	AND fully_audited_at IS NOT NULL
-	AND resolved_at <= ?
-	AND fully_audited_at <= ?`
+	AND MAX(resolved_at, fully_audited_at) <= ?`
 
 // PruneStats reports what one prune pass removed. The three counts are reported
 // separately because they are the observable evidence that a pass deleted a
@@ -180,7 +191,7 @@ func pruneTerminalIntents(ctx context.Context, q querier, before time.Time, limi
 		// is wrong at a level this code cannot reason about, so the pass aborts and
 		// rolls back rather than deleting on an assumption.
 		n, err := execCount(ctx, q, `DELETE FROM intents WHERE intent_id = ? AND `+pruneEligibleWhere,
-			id, cutoff, cutoff)
+			id, cutoff)
 		if err != nil {
 			return PruneStats{}, fmt.Errorf("store: prune intent %q: %w", id, err)
 		}
@@ -195,22 +206,29 @@ func pruneTerminalIntents(ctx context.Context, q querier, before time.Time, limi
 	return stats, nil
 }
 
-// pruneCandidateQuery selects one bounded, deterministic batch of eligible intents.
+// pruneCandidateQuery selects one bounded, deterministic batch of eligible intents,
+// longest-eligible first.
 //
 // It is a named constant because its shape is a CONTRACT with idx_intents_prunable
-// (schemaV5): the index exists to serve exactly these predicates and this ordering,
-// and TestPruneCandidateSelectionUsesTheIndex asserts the planner actually uses it.
-// Changing the predicate or the ORDER BY here without moving the index would
-// silently reintroduce a full scan plus a sort under the write lock.
+// (schemaV5): the index is built on the same MAX() expression and the same ordering,
+// and TestPruneCandidateSelectionUsesTheIndex asserts the planner both picks it AND
+// range-bounds on it. Changing the predicate or the ORDER BY here without moving the
+// index would silently reintroduce an unbounded scan (and a sort) under the write
+// lock — while every functional test kept passing.
+//
+// The ordering is on the eligibility key, not on resolved_at, so the batch drains
+// the rows that have been eligible LONGEST. That is the queue discipline a retention
+// backlog wants, and it is also what lets the ORDER BY be answered by the same index
+// traversal that the range bound already performs.
 const pruneCandidateQuery = `SELECT intent_id FROM intents WHERE ` + pruneEligibleWhere + `
-	ORDER BY resolved_at, intent_id LIMIT ?`
+	ORDER BY MAX(resolved_at, fully_audited_at), intent_id LIMIT ?`
 
 // selectPruneCandidates returns the ids of at most limit eligible intents, oldest
 // resolution first. Draining the result set completely before any DELETE is
 // required, not stylistic: the pass runs on the single write connection, where a
 // live result set and a write cannot coexist.
 func selectPruneCandidates(ctx context.Context, q querier, cutoff int64, limit int) ([]string, error) {
-	rows, err := q.QueryContext(ctx, pruneCandidateQuery, cutoff, cutoff, limit)
+	rows, err := q.QueryContext(ctx, pruneCandidateQuery, cutoff, limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: select prune candidates: %w", err)
 	}
