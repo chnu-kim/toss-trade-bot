@@ -413,10 +413,10 @@ func TestADRProtectsCompleteness_GrantsNoAutonomy(t *testing.T) {
 	}
 }
 
-// TestADRProtectsCompleteness_RealRepoCoversKnownSacredADRs pins the currently
-// expected set so that an ADR quietly losing its protects: declaration (which
-// would make the generic check vacuously pass for it) is still caught.
-func TestADRProtectsCompleteness_RealRepoCoversKnownSacredADRs(t *testing.T) {
+// currentlyDeclaringADRIDs returns the ids of every ADR whose frontmatter
+// declares a non-empty protects: list.
+func currentlyDeclaringADRIDs(t *testing.T) map[string]bool {
+	t.Helper()
 	decls, err := loadADRDecls(repoRootForTest)
 	if err != nil {
 		t.Fatalf("loadADRDecls() error = %v", err)
@@ -427,9 +427,43 @@ func TestADRProtectsCompleteness_RealRepoCoversKnownSacredADRs(t *testing.T) {
 			declaring[adrIDFromPath(d.Path)] = true
 		}
 	}
-	for _, id := range []string{"0004", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015"} {
+	return declaring
+}
+
+// TestSacredADRRegistry_NoDeclarationSilentlyRemoved is the de-wiring guard.
+//
+// The frontmatter-derived checks are structurally blind to a simultaneous
+// three-way removal: drop an ADR's protects:, its sacredRequiredPaths entry and
+// its CODEOWNERS line in one PR and the forward check skips it (nothing
+// declared), the reverse check skips it (nothing registered), and protection is
+// gone with everything green. The registry is the only artifact that remembers
+// the decision was sacred.
+func TestSacredADRRegistry_NoDeclarationSilentlyRemoved(t *testing.T) {
+	declaring := currentlyDeclaringADRIDs(t)
+	for _, id := range sacredADRRegistry {
 		if !declaring[id] {
-			t.Errorf("ADR-%s는 sacred invariant를 보호하는데 protects: 선언이 비어있거나 사라짐 — SSOT가 약화됨", id)
+			t.Errorf("ADR-%s가 sacredADRRegistry에 있으나 frontmatter protects: 가 비어있거나 사라짐 — sacred 집합에서 조용히 빠졌다. 의도된 제거라면 registry에서도 근거와 함께 지워라(그 diff가 곧 사람 검토 지점이다)", id)
+		}
+	}
+}
+
+// TestSacredADRRegistry_NewDeclarationMustRegister keeps the registry
+// self-maintaining. Without it the roster would only ever protect the ADRs that
+// existed when it was written, so any sacred ADR added later would silently
+// miss the de-wiring guard above — the same drift that made ten hand-written
+// per-ADR fixtures fail, reintroduced one level up (codex adversarial-review
+// [high] on PR #74).
+func TestSacredADRRegistry_NewDeclarationMustRegister(t *testing.T) {
+	registered := map[string]bool{}
+	for _, id := range sacredADRRegistry {
+		if registered[id] {
+			t.Fatalf("sacredADRRegistry에 %s가 중복 등재됨", id)
+		}
+		registered[id] = true
+	}
+	for id := range currentlyDeclaringADRIDs(t) {
+		if !registered[id] {
+			t.Errorf("ADR-%s가 protects: 를 선언했으나 sacredADRRegistry에 미등재 — 같은 PR에서 등재하라. 등재해야 이후 이 선언이 조용히 제거되는 것을 막을 수 있다", id)
 		}
 	}
 }

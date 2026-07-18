@@ -61,6 +61,43 @@ import (
 // docs/adr/ prefix used by sacredRequiredPaths.
 const adrDirRel = "docs/adr"
 
+// sacredADRRegistry is the historical roster of ADR ids that declare a
+// non-empty protects: list. It is checked in BOTH directions
+// (TestSacredADRRegistry_*), which is what makes it self-maintaining rather
+// than one more hand-mirror of the kind this file exists to police:
+//
+//   - Every id here must still declare a non-empty protects:. This catches
+//     de-wiring, which the frontmatter-derived checks structurally cannot: an
+//     ADR that loses its protects: AND its sacredRequiredPaths entry AND its
+//     CODEOWNERS line disappears from both directions at once and leaves them
+//     vacuously green (codex adversarial-review [high] on PR #74).
+//   - Every currently-declaring ADR must appear here. Without this the roster
+//     would only ever cover ADRs that existed when it was written — exactly the
+//     drift that made the ten hand-written per-ADR fixtures fail — so a sacred
+//     ADR added later would never gain de-wiring protection.
+//
+// The practical effect is that removing a decision from the sacred set can no
+// longer be a silent deletion: it must show up in a diff here, next to a
+// comment saying so, in the same PR that edits the (code-owner protected) ADR.
+//
+// Known limitation, deliberately not fixed here: this file is not itself a
+// CODEOWNERS-protected path, so the roster raises the visibility of a de-wiring
+// PR rather than gating it. Moving it under CODEOWNERS protection is a wiring
+// change (a new sacred path), which is out of scope for issue #64 — that PR
+// touches enforcement wiring only, by explicit instruction.
+var sacredADRRegistry = []string{
+	"0004", // live-execution-human-gate — kill-switch submit guard
+	"0007", // live-execution-human-gate — dev-time autonomy boundary
+	"0008", // enforcement-integrity — independent verification gate
+	"0009", // live-execution-human-gate, enforcement-integrity — the sacred carve-out itself
+	"0010", // enforcement-integrity — frontmatter SSOT
+	"0011", // enforcement-integrity — loop PR credential flow
+	"0012", // live-execution-human-gate — kill-switch durability/ordering
+	"0013", // live-execution-human-gate — kill-switch mirror concurrency
+	"0014", // live-execution-human-gate — reconciler escalation / bounded re-count
+	"0015", // enforcement-integrity, live-execution-human-gate — Phase A/B activation
+}
+
 // adrFileNameRE matches the canonical ADR filename form (docs/adr/README.md and
 // why-adr.md are companion docs, not ADRs, and carry no frontmatter).
 var adrFileNameRE = regexp.MustCompile(`^(\d{4})-.+\.md$`)
