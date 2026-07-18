@@ -61,6 +61,12 @@ type BootDecision struct {
 	// Conservative reports that this boot came up halted and stays fail-closed
 	// until an operator clears it.
 	Conservative bool
+	// Fatal reports that the boot cannot proceed at all: the durable running
+	// marker never landed, so this run is invisible to the next boot's crash
+	// detection. Unlike Conservative — which an operator may clear — this cannot
+	// be waived, because clearing an in-memory halt does not repair the durable
+	// marker.
+	Fatal bool
 	// Reason explains Conservative in operator-readable terms.
 	Reason string
 	// Err carries any sentinel read/write failure. It is diagnostic only: the
@@ -128,15 +134,25 @@ func BootSentinel(ctx context.Context, st SentinelStore, g SentinelGuard, logger
 
 	// (3) flip to running — attempted even when the read failed, so the NEXT
 	// boot can still detect this run as unclean.
+	//
+	// A failure here is FATAL, not merely halted. A boot halt is in-memory and
+	// operator-clearable, and clearing it does not repair the durable marker: an
+	// operator who clears the halt and then hits a crash would leave the
+	// PREVIOUS run's clean on disk, so the next boot would trust a run that was
+	// never marked running — precisely the stale-clean fail-open (#1) this
+	// sentinel exists to close. No in-memory carrier is strong enough to protect
+	// a durable invariant, so the boot refuses instead. Restarting is safe and is
+	// the normal unattended recovery: the next attempt retries the flip.
 	if err := st.SetLifecycle(ctx, store.LifecycleRunning); err != nil {
 		setErr := fmt.Errorf("mark clean-shutdown sentinel running: %w", err)
 		d.Err = errors.Join(d.Err, setErr)
+		d.Fatal = true
 		if !d.Conservative {
 			d.Conservative = true
 			d.Reason = "sentinel could not be marked running: a crash in this run would look clean to the next boot"
 			g.BootHalt()
 		}
-		logger.Error("clean-shutdown sentinel could not be marked running; booting halted",
+		logger.Error("clean-shutdown sentinel could not be marked running; refusing to run",
 			"err", setErr)
 	}
 
@@ -152,6 +168,12 @@ func BootSentinel(ctx context.Context, st SentinelStore, g SentinelGuard, logger
 // without first flipping the sentinel.
 func Boot(ctx context.Context, st SentinelStore, g SentinelGuard, logger *slog.Logger, startRecovery func()) BootDecision {
 	d := BootSentinel(ctx, st, g, logger)
+	if d.Fatal {
+		// No durable running marker means there is no safe run to recover into:
+		// starting recovery would leave a live process sitting over a stale
+		// clean marker. The caller stops the process instead.
+		return d
+	}
 	if startRecovery != nil {
 		startRecovery()
 	}

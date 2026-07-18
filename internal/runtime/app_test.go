@@ -341,3 +341,45 @@ func (b *syncBuffer) String() string {
 	defer b.mu.Unlock()
 	return string(b.buf)
 }
+
+// TestApp_RunRefusesBootWhenTheSentinelFlipFails is the process-level half of
+// the fatal rule: without a durable running marker the run is invisible to the
+// next boot's crash detection, so Run must return an error (non-zero exit, which
+// makes the supervisor retry) instead of trading on a stale clean marker.
+func TestApp_RunRefusesBootWhenTheSentinelFlipFails(t *testing.T) {
+	cfg := testConfig(t)
+	app, err := Assemble(context.Background(), cfg, discardLogger())
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+
+	// Swap in a sentinel seam whose running flip fails, leaving the real store
+	// (and therefore the previous marker) untouched.
+	app.sentinel = &flipFailingSentinel{SentinelStore: app.db}
+
+	// Run must return promptly WITHOUT waiting for a shutdown signal.
+	done := make(chan error, 1)
+	go func() { done <- app.Run(context.Background()) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Run must fail when the running flip never persisted")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run blocked instead of refusing the boot")
+	}
+}
+
+// flipFailingSentinel fails only the running flip; reads and the clean write
+// pass through, so the test isolates exactly the durable-marker failure.
+type flipFailingSentinel struct {
+	SentinelStore
+}
+
+func (s *flipFailingSentinel) SetLifecycle(ctx context.Context, ls store.LifecycleState) error {
+	if ls == store.LifecycleRunning {
+		return errors.New("test: sentinel write unavailable")
+	}
+	return s.SentinelStore.SetLifecycle(ctx, ls)
+}

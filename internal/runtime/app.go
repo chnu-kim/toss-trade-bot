@@ -35,8 +35,12 @@ type App struct {
 	logger *slog.Logger
 	sup    *Supervisor
 
-	client    *toss.Client
-	db        *store.DB
+	client *toss.Client
+	db     *store.DB
+	// sentinel is the lifecycle seam Boot/Shutdown judge through. It is a.db in
+	// production; the narrow interface keeps the judgment testable against an
+	// injected store and keeps the journal out of reach.
+	sentinel  SentinelStore
 	sink      *audit.Writer
 	guard     *killswitch.Switch
 	rec       *reconciler.Reconciler
@@ -152,6 +156,7 @@ func Assemble(ctx context.Context, cfg config.Config, logger *slog.Logger) (app 
 		sup:       NewSupervisor(logger),
 		client:    client,
 		db:        db,
+		sentinel:  db,
 		sink:      sink,
 		guard:     guard,
 		rec:       rec,
@@ -196,7 +201,7 @@ func (a *App) Run(ctx context.Context) error {
 		"store_path", a.cfg.StorePath,
 		"audit_dir", a.cfg.AuditDir)
 
-	decision := Boot(ctx, a.db, a.guard, a.logger, func() {
+	decision := Boot(ctx, a.sentinel, a.guard, a.logger, func() {
 		// reconciler.Run performs the boot scan and only then opens the replay
 		// gate, then keeps reconciling until ctx is cancelled. It runs under the
 		// supervisor so a panic is contained rather than fatal.
@@ -206,6 +211,18 @@ func (a *App) Run(ctx context.Context) error {
 			}
 		})
 	})
+	if decision.Fatal {
+		// The durable running marker never landed, so this process is invisible
+		// to the next boot's crash detection. Nothing has been started yet;
+		// release the handles and exit non-zero so the supervisor retries.
+		a.logger.Error("boot refused: the clean-shutdown sentinel could not be marked running",
+			"err", decision.Err)
+		if cerr := a.Close(); cerr != nil {
+			a.logger.Error("failed to release resources after a refused boot", "err", cerr)
+		}
+		return fmt.Errorf("runtime: boot refused: %w", decision.Err)
+	}
+
 	a.logger.Info("boot complete",
 		"previous_sentinel", string(decision.Previous),
 		"conservative_halt", decision.Conservative)
@@ -219,13 +236,19 @@ func (a *App) Run(ctx context.Context) error {
 			"drain_timeout", a.cfg.ShutdownTimeout.String())
 	}
 
-	// Stop escalating token failures now that the store is about to close: a
-	// report landing after the sentinel decision could not be persisted anyway,
-	// and it must not race the close.
-	a.client.SetTokenRefreshFailureHook(nil)
-
+	// The token-refresh escalation hook stays registered through the sentinel
+	// decision on purpose. Token flights are detached from the supervisor, so a
+	// refresh that failed just before shutdown may still be running its
+	// post-flight notification; de-registering here would DROP that report even
+	// though the store is still open and could persist it — and the run could
+	// then certify itself clean with an uncounted non-reconstructable failure.
+	// Leaving it registered is strictly safer: a report that lands before the
+	// close is durably counted (and a resulting halt survives via the durable
+	// halt row even if the clean was already written), while one that lands
+	// after the close fails into an in-memory latch on a process that is exiting
+	// anyway — the same residual a crash has.
 	sd := Shutdown(ctx, ShutdownPlan{
-		Sentinel: a.db,
+		Sentinel: a.sentinel,
 		Guard:    a.guard,
 		Drained:  drained,
 		Logger:   a.logger,

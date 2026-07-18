@@ -230,10 +230,18 @@ func TestBootSentinel_ReadsBeforeFlippingToRunning(t *testing.T) {
 	}
 }
 
-// TestBootSentinel_SetLifecycleFailureBootsHalted covers the ADR-0012 rule that a
+// TestBootSentinel_SetLifecycleFailureIsFatal covers the ADR-0012 rule that a
 // failed boot write is itself a fail-closed boot: without a durable running
 // marker this run cannot be detected as unclean later, so it must not trade.
-func TestBootSentinel_SetLifecycleFailureBootsHalted(t *testing.T) {
+//
+// It must be FATAL, not merely boot-halted. A boot halt is in-memory and an
+// operator can clear it — and clearing it does not repair the durable marker.
+// An operator who sees "halted boot", clears it, and then suffers a crash would
+// leave the previous run's `clean` on disk, so the NEXT boot would trust a run
+// that was never marked running. That is exactly the stale-clean fail-open
+// (sentinel fail-open #1) this sentinel exists to close, so the only carrier
+// strong enough here is refusing to run at all.
+func TestBootSentinel_SetLifecycleFailureIsFatal(t *testing.T) {
 	rec := &recorder{}
 	st := newFakeStore(rec, store.LifecycleClean)
 	st.setErr = errors.New("disk on fire")
@@ -241,11 +249,52 @@ func TestBootSentinel_SetLifecycleFailureBootsHalted(t *testing.T) {
 
 	d := BootSentinel(context.Background(), st, g, testLogger())
 
+	if !d.Fatal {
+		t.Fatalf("a failed running flip must be fatal, not merely halted: %+v", d)
+	}
 	if !d.Conservative || !g.halted() {
-		t.Fatalf("a failed running flip must boot conservatively halted: %+v", d)
+		t.Fatalf("a failed running flip must also boot conservatively halted: %+v", d)
 	}
 	if d.Err == nil {
 		t.Fatal("the sentinel write error must be reported for logging")
+	}
+}
+
+// TestBootSentinel_ReadFailureIsNotFatal keeps the fatal rule narrow: an
+// unreadable sentinel is fail-closed (conservative halt) but the durable marker
+// still lands, so crash detection for the NEXT boot is intact and truth
+// recovery may proceed (ADR-0004 point 1).
+func TestBootSentinel_ReadFailureIsNotFatal(t *testing.T) {
+	st := newFakeStore(nil, store.LifecycleClean)
+	st.lifecycleErr = errors.New("halt row missing")
+	g := &fakeGuard{}
+
+	d := BootSentinel(context.Background(), st, g, testLogger())
+
+	if d.Fatal {
+		t.Fatalf("a read failure must not be fatal once the running flip landed: %+v", d)
+	}
+	if !d.Conservative {
+		t.Fatal("a read failure must still boot conservatively halted")
+	}
+}
+
+// TestBoot_DoesNotStartRecoveryWhenTheFlipFailed: with no durable running
+// marker there is no safe run to recover into, so the boot stops before
+// recovery rather than leaving a live process over a stale clean.
+func TestBoot_DoesNotStartRecoveryWhenTheFlipFailed(t *testing.T) {
+	st := newFakeStore(nil, store.LifecycleClean)
+	st.setErr = errors.New("disk on fire")
+	g := &fakeGuard{}
+
+	started := false
+	d := Boot(context.Background(), st, g, testLogger(), func() { started = true })
+
+	if !d.Fatal {
+		t.Fatalf("expected a fatal boot: %+v", d)
+	}
+	if started {
+		t.Fatal("recovery must not start when the running flip never persisted")
 	}
 }
 
