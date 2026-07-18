@@ -191,7 +191,42 @@ CREATE TABLE audit_acks (
 // If rows already on disk violate these rules, the migration FAILS (surfaced as
 // ErrMigrationDataViolation) rather than repairing them — see that sentinel for
 // why deleting the evidence of a duplicate submit is not an option.
+//
+// The migration validates ALL the invariants V4 introduces, not only the three
+// the table constraints can express. The other two are cross-row rules enforced
+// by appendMarker (no marker after terminal; no transition before its
+// predecessor), and an upgrade that admitted rows violating them would leave the
+// database in a state the running code declares impossible. Since a CHECK cannot
+// span rows, they are pre-checked by probing for offending rows into a throwaway
+// guard table whose NAMED constraints reject the probe — so a violation surfaces
+// as "CHECK constraint failed: markers_v4_marker_order", which names the broken
+// invariant, and a clean journal inserts nothing and drops an empty table.
+//
+// The post-terminal probe compares markers.at against intents.resolved_at. That
+// is a timestamp proxy for the causal rule ("was this row inserted while the
+// intent was still unresolved"), which the schema does not record; the comparison
+// is exact as long as the wall clock is monotonic across the two writes, and ties
+// are read as legal. A backwards clock step spanning a marker/resolve pair could
+// therefore misjudge it — accepted deliberately, because the failure it can cause
+// is a loud refusal to boot (the direction this store already chooses for
+// ErrUnsafeDBPath/ErrSchemaTooNew), not a silent import of a journal that
+// contradicts the protocol.
 const schemaV4 = `
+CREATE TABLE markers_v4_precheck (
+	violation INTEGER NOT NULL,
+	CONSTRAINT markers_v4_no_marker_after_terminal CHECK (violation != 1),
+	CONSTRAINT markers_v4_marker_order CHECK (violation != 2)
+);
+INSERT INTO markers_v4_precheck (violation)
+	SELECT 1 FROM markers m JOIN intents i ON i.intent_id = m.intent_id
+	WHERE i.resolved_at IS NOT NULL AND m.at > i.resolved_at;
+INSERT INTO markers_v4_precheck (violation)
+	SELECT 2 FROM markers m WHERE
+		(m.kind = 'submit-attempted' AND NOT EXISTS (
+			SELECT 1 FROM markers p WHERE p.intent_id = m.intent_id AND p.kind = 'prepared'))
+		OR (m.kind = 'acked' AND NOT EXISTS (
+			SELECT 1 FROM markers p WHERE p.intent_id = m.intent_id AND p.kind = 'submit-attempted'));
+DROP TABLE markers_v4_precheck;
 CREATE TABLE markers_v4 (
 	seq       INTEGER PRIMARY KEY AUTOINCREMENT,
 	intent_id TEXT NOT NULL REFERENCES intents(intent_id),

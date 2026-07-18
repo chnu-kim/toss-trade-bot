@@ -66,10 +66,48 @@ func TestAckedWithEmptyOrderIDRejected(t *testing.T) {
 	if err := db.AppendIntent(ctx, Intent{IntentID: "i1", ClientOrderID: "c1"}); err != nil {
 		t.Fatalf("AppendIntent: %v", err)
 	}
+	// Seed the legal predecessor so the ONLY violation under test is the empty
+	// orderId — otherwise the ordering guard would reject it first and this test
+	// would pass without ever exercising the shape constraint.
+	if err := db.AppendMarker(ctx, "i1", MarkerSubmitAttempted, ""); err != nil {
+		t.Fatalf("submit-attempted: %v", err)
+	}
 	if err := db.AppendMarker(ctx, "i1", MarkerAcked, ""); !errors.Is(err, ErrInvalidMarker) {
 		t.Fatalf("acked with empty order_id err = %v, want ErrInvalidMarker", err)
 	}
+	assertMarkerKinds(t, db, "i1", MarkerPrepared, MarkerSubmitAttempted)
+}
+
+// TestMarkerOutOfOrderRejected: the 2-marker model's whole discriminating power
+// is that submit-attempted's ABSENCE proves the POST certainly did not happen
+// (ADR-0002). An acked marker with no submit-attempted before it claims an
+// acknowledged order while the journal still says no POST was attempted, which is
+// precisely the "단일 마커" degenerate case ADR-0002 rejected.
+func TestMarkerOutOfOrderRejected(t *testing.T) {
+	db := openTemp(t)
+	ctx := context.Background()
+
+	if err := db.AppendIntent(ctx, Intent{IntentID: "i1", ClientOrderID: "c1"}); err != nil {
+		t.Fatalf("AppendIntent: %v", err)
+	}
+	err := db.AppendMarker(ctx, "i1", MarkerAcked, "ord-1")
+	if !errors.Is(err, ErrMarkerOutOfOrder) {
+		t.Fatalf("acked without a preceding submit-attempted err = %v, want ErrMarkerOutOfOrder", err)
+	}
+	// Not misreported as one of the neighbouring failure modes.
+	if errors.Is(err, ErrMarkerAfterTerminal) || errors.Is(err, ErrIntentNotFound) {
+		t.Fatalf("out-of-order marker misclassified: %v", err)
+	}
 	assertMarkerKinds(t, db, "i1", MarkerPrepared)
+
+	// Once the predecessor is there, the same append is accepted — the guard gates
+	// on the progression, not on the kind.
+	if err := db.AppendMarker(ctx, "i1", MarkerSubmitAttempted, ""); err != nil {
+		t.Fatalf("submit-attempted: %v", err)
+	}
+	if err := db.AppendMarker(ctx, "i1", MarkerAcked, "ord-1"); err != nil {
+		t.Fatalf("acked after its predecessor must be accepted: %v", err)
+	}
 }
 
 // TestSecondAckedWithDifferentOrderIDRejected: two acked markers with different
@@ -224,8 +262,21 @@ func TestLegalTwoMarkerFlowStillAccepted(t *testing.T) {
 	if err := db.AppendMarker(ctx, "other", MarkerSubmitAttempted, ""); err != nil {
 		t.Fatalf("other intent submit-attempted must be accepted: %v", err)
 	}
+	// Two intents carrying the SAME orderId is deliberately left unconstrained,
+	// and this assertion pins that decision rather than merely observing it.
+	// Uniqueness on acked order_id was considered and rejected: the acked marker is
+	// written AFTER the irreversible POST, so a rejection there lands on the one
+	// path where money has already moved, and order's acked-append failure branch
+	// trips the GLOBAL halt. The only ways two intents can share an orderId are a
+	// clientOrderId hash collision or the server replaying a duplicate
+	// clientOrderId — behaviour ADR-0002 point 4 explicitly records as UNDEFINED.
+	// Halting the whole bot on undefined server behaviour, to prevent a
+	// double-counted audit record, is the wrong side of the trade
+	// (fail-closed-wrong-direction). What order should do when the exchange hands
+	// back an already-bound orderId is a policy question for ADR-0003's owner, not
+	// for this schema-integrity change.
 	if err := db.AppendMarker(ctx, "other", MarkerAcked, "ord-1"); err != nil {
-		t.Fatalf("two intents may reference the same orderId (not constrained here): %v", err)
+		t.Fatalf("two intents sharing an orderId must not be rejected here: %v", err)
 	}
 }
 
@@ -308,10 +359,17 @@ func TestConcurrentDuplicateMarkerRacesToOne(t *testing.T) {
 // --- the DDL itself is the backstop, independent of the Go guard ---
 
 // TestSchemaRejectsViolationsBelowTheGoLayer writes raw SQL straight at the
-// engine, bypassing appendMarker entirely. This is what makes the constraints a
+// engine, bypassing appendMarker entirely. This is what makes these constraints a
 // STRUCTURAL backstop rather than store-layer discipline: a future writer that
 // forgets the guard still cannot persist a protocol violation (the whole point of
 // moving enforcement from the order layer into the schema — issue #29).
+//
+// It covers the three rules a table constraint can express. The two row-spanning
+// rules (no marker after terminal, no transition before its predecessor) are NOT
+// expressible as a CHECK and are enforced in appendMarker instead, so they bind
+// every caller that goes through the store API — the only supported way in
+// (ADR-0005) — but not raw SQL against the file. The migration pre-check in
+// schemaV4 is what keeps a journal violating those two from being imported.
 func TestSchemaRejectsViolationsBelowTheGoLayer(t *testing.T) {
 	db := openTemp(t)
 	ctx := context.Background()
@@ -393,6 +451,16 @@ func TestUpgradeOverExistingLegalDataPreservesJournal(t *testing.T) {
 		mustExec(t, db, `INSERT INTO markers (seq, intent_id, kind, order_id, at) VALUES (8, 'i1', 'submit-attempted', '', 102)`)
 		mustExec(t, db, `INSERT INTO markers (seq, intent_id, kind, order_id, at) VALUES (9, 'i1', 'acked', 'ord-1', 103)`)
 		mustExec(t, db, `INSERT INTO audit_acks (intent_id, record_key, acked_at) VALUES ('i1', 'm:8', 104)`)
+		// A RESOLVED intent whose markers all precede its resolution — the shape the
+		// post-terminal pre-check must NOT mistake for a violation. Without this the
+		// upgrade tests would only ever see unresolved intents and an over-rejecting
+		// pre-check would go unnoticed until it refused to boot on real data.
+		mustExec(t, db, `INSERT INTO intents (intent_id, client_order_id, payload, created_at, resolved_at, resolution) VALUES ('i0', 'c0', NULL, 10, 50, 'filled')`)
+		mustExec(t, db, `INSERT INTO markers (seq, intent_id, kind, order_id, at) VALUES (1, 'i0', 'prepared', '', 11)`)
+		mustExec(t, db, `INSERT INTO markers (seq, intent_id, kind, order_id, at) VALUES (2, 'i0', 'submit-attempted', '', 12)`)
+		// A marker written in the same instant as the resolve is a tie, and ties read
+		// as legal (the pre-check uses a strict >).
+		mustExec(t, db, `INSERT INTO markers (seq, intent_id, kind, order_id, at) VALUES (3, 'i0', 'acked', 'ord-0', 50)`)
 	})
 
 	db, err := Open(path)
@@ -477,6 +545,25 @@ func TestUpgradeOverViolatingDataFailsClosed(t *testing.T) {
 			name: "unknown kind",
 			seed: func(t *testing.T, db *sql.DB) {
 				mustExec(t, db, `INSERT INTO markers (intent_id, kind, order_id, at) VALUES ('i1', 'submitted', '', 102)`)
+			},
+		},
+		{
+			// Row-spanning rule: appendMarker refuses this going forward, so an
+			// upgrade that admitted it would leave the database in a state the running
+			// code declares impossible.
+			name: "marker appended after the intent was terminally resolved",
+			seed: func(t *testing.T, db *sql.DB) {
+				mustExec(t, db, `UPDATE intents SET resolved_at = 150, resolution = 'filled' WHERE intent_id = 'i1'`)
+				mustExec(t, db, `INSERT INTO markers (intent_id, kind, order_id, at) VALUES ('i1', 'submit-attempted', '', 200)`)
+			},
+		},
+		{
+			// The other row-spanning rule: an acked marker with no submit-attempted
+			// before it asserts an acknowledged order while the journal still says no
+			// POST was ever attempted (ADR-0002).
+			name: "acked with no preceding submit-attempted",
+			seed: func(t *testing.T, db *sql.DB) {
+				mustExec(t, db, `INSERT INTO markers (intent_id, kind, order_id, at) VALUES ('i1', 'acked', 'ord-1', 102)`)
 			},
 		},
 	} {

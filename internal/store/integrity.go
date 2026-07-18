@@ -39,6 +39,20 @@ var ErrDuplicateMarker = errors.New("store: a marker of this kind already exists
 // orderId, so it would be invisible corruption rather than a loud error).
 var ErrInvalidMarker = errors.New("store: marker violates the 2-marker protocol shape")
 
+// ErrMarkerOutOfOrder is returned when a marker is appended before the transition
+// that must precede it: submit-attempted requires prepared, acked requires
+// submit-attempted (ADR-0002's progression).
+//
+// This is the invariant the whole 2-marker model rests on. submit-attempted's
+// PRESENCE means "the POST may have happened" and its ABSENCE means "the POST
+// certainly did not" — an acked marker with no submit-attempted before it asserts
+// an acknowledged order while the journal still says no POST was ever attempted,
+// destroying exactly the discriminator that keeps a crashed submit out of a
+// permanent UNKNOWN (ADR-0002, "단일 마커" alternative). Like the terminal rule
+// this spans rows, so it is enforced by appendMarker's conditional insert rather
+// than by a CHECK.
+var ErrMarkerOutOfOrder = errors.New("store: marker appended before the transition that must precede it")
+
 // ErrMarkerAfterTerminal is returned when a marker targets an intent that is
 // already terminally resolved. A terminal resolution closes the journal entry
 // (ADR-0003); a later marker would reopen a settled intent and could resurrect it
@@ -58,6 +72,22 @@ var ErrMarkerAfterTerminal = errors.New("store: cannot append a marker to a term
 // top of a journal whose duplicate-submit accounting is already known to be wrong.
 // The operator inspects the markers table and decides.
 var ErrMigrationDataViolation = errors.New("store: existing rows violate an invariant this migration enforces")
+
+// requiredPredecessor returns the marker kind that must already exist for the
+// intent before kind may be appended, or "" when kind opens the progression
+// (prepared) or is not a recognized kind at all — an unrecognized kind is left to
+// the schema's vocabulary CHECK so it surfaces as ErrInvalidMarker rather than
+// being reported as an ordering problem.
+func requiredPredecessor(kind MarkerKind) MarkerKind {
+	switch kind {
+	case MarkerSubmitAttempted:
+		return MarkerPrepared
+	case MarkerAcked:
+		return MarkerSubmitAttempted
+	default:
+		return ""
+	}
+}
 
 // constraintCode reports the SQLite extended result code of err when it is a
 // constraint violation from the driver, and whether it was one.
