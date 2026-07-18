@@ -41,9 +41,12 @@ section() { printf '\n=== %s ===\n' "$1"; }
 
 # allowlist 매니페스트(경로|리터럴|사유). CODEOWNERS 보호 대상 = 항목 추가에 소유자 리뷰 필요.
 ALLOWLIST_FILE=".claude/skills/opensource-maintainer/allowlist.txt"
-# allowlisted: 매니페스트에 (경로 == $1) 이고 (리터럴이 **매치된 텍스트** $2 안에) 있는
-# 항목이 있으면 성공(=허용). 판정 단위가 '줄'이 아니라 '매치'라는 점이 핵심이다 —
-# 줄 단위로 허용하면 한 줄에 허용값과 진짜 값이 같이 있을 때 진짜 값까지 사라진다.
+# allowlisted: 매니페스트에 (경로 == $1) 이고 (리터럴 == **매치된 텍스트** $2) 인 항목이
+# 있으면 성공(=허용). 두 가지가 핵심이다:
+#  - 판정 단위가 '줄'이 아니라 '매치'다. 줄 단위면 한 줄에 허용값과 진짜 값이 같이 있을 때
+#    진짜 값까지 사라진다.
+#  - 비교가 부분일치가 아니라 **완전일치**다. 부분일치면 허용된 리터럴을 접두/접미로 품은
+#    더 긴 값(`<허용값>PLUS_REAL_SECRET`)이 그대로 통과한다 — 의도적 우회 경로가 된다.
 allowlisted() { # $1=파일 경로 $2=매치된 텍스트
   [ -f "$ALLOWLIST_FILE" ] || return 1
   local epath eliteral _rest
@@ -51,7 +54,7 @@ allowlisted() { # $1=파일 경로 $2=매치된 텍스트
     case "$epath" in ''|'#'*) continue ;; esac
     [ "$epath" = "$1" ] || continue
     [ -n "$eliteral" ] || continue
-    case "$2" in *"$eliteral"*) return 0 ;; esac
+    [ "$2" = "$eliteral" ] && return 0
   done < "$ALLOWLIST_FILE"
   return 1
 }
