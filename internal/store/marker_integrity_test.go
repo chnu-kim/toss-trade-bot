@@ -566,6 +566,17 @@ func TestUpgradeOverViolatingDataFailsClosed(t *testing.T) {
 				mustExec(t, db, `INSERT INTO markers (intent_id, kind, order_id, at) VALUES ('i1', 'acked', 'ord-1', 102)`)
 			},
 		},
+		{
+			// The predecessor EXISTS but was appended AFTER the marker it is supposed
+			// to precede. seq is the durable append order that reconstruction replays
+			// in, so this is still a progression appendMarker can never produce — a
+			// mere existence check would import it unchallenged.
+			name: "predecessor appended after the marker it must precede",
+			seed: func(t *testing.T, db *sql.DB) {
+				mustExec(t, db, `INSERT INTO markers (seq, intent_id, kind, order_id, at) VALUES (50, 'i1', 'acked', 'ord-1', 102)`)
+				mustExec(t, db, `INSERT INTO markers (seq, intent_id, kind, order_id, at) VALUES (51, 'i1', 'submit-attempted', '', 103)`)
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "store.db")

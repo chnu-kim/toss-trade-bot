@@ -202,6 +202,15 @@ CREATE TABLE audit_acks (
 // as "CHECK constraint failed: markers_v4_marker_order", which names the broken
 // invariant, and a clean journal inserts nothing and drops an empty table.
 //
+// The ordering probe requires the predecessor to have a LOWER seq, not merely to
+// exist. seq is the durable append order that loadMarkers and
+// ReconstructLifecycleRecords replay in, so a journal holding acked at an earlier
+// seq than its submit-attempted is a state appendMarker can never produce (a new
+// marker's AUTOINCREMENT seq is always above every existing one, which is why the
+// live guard can settle for a plain EXISTS) and would otherwise be imported
+// unchallenged. Unlike the post-terminal probe this needs no timestamp proxy —
+// seq is exact.
+//
 // The post-terminal probe compares markers.at against intents.resolved_at. That
 // is a timestamp proxy for the causal rule ("was this row inserted while the
 // intent was still unresolved"), which the schema does not record; the comparison
@@ -223,9 +232,11 @@ INSERT INTO markers_v4_precheck (violation)
 INSERT INTO markers_v4_precheck (violation)
 	SELECT 2 FROM markers m WHERE
 		(m.kind = 'submit-attempted' AND NOT EXISTS (
-			SELECT 1 FROM markers p WHERE p.intent_id = m.intent_id AND p.kind = 'prepared'))
+			SELECT 1 FROM markers p
+			WHERE p.intent_id = m.intent_id AND p.kind = 'prepared' AND p.seq < m.seq))
 		OR (m.kind = 'acked' AND NOT EXISTS (
-			SELECT 1 FROM markers p WHERE p.intent_id = m.intent_id AND p.kind = 'submit-attempted'));
+			SELECT 1 FROM markers p
+			WHERE p.intent_id = m.intent_id AND p.kind = 'submit-attempted' AND p.seq < m.seq));
 DROP TABLE markers_v4_precheck;
 CREATE TABLE markers_v4 (
 	seq       INTEGER PRIMARY KEY AUTOINCREMENT,
