@@ -70,4 +70,11 @@
 //     FILL's reset is withheld while any equally-old-or-older intent's truth is
 //     still undetermined, otherwise a late-confirmed REJECT is not merely delayed
 //     but erased from the streak.
+//   - resolve-before-reset on the success path — the exact opposite of the failure
+//     path, for the same reason. A reset that ran before its own resolve stays
+//     replayable while that resolve keeps failing, so a NEWER rejection counted in
+//     between would be erased on the next cycle. Closing the intent first makes the
+//     reset at-most-once, and a fill whose resolve had to be retried abandons its
+//     reset for good. Every skipped reset only leaves the counter high, which
+//     over-halts — the safe direction ADR-0012 point 4 sanctions.
 package reconciler

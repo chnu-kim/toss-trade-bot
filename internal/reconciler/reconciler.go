@@ -211,6 +211,10 @@ type Reconciler struct {
 	// ever releases a symbol in this set, so it can never open a block some other
 	// component established.
 	blocked map[string]struct{}
+	// abandonedResets holds fills whose success reset was given up because their
+	// resolution needed a retry — by the time it lands, a newer failure may already
+	// be counted and the reset would erase it (see the verdictFilled branch).
+	abandonedResets map[string]struct{}
 	// lastFill is the last cumulative execution snapshot emitted per orderId, so a
 	// re-drive of an unchanged open order does not append a duplicate fill record
 	// every tick. It is memory-only: after a restart one duplicate re-emit is
@@ -292,6 +296,7 @@ func New(cfg Config) (*Reconciler, error) {
 		logger:               logger,
 		wake:                 make(chan struct{}, 1),
 		blocked:              make(map[string]struct{}),
+		abandonedResets:      make(map[string]struct{}),
 		lastFill:             make(map[string]audit.FillSnapshot),
 	}, nil
 }

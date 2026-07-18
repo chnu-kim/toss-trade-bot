@@ -17,6 +17,7 @@ const (
 	reasonUnknownStatus     = "order-status-unclassifiable"
 	reasonOrderRejected     = "order-rejected"
 	reasonAuditFailClosed   = "audit-fail-closed"
+	reasonJournalDurability = "journal-durable-failure:resolve"
 	reasonLoopUnsustainable = "reconciler-loop-unsustainable"
 )
 

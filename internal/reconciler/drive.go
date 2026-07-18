@@ -111,7 +111,7 @@ func (r *Reconciler) closePreparedOnly(ctx context.Context, v intentView, now ti
 	if now.Sub(v.preparedAt) < r.preparedAbandonAfter {
 		return
 	}
-	r.resolve(ctx, v, ResolutionAbortedBeforeSubmit)
+	_ = r.resolve(ctx, v, ResolutionAbortedBeforeSubmit)
 }
 
 // applyVerdict acts on one established (or deliberately unestablished) truth.
@@ -171,14 +171,35 @@ func (r *Reconciler) applyVerdict(ctx context.Context, l lookup, inDoubt []time.
 			// over a non-durable audit trail (ADR-0006 point 4).
 			return
 		}
-		if err := r.guard.ReportOrderSuccess(ctx); err != nil {
-			// Leaving the counter high is the conservative direction, and the intent
-			// stays unresolved so the next cycle retries the reset.
-			r.logger.Error("order-success counter reset failed; intent left unresolved for retry",
-				"intent_id", v.intent.IntentID, "error", err)
+		// The resolve commits BEFORE the reset, which is the opposite of the failure
+		// path and is required for the same reason: a reset must never be replayable.
+		// If the reset ran first and the resolve then failed, the intent would stay
+		// unresolved, a NEWER rejection could be durably counted, and the next cycle
+		// would replay this fill's reset — erasing a failure that happened after it
+		// (permanent undercount, the fail-open the count ordering exists to prevent).
+		// Once the intent is resolved it leaves the unresolved set, so its reset is
+		// applied at most once.
+		if !r.resolve(ctx, v, ResolutionFilled) {
+			// The resolution did not durably land. Abandon this fill's reset for good:
+			// by the time the resolve succeeds on a later cycle, a newer failure may
+			// already be counted, and this reset would erase it. Leaving the counter
+			// high is the over-halt direction, which ADR-0012 point 4 explicitly
+			// sanctions ("a reset failure is overcount-safe").
+			r.abandonReset(v.intent.IntentID)
 			return
 		}
-		r.resolve(ctx, v, ResolutionFilled)
+		if r.resetAbandoned(v.intent.IntentID) {
+			r.logger.Warn("success reset abandoned: this fill's resolution needed a retry, so the reset may be stale; leaving the failure counter high (over-halt)",
+				"intent_id", v.intent.IntentID, "order_id", v.orderID)
+			return
+		}
+		if err := r.guard.ReportOrderSuccess(ctx); err != nil {
+			// The counter simply stays high — conservative, and outside the count
+			// ordering contract (ADR-0012 point 4). The intent is already closed, so
+			// there is nothing to retry and nothing that could replay later.
+			r.logger.Error("order-success counter reset failed; failure counter left high (conservative)",
+				"intent_id", v.intent.IntentID, "error", err)
+		}
 
 	case verdictCanceled:
 		// A cancel is neither a failure nor a success: it must not increment the
@@ -188,7 +209,7 @@ func (r *Reconciler) applyVerdict(ctx context.Context, l lookup, inDoubt []time.
 		if !r.emitFillDelta(ctx, l) {
 			return
 		}
-		r.resolve(ctx, v, ResolutionCanceled)
+		_ = r.resolve(ctx, v, ResolutionCanceled)
 
 	case verdictRejected:
 		// count-before-resolve (ADR-0012 Decision 3 / ADR-0014 Decision 8): the
@@ -202,7 +223,7 @@ func (r *Reconciler) applyVerdict(ctx context.Context, l lookup, inDoubt []time.
 				"intent_id", v.intent.IntentID, "order_id", v.orderID, "error", err)
 			return
 		}
-		r.resolve(ctx, v, ResolutionRejected)
+		_ = r.resolve(ctx, v, ResolutionRejected)
 	}
 }
 
@@ -260,15 +281,23 @@ func (r *Reconciler) emitFillDelta(ctx context.Context, l lookup) bool {
 }
 
 // resolve terminally closes an intent and immediately converges its audit trail
-// (which is what emits the terminal lifecycle record).
+// (which is what emits the terminal lifecycle record). It reports whether the
+// intent is now durably closed.
 //
 // A store.ErrResolutionConflict is NEVER swallowed (#28): it means two
 // components reached contradictory verdicts about the same order, and the journal
 // is the restart-recovery and audit ground truth, so a silently dropped second
 // verdict makes a real inconsistency undetectable. It is logged AND written to
 // the independent durable audit medium. The first recorded resolution is never
-// overwritten, so the audit convergence still runs against the stored verdict.
-func (r *Reconciler) resolve(ctx context.Context, v intentView, resolution string) {
+// overwritten, so the audit convergence still runs against the stored verdict —
+// and the intent IS closed, so this counts as resolved.
+//
+// Any OTHER error is a journal durability failure, and the journal is what makes
+// unattended operation recoverable at all. The submit path already treats a
+// marker-write failure this way (ADR-0005 point 6), and the same reasoning holds
+// here, so it escalates to a global halt. Caller cancellation is excluded — a
+// shutdown is not a medium failure (fail-closed-wrong-direction).
+func (r *Reconciler) resolve(ctx context.Context, v intentView, resolution string) bool {
 	err := r.journal.ResolveIntent(ctx, v.intent.IntentID, resolution)
 	switch {
 	case err == nil:
@@ -277,13 +306,32 @@ func (r *Reconciler) resolve(ctx context.Context, v intentView, resolution strin
 		r.logger.Error("journal resolution CONFLICT: the intent was already closed with a different verdict",
 			"intent_id", v.intent.IntentID, "attempted_resolution", resolution, "error", err)
 		r.emitErrorRecord(ctx, v.intent.IntentID, v.orderID, "reconciler.resolve", "resolution-conflict", err.Error())
-	default:
-		// Not durable: leave the intent unresolved and retry on the next cycle. For
-		// a rejection this is safe by construction — the failure was already counted,
-		// and a re-count is an overcount, which over-halts.
-		r.logger.Error("resolve intent failed; left unresolved for a later cycle",
+	case ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+		r.logger.Info("resolve aborted by shutdown; intent left unresolved for the next run",
 			"intent_id", v.intent.IntentID, "resolution", resolution, "error", err)
-		return
+		return false
+	default:
+		r.logger.Error("resolve intent failed on the journal medium; left unresolved and escalating fail-closed",
+			"intent_id", v.intent.IntentID, "resolution", resolution, "error", err)
+		r.tripGlobal(ctx, reasonJournalDurability, r.now())
+		return false
 	}
 	r.syncAudit(ctx, v.intent.IntentID)
+	return true
+}
+
+// abandonReset permanently gives up a fill's pending success reset (see the
+// verdictFilled branch). Skipping a reset only ever leaves the failure counter
+// high, which is the over-halt direction.
+func (r *Reconciler) abandonReset(intentID string) {
+	r.mu.Lock()
+	r.abandonedResets[intentID] = struct{}{}
+	r.mu.Unlock()
+}
+
+func (r *Reconciler) resetAbandoned(intentID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.abandonedResets[intentID]
+	return ok
 }
