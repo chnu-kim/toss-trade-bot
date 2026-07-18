@@ -132,6 +132,14 @@ var sacredRequiredPaths = []string{
 	// new rule had not been applied to the files that carry it.
 	".claude/agents/go-tdd-implementer.md",
 	"CLAUDE.md",
+	// Orchestration skills: protecting the worker leaf while leaving the procedure
+	// that INVOKES it unowned turns the gate off just as effectively. dispatch-issue
+	// decides issue eligibility, risk:critical stop conditions, account pinning,
+	// worktree isolation, mandatory worker delegation, PR handoff and cleanup;
+	// codex-pr-review decides the review invocation itself (both channels, base ref).
+	// Both pass the rule's own test: "would editing this change a gate verdict or its
+	// evidence?" (codex adversarial review on PR #81, R3 — same class, fifth instance.)
+	".claude/skills/dispatch-issue/SKILL.md",
 	// This package itself (#64). The checker that decides whether the sacred
 	// paths are protected was, until now, the one gate-defining component with
 	// no protection of its own: neither .github/CODEOWNERS nor this slice
@@ -180,6 +188,7 @@ var sacredRequiredPaths = []string{
 	"internal/enforcement/github_client.go",
 	"internal/enforcement/identity.go",
 	"internal/enforcement/identity_test.go",
+	"internal/enforcement/instructionsurface_test.go",
 	"internal/enforcement/presence.go",
 	"internal/enforcement/presence_test.go",
 	"internal/enforcement/protectedbranch_test.go",

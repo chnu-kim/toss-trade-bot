@@ -33,6 +33,7 @@ const validCodeowners = `# enforcement-integrity sacred invariant (ADR-0009) 의
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
 /.claude/skills/opensource-maintainer/ @chnu-kim
+/.claude/skills/dispatch-issue/ @chnu-kim
 /CLAUDE.md @chnu-kim
 /.claude/agents/ @chnu-kim
 /internal/enforcement/ @chnu-kim
@@ -202,6 +203,7 @@ func TestCheckCodeowners_MissingInstructionSurfacesFailsClosed(t *testing.T) {
 /docs/runbooks/phase-b-entry.md @chnu-kim
 /scripts/ @chnu-kim
 /.claude/skills/opensource-maintainer/ @chnu-kim
+/.claude/skills/dispatch-issue/ @chnu-kim
 /.github/workflows/verdict-gate.yml @chnu-kim
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
@@ -285,6 +287,7 @@ func TestCheckCodeowners_CommentsAndBlankLinesIgnored(t *testing.T) {
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
 /.claude/skills/opensource-maintainer/ @chnu-kim
+/.claude/skills/dispatch-issue/ @chnu-kim
 /CLAUDE.md @chnu-kim
 /.claude/agents/ @chnu-kim
 /internal/enforcement/ @chnu-kim
@@ -383,6 +386,7 @@ func TestCheckCodeowners_LaterEntryWithSameOwnerStillSatisfies(t *testing.T) {
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
 /.claude/skills/opensource-maintainer/ @chnu-kim
+/.claude/skills/dispatch-issue/ @chnu-kim
 /CLAUDE.md @chnu-kim
 /.claude/agents/ @chnu-kim
 /internal/enforcement/ @chnu-kim
@@ -449,6 +453,7 @@ func TestCheckCodeowners_GateArtifactOwnerStripped(t *testing.T) {
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
 /.claude/skills/opensource-maintainer/ @chnu-kim
+/.claude/skills/dispatch-issue/ @chnu-kim
 /CLAUDE.md @chnu-kim
 /.claude/agents/ @chnu-kim
 /internal/enforcement/ @chnu-kim
@@ -487,6 +492,7 @@ func TestCheckCodeowners_NarrowerCarveOutOnOneGateFileNotCaught(t *testing.T) {
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
 /.claude/skills/opensource-maintainer/ @chnu-kim
+/.claude/skills/dispatch-issue/ @chnu-kim
 /CLAUDE.md @chnu-kim
 /.claude/agents/ @chnu-kim
 /internal/enforcement/ @chnu-kim
@@ -608,6 +614,7 @@ func TestCheckCodeowners_PRCreationWorkflowCarveOutCaught(t *testing.T) {
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
 /.claude/skills/opensource-maintainer/ @chnu-kim
+/.claude/skills/dispatch-issue/ @chnu-kim
 /CLAUDE.md @chnu-kim
 /.claude/agents/ @chnu-kim
 /internal/enforcement/ @chnu-kim
@@ -678,6 +685,7 @@ internal/gate/** @chnu-kim
 cmd/verdict-gate/** @chnu-kim
 configs/gate/** @chnu-kim
 .claude/skills/opensource-maintainer/** @chnu-kim
+.claude/skills/dispatch-issue/** @chnu-kim
 CLAUDE.md @chnu-kim
 .claude/agents/** @chnu-kim
 internal/enforcement/** @chnu-kim
