@@ -97,13 +97,26 @@ Phase B까지 durable하게 잔존한다.
 1. **스냅샷**: `GET .../branches/main/protection`으로 현재 protection **전체** 저장.
 2. **완전 payload 재구성**: 오직 두 가지만 변경 —
    - `required_approving_review_count` 1→0
-   - required status check contexts에 `verdict-gate` 추가
+   - `required_status_checks`에 `verdict-gate` **추가**
    나머지 **명시 보존**: `require_code_owner_reviews=true`(사라지면 사람 게이트 소멸!),
-   `enforce_admins`, 기존 contexts(`build · vet · gofmt · test-race`, app_id 15368),
-   `restrictions`, `required_linear_history`, `required_pull_request_reviews` 블록.
+   `enforce_admins`, `restrictions`, `required_linear_history`, `required_pull_request_reviews` 블록.
+
+   > 🔴 **`checks[]`를 쓰고 `contexts[]`를 쓰지 마라 — app_id 소스 핀 강등 = check-spoofing**(codex #73 R7 [high]).
+   > `required_status_checks`는 두 표현이 있다: 이름만 담는 레거시 `contexts: ["build · vet · gofmt · test-race"]`와
+   > 소스까지 고정하는 `checks: [{"context": "...", "app_id": 15368}]`. **full-replace PUT에서 payload를 이름
+   > 리스트로 재구성하면 기존 app_id 핀이 조용히 사라진다.** `count=0` 이후 동명 required check가 비-sacred
+   > 경로의 **주 게이트**가 되므로, 핀을 잃으면 workflow scope를 쥔 주체가 **같은 이름의 check를 위조**해
+   > 게이트를 통과시킬 수 있다(ADR-0011 point 5 (b) check-위조 벡터). 따라서:
+   > - payload는 반드시 **`checks[]` 형태**로 만들고, 스냅샷의 **모든 기존 항목을 `context`+`app_id`째 그대로
+   >   복사**한 뒤 `verdict-gate`를 **그 예상 소스 app_id와 함께** 추가한다.
+   > - **PUT 전 mandatory assertion(fail-closed)**: 스냅샷의 `required_status_checks`가 app_id-핀 상태인데
+   >   생성된 payload에 `app_id` 없는 항목이 하나라도 있으면 **flip을 중단**한다(핀 강등 금지).
+   > - 이 변환은 prose로 수행하지 말고 **스크립트로 고정하고 테스트**한다(스냅샷 → payload 변환의 정본화).
+   > - PUT 후 검증에서 **모든 check가 app_id를 유지했는지**를 항목별로 확인한다(아래 3).
 3. **단일 PUT → 즉시 검증**:
    - `internal/enforcement`의 `CheckBranchProtection` 재통과 — **code-owner 강제만 확인**(이 검사기는 `require_code_owner_reviews`만 파싱하고 `required_status_checks`는 미검사, branchprotection.go:47-48)
    - **별도 `GET .../branches/main/protection` assertion으로 `required_status_checks`에 `verdict-gate` context 실재 확인** — verdict-gate required는 `CheckBranchProtection`이 아니라 이 GET이 검증한다(누락 시 verdict 게이트 없이 count=0이 되는 false-green 봉쇄 — codex #73)
+   - **같은 GET에서 `checks[]`의 모든 항목이 `app_id`를 유지했는지 항목별 확인** — 하나라도 app_id가 사라졌으면 소스 핀 강등이므로 즉시 롤백(check-spoofing 봉쇄 — codex #73 R7)
    - `GET` diff로 의도한 두 필드 외 **무변경 실측**(silent drop 검출)
    - 테스트 PR로 **count=0에서 code-owner·verdict-gate가 실제 blocking인지 거동 실측**
      (Phase-A 실측은 이전되지 않는다 — count≥1 실측 ≠ count=0 거동)
