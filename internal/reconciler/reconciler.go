@@ -206,6 +206,19 @@ type Reconciler struct {
 	// collapses a burst into one pending cycle.
 	wake chan struct{}
 
+	// cycleMu makes a reconciliation cycle exclusive. count-before-resolve puts the
+	// durable failure count BEFORE the evidence leaves the unresolved set — which is
+	// what makes a crash recover by re-counting — so two overlapping cycles reading
+	// the same snapshot could both count one rejection. Overcounting is the safe
+	// direction and ADR-0014 Decision 13 books it as acceptable, but inflating a
+	// durable threshold counter from mere concurrency would halt the bot on fewer
+	// real failures than configured, so overlapping callers queue instead.
+	//
+	// It covers only THIS process. The bot is single-process by ADR-0001 and the
+	// sentinel that enforces that belongs to cmd/bot (#36); even across processes the
+	// failure mode stays overcount, never undercount.
+	cycleMu sync.Mutex
+
 	mu sync.Mutex
 	// blocked is the set of symbols THIS reconciler has tripped. Auto-clear only
 	// ever releases a symbol in this set, so it can never open a block some other

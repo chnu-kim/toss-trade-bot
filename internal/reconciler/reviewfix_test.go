@@ -3,6 +3,7 @@ package reconciler
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -461,4 +462,51 @@ func TestResolutionConflictDoesNotApplyTheAttemptedVerdictsSideEffects(t *testin
 		t.Fatal("the resolution conflict was not recorded on the durable audit medium")
 	}
 	assertResolution(t, r.path, "i-conflict", ResolutionCanceled)
+}
+
+// TestConcurrentCyclesCountARejectionOnce — codex adversarial review round 4
+// [high].
+//
+// count-before-resolve deliberately makes the durable count land BEFORE the
+// evidence leaves the unresolved set, which is what makes a crash recover by
+// re-counting. The same property means two OVERLAPPING cycles reading the same
+// snapshot can both count one rejection before either resolve removes it.
+//
+// Overcounting is the safe direction and ADR-0014 Decision 13 books it explicitly
+// ("at-least-once with safe overcount"), so this is not a fail-open — but inflating
+// a durable threshold counter from concurrency is avoidable noise that could halt
+// the bot on fewer real failures than configured. A reconciliation cycle is
+// therefore exclusive: overlapping callers queue instead of racing.
+//
+// (Cross-PROCESS exclusion is a different question and is not this package's: the
+// bot is single-process by ADR-0001, and the lifecycle sentinel that enforces it
+// belongs to cmd/bot. Even there, the failure mode stays overcount.)
+func TestConcurrentCyclesCountARejectionOnce(t *testing.T) {
+	r := newRig(t)
+	seedAcked(t, r.db, "i-rej", "AAA", "ord-1")
+	r.api.set("ord-1", order.OrderStatusRejected, "AAA")
+
+	const concurrency = 8
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if err := r.rec.Reconcile(context.Background()); err != nil {
+				t.Errorf("Reconcile: %v", err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	assertResolution(t, r.path, "i-rej", ResolutionRejected)
+	if got := orderFailureCount(t, r.db); got != 1 {
+		t.Fatalf("counter = %d after %d overlapping cycles, want exactly 1 — one real rejection must count once", got, concurrency)
+	}
+	if got := r.log.count("report-order-failure"); got != 1 {
+		t.Fatalf("ReportOrderFailure ran %d times for one rejection", got)
+	}
 }

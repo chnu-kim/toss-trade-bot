@@ -32,6 +32,9 @@ var ErrTickerStopped = errors.New("reconciler: re-evaluation ticker stopped")
 // to a fail-closed halt: a scan that failed is "state unknown", which ADR-0004
 // point 3 requires to be treated as blocked.
 func (r *Reconciler) BootScan(ctx context.Context) error {
+	r.cycleMu.Lock()
+	defer r.cycleMu.Unlock()
+
 	// Pass 1 — marker branching, ambiguous floor, backlog escalation, auto-clear.
 	if err := r.reconcile(ctx); err != nil {
 		// A shutdown that lands mid-scan is not a sick reconciler. Promoting it would
@@ -66,6 +69,9 @@ func (r *Reconciler) BootScan(ctx context.Context) error {
 // ambiguous policy and auto-clear as the boot scan (minus the gate transition),
 // followed by the audit re-emit convergence.
 func (r *Reconciler) Reconcile(ctx context.Context) error {
+	r.cycleMu.Lock()
+	defer r.cycleMu.Unlock()
+
 	if err := r.reconcile(ctx); err != nil {
 		return err
 	}
