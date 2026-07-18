@@ -81,16 +81,6 @@ supersedes: []
 			want: []string{"live-execution-human-gate", "enforcement-integrity"},
 		},
 		{
-			name: "multiline block with no items is empty",
-			content: `---
-id: "0002"
-protects:
-supersedes: []
----
-`,
-			want: nil,
-		},
-		{
 			name: "inline array with trailing comment",
 			content: `---
 protects: [enforcement-integrity] # registered in CODEOWNERS
@@ -163,6 +153,16 @@ func TestParseADRProtects_FailsClosed(t *testing.T) {
 		{name: "empty element in array", content: "---\nprotects: [a, ]\n---\n"},
 		{name: "duplicate protects keys", content: "---\nprotects: []\nprotects: [a]\n---\n"},
 		{name: "unrecognised block item", content: "---\nprotects:\n  bogus: value\n---\n"},
+		// codex bot [P2] on PR #74: a bare `protects:` (YAML null) followed by
+		// the next key, or by comments only, must NOT be read as "declares
+		// nothing". docs/adr/README.md defines the field as an array and
+		// requires an explicit empty array when there is nothing to protect, so
+		// accepting null is a fail-open: a malformed new sacred ADR would dodge
+		// both sacredRequiredPaths and CODEOWNERS while the completeness check
+		// sees no declaration to enforce.
+		{name: "bare protects followed by next key", content: "---\nprotects:\nsupersedes: []\n---\n"},
+		{name: "bare protects at end of frontmatter", content: "---\nid: \"0002\"\nprotects:\n---\n"},
+		{name: "bare protects with comments only", content: "---\nprotects:\n  # 아직 미정\nsupersedes: []\n---\n"},
 	}
 
 	for _, tt := range tests {

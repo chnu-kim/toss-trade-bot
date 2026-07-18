@@ -218,6 +218,16 @@ func parseADRProtects(content string) ([]string, error) {
 			if err != nil {
 				return nil, err
 			}
+			if len(items) == 0 {
+				// A bare "protects:" is YAML null, not an empty list.
+				// docs/adr/README.md defines the field as an array and requires
+				// an explicit [] when nothing is protected, so reading null as
+				// "declares nothing" would be a fail-open: a malformed new
+				// sacred ADR would dodge both sacredRequiredPaths and
+				// CODEOWNERS while the completeness check sees nothing to
+				// enforce (codex bot [P2] on PR #74).
+				return nil, fmt.Errorf("protects 값이 비어있음(YAML null) — 보호 대상이 없으면 빈 배열([])로 명시하라(docs/adr/README.md)")
+			}
 			protects = items
 			continue
 		}
