@@ -25,7 +25,8 @@ make_repo() {
   git -C "$dir" config commit.gpgsign false
   local spec name body
   for spec in "$@"; do
-    name="${spec%%|*}"; body="${spec#*|}"
+    name="${spec%%|*}"; body="${spec#*|}"   # 첫 '|'만 구분자 — 본문의 '|'는 그대로 유지된다
+    mkdir -p "$(dirname "$dir/$name")"
     printf '%s\n' "$body" >"$dir/$name"
   done
   git -C "$dir" add -A >/dev/null 2>&1
@@ -97,22 +98,37 @@ else
   pass "SKIP: /bin/bash 없음"
 fi
 
-echo "== allowlist: scan-allow 마커는 '그 줄만' 허용한다 =="
-# 핵심 안전 속성: 마커가 파일/디렉토리 전체를 삼키면 그게 새 false-green이다.
-# 같은 파일에 마커 있는 줄과 없는 줄을 두고, 없는 줄은 반드시 계속 검출돼야 한다.
+echo "== allowlist: 매니페스트는 (경로 + 리터럴)로 좁게 pin 한다 =="
+# 핵심 안전 속성: allowlist가 파일 전체나 값 하나를 통째로 열면 그게 새 false-green이다.
+# 같은 파일의 '다른 값'과, 다른 파일의 '같은 값'은 반드시 계속 검출돼야 한다.
 D=$(make_repo \
-  'mixed.go|const allowedSecret = "AbCdEf123456789xyz" // scan-allow: 합성 픽스처
-const leakedSecret = "ZyXwVu987654321qrs"')
+  '.claude/skills/opensource-maintainer/allowlist.txt|fixtures.go|SyntheticFixtureValue1|합성 픽스처' \
+  'fixtures.go|const fixtureSecret = "SyntheticFixtureValue1"
+const otherSecret = "DifferentLeakValue999"' \
+  'elsewhere.go|const copiedSecret = "SyntheticFixtureValue1"')
 OUT=$(run_scan bash "$D" --all); RC=$?
-{ ! grep -q 'AbCdEf123456789xyz' <<<"$OUT"; } && pass "마커 있는 줄은 제외됨" || fail "마커가 동작 안 함"
-grep -q 'ZyXwVu987654321qrs' <<<"$OUT" && pass "같은 파일의 마커 없는 시크릿은 여전히 검출(파일 전체를 삼키지 않음)" \
-  || fail "allowlist가 같은 파일의 진짜 시크릿까지 삼킴(false-green)"
-[ "$RC" -eq 1 ] && pass "마커 없는 시크릿 존재 시 exit 1" || fail "exit=$RC (1 기대)"
+{ ! grep -q 'fixtures.go:1:' <<<"$OUT"; } && pass "(경로+리터럴) 일치 줄은 제외됨" || fail "매니페스트가 동작 안 함"
+grep -q 'DifferentLeakValue999' <<<"$OUT" && pass "같은 파일의 '다른 값'은 계속 검출(리터럴 pin)" \
+  || fail "allowlist가 파일 전체를 열어버림(false-green)"
+grep -q 'elsewhere.go' <<<"$OUT" && pass "'다른 파일'의 같은 값은 계속 검출(경로 pin)" \
+  || fail "allowlist가 값만으로 열림(false-green)"
+[ "$RC" -eq 1 ] && pass "허용되지 않은 시크릿 존재 시 exit 1" || fail "exit=$RC (1 기대)"
 rm -rf "$D"
 
-D=$(make_repo 'only_allowed.go|const allowedSecret = "AbCdEf123456789xyz" // scan-allow: 합성 픽스처')
+D=$(make_repo \
+  '.claude/skills/opensource-maintainer/allowlist.txt|only.go|SyntheticFixtureValue1|합성 픽스처' \
+  'only.go|const fixtureSecret = "SyntheticFixtureValue1"')
 OUT=$(run_scan bash "$D" --all); RC=$?
-[ "$RC" -eq 0 ] && pass "마커로 전부 허용되면 exit 0" || { fail "exit=$RC (0 기대)"; printf '%s\n' "$OUT"; }
+[ "$RC" -eq 0 ] && pass "매니페스트로 전부 허용되면 exit 0" || { fail "exit=$RC (0 기대)"; printf '%s\n' "$OUT"; }
+rm -rf "$D"
+
+# 인라인 주석 마커는 우회 수단이 아니다: 인정하면 PR이 진짜 자격증명 옆에 주석만 달아
+# CI 게이트를 통과할 수 있다(우회 수단이 스캔 대상과 같은 신뢰 경계에 놓임).
+D=$(make_repo 'inline.go|const someSecret = "InlineBypassValue123" // scan-allow: 우회 시도')
+OUT=$(run_scan bash "$D" --all); RC=$?
+{ [ "$RC" -eq 1 ] && grep -q 'inline.go' <<<"$OUT"; } \
+  && pass "인라인 scan-allow 주석으로는 우회 불가(매니페스트만 유효)" \
+  || fail "인라인 마커로 게이트 우회 가능(false-green): RC=$RC"
 rm -rf "$D"
 
 echo "== --content-only: 커밋 설정 점검만 건너뛰고 내용 스캔은 유지 =="

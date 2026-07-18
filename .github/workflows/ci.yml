@@ -73,6 +73,8 @@ jobs:
       # CI가 초록이 된다(시크릿 게이트의 false-green).
       # --content-only: 레포 내용 스캔은 전부 수행하고, 커밋 머신의 git config 점검만
       # 건너뛴다(러너는 커밋 주체가 아니고 user.email이 없어 항상 실패하므로).
-      # 의도적 합성 픽스처는 소스에 명시한 `scan-allow:` per-line 마커로만 좁게 허용된다.
+      # 의도적 합성 픽스처는 allowlist 매니페스트(경로+리터럴 pin, CODEOWNERS 보호)로만
+      # 좁게 허용된다 — 소스 인라인 주석은 우회 수단으로 인정하지 않는다(그걸 인정하면
+      # PR이 진짜 자격증명 옆에 주석만 달아 이 게이트를 통과할 수 있다).
       - name: Secret scan (repository contents)
         run: bash .claude/skills/opensource-maintainer/scripts/scan.sh --all --content-only

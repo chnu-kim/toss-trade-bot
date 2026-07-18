@@ -2,6 +2,7 @@ package enforcement
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -27,6 +28,7 @@ const validCodeowners = `# enforcement-integrity sacred invariant (ADR-0009) 의
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
+/.claude/skills/opensource-maintainer/ @chnu-kim
 
 /.github/CODEOWNERS @chnu-kim
 `
@@ -92,6 +94,7 @@ func TestCheckCodeowners_Missing0012FailsClosed(t *testing.T) {
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
+/.claude/skills/opensource-maintainer/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
@@ -119,6 +122,7 @@ func TestCheckCodeowners_Missing0013FailsClosed(t *testing.T) {
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
+/.claude/skills/opensource-maintainer/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
@@ -192,6 +196,7 @@ func TestCheckCodeowners_CommentsAndBlankLinesIgnored(t *testing.T) {
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
+/.claude/skills/opensource-maintainer/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
@@ -282,6 +287,7 @@ func TestCheckCodeowners_LaterEntryWithSameOwnerStillSatisfies(t *testing.T) {
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
+/.claude/skills/opensource-maintainer/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 /.github/workflows/ci.yml @chnu-kim
 /.github/workflows/verdict-gate.yml @chnu-kim
@@ -336,6 +342,7 @@ func TestCheckCodeowners_GateArtifactOwnerStripped(t *testing.T) {
 /internal/gate/
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
+/.claude/skills/opensource-maintainer/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
@@ -366,6 +373,7 @@ func TestCheckCodeowners_NarrowerCarveOutOnOneGateFileNotCaught(t *testing.T) {
 /internal/gate/sanity.go
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
+/.claude/skills/opensource-maintainer/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
@@ -396,11 +404,51 @@ func TestCheckCodeowners_PRCreationWorkflowCarveOutCaught(t *testing.T) {
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
+/.claude/skills/opensource-maintainer/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
 	if got.Satisfied {
 		t.Fatal("a narrower ownerless entry stripping protection from pr-creation.yml specifically must not satisfy the check, even though the directory pattern still looks protective")
+	}
+}
+
+func TestCheckCodeowners_MissingSecretScannerFailsClosed(t *testing.T) {
+	// The commit-time/CI secret scanner is enforcement code: ci.yml runs
+	// scan.sh against the PR checkout to block leaks (#27). If it is not
+	// CODEOWNERS-protected, a PR can neuter the scanner (drop patterns, exit
+	// 0) or append an allowlist entry in the same change and ship the leak the
+	// gate exists to stop — the same "main에 있음 ≠ 보호됨" hole ADR-0011
+	// point 4(b) closed for internal/gate (codex adversarial-review on PR #72).
+	//
+	// Otherwise-VALID sample with only the scanner line removed, so the check
+	// fails specifically because the scanner is unprotected — that is what
+	// actually guards the twin-artifact requirement.
+	content := `/.github/workflows/ @chnu-kim
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+/docs/adr/0011-*.md @chnu-kim
+/docs/adr/0012-*.md @chnu-kim
+/docs/adr/0013-*.md @chnu-kim
+/internal/gate/ @chnu-kim
+/cmd/verdict-gate/ @chnu-kim
+/configs/gate/ @chnu-kim
+/.github/CODEOWNERS @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if got.Satisfied {
+		t.Fatal("unprotected secret scanner must not satisfy the check — a PR could disable the gate it is scanned by")
+	}
+	for _, want := range []string{
+		".claude/skills/opensource-maintainer/scripts/scan.sh",
+		".claude/skills/opensource-maintainer/allowlist.txt",
+	} {
+		if !strings.Contains(got.Reason, want) {
+			t.Fatalf("reason %q must name the unprotected path %q", got.Reason, want)
+		}
 	}
 }
 
@@ -419,6 +467,7 @@ docs/adr/0013-*.md @chnu-kim
 internal/gate/** @chnu-kim
 cmd/verdict-gate/** @chnu-kim
 configs/gate/** @chnu-kim
+.claude/skills/opensource-maintainer/** @chnu-kim
 .github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
