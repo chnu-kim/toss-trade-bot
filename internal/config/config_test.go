@@ -82,7 +82,7 @@ func TestLoad_AllowsLoopbackHTTPBaseURL(t *testing.T) {
 
 // --- L-9: client_secret must never appear in logs or formatted output ---
 
-const rawSecret = "raw-test-secret-do-not-log"
+const rawSecret = "raw-test-secret-do-not-log" // scan-allow: 로그 유출 검증용 합성 상수(실제 시크릿 아님)
 
 func maskedConfig() Config {
 	return Config{

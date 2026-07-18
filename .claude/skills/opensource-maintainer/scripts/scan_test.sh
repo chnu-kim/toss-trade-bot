@@ -97,6 +97,47 @@ else
   pass "SKIP: /bin/bash 없음"
 fi
 
+echo "== allowlist: scan-allow 마커는 '그 줄만' 허용한다 =="
+# 핵심 안전 속성: 마커가 파일/디렉토리 전체를 삼키면 그게 새 false-green이다.
+# 같은 파일에 마커 있는 줄과 없는 줄을 두고, 없는 줄은 반드시 계속 검출돼야 한다.
+D=$(make_repo \
+  'mixed.go|const allowedSecret = "AbCdEf123456789xyz" // scan-allow: 합성 픽스처
+const leakedSecret = "ZyXwVu987654321qrs"')
+OUT=$(run_scan bash "$D" --all); RC=$?
+{ ! grep -q 'AbCdEf123456789xyz' <<<"$OUT"; } && pass "마커 있는 줄은 제외됨" || fail "마커가 동작 안 함"
+grep -q 'ZyXwVu987654321qrs' <<<"$OUT" && pass "같은 파일의 마커 없는 시크릿은 여전히 검출(파일 전체를 삼키지 않음)" \
+  || fail "allowlist가 같은 파일의 진짜 시크릿까지 삼킴(false-green)"
+[ "$RC" -eq 1 ] && pass "마커 없는 시크릿 존재 시 exit 1" || fail "exit=$RC (1 기대)"
+rm -rf "$D"
+
+D=$(make_repo 'only_allowed.go|const allowedSecret = "AbCdEf123456789xyz" // scan-allow: 합성 픽스처')
+OUT=$(run_scan bash "$D" --all); RC=$?
+[ "$RC" -eq 0 ] && pass "마커로 전부 허용되면 exit 0" || { fail "exit=$RC (0 기대)"; printf '%s\n' "$OUT"; }
+rm -rf "$D"
+
+echo "== --content-only: 커밋 설정 점검만 건너뛰고 내용 스캔은 유지 =="
+# CI 러너엔 user.email이 없어 설정 점검이 항상 실패한다 → --content-only로 그 절만 건너뛴다.
+# 단, 내용(시크릿) 스캔이 함께 약해지면 안 된다.
+D=$(make_repo 'clean.md|이 레포는 Toss Open API를 사용한다.')
+git -C "$D" config user.email "personal@gmail.com"   # noreply 아님 → 설정 점검 실패 유발
+OUT=$(run_scan bash "$D" --all); RC=$?
+[ "$RC" -eq 1 ] && pass "비-noreply 이메일은 기본 모드에서 후보(exit 1)" || fail "설정 점검이 동작 안 함(exit=$RC)"
+OUT=$(run_scan bash "$D" --all --content-only); RC=$?
+[ "$RC" -eq 0 ] && pass "--content-only는 설정 점검을 건너뜀(exit 0)" || { fail "--content-only exit=$RC (0 기대)"; printf '%s\n' "$OUT"; }
+rm -rf "$D"
+
+D=$(make_repo 'leak.yml|client_secret: AbCdEf123456789xyz')
+OUT=$(run_scan bash "$D" --all --content-only); RC=$?
+{ [ "$RC" -eq 1 ] && grep -q 'leak.yml' <<<"$OUT"; } && pass "--content-only에서도 시크릿은 그대로 검출" \
+  || fail "--content-only가 내용 스캔을 약화시킴(RC=$RC)"
+rm -rf "$D"
+
+echo "== fail-closed: 알 수 없는 인자 → exit 2 =="
+D=$(make_repo 'clean.md|정상 파일')
+OUT=$(run_scan bash "$D" --bogus-flag); RC=$?
+[ "$RC" -eq 2 ] && pass "오타/미지원 플래그는 exit 2(게이트 약화 방지)" || fail "미지원 플래그 exit=$RC (2 기대)"
+rm -rf "$D"
+
 echo "== 정상: 깨끗한 레포는 exit 0 (거짓 양성 없음) =="
 D=$(make_repo \
   'main.go|package main

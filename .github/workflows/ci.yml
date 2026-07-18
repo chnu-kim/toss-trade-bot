@@ -66,3 +66,13 @@ jobs:
       # (bash 3.2 fail-open 케이스는 runner의 bash가 4.4+라 자동 SKIP된다.)
       - name: Secret-gate regression (scan.sh)
         run: bash .claude/skills/opensource-maintainer/scripts/scan_test.sh
+
+      # 위 스텝은 "스캐너가 올바로 동작하는가"만 본다(격리 픽스처 레포 대상). 이 스텝은
+      # "이 PR의 실제 내용에 유출이 없는가"를 본다 — 서로 다른 보장이고 둘 다 필요하다.
+      # 이게 없으면 로컬 pre-commit을 우회한 PR이 시크릿을 넣어도 회귀 테스트만 통과하면
+      # CI가 초록이 된다(시크릿 게이트의 false-green).
+      # --content-only: 레포 내용 스캔은 전부 수행하고, 커밋 머신의 git config 점검만
+      # 건너뛴다(러너는 커밋 주체가 아니고 user.email이 없어 항상 실패하므로).
+      # 의도적 합성 픽스처는 소스에 명시한 `scan-allow:` per-line 마커로만 좁게 허용된다.
+      - name: Secret scan (repository contents)
+        run: bash .claude/skills/opensource-maintainer/scripts/scan.sh --all --content-only
