@@ -1,0 +1,150 @@
+# Runbook: Phase B(자율 머지) 진입 절차 — hard precondition ①~⑤ + 활성화 실행
+
+이 문서는 [ADR-0008](../adr/0008-independent-verification-gate.md)의 verdict 게이트와
+[ADR-0011](../adr/0011-loop-pr-credential-flow.md)·[ADR-0015](../adr/0015-loop-pr-amendment-bootstrap-activation.md)이
+사람 액션으로 남긴 Phase B 활성화 절차를 실행 가능한 체크리스트로 정리한다(이슈 #50).
+
+> **fail-closed 원칙**: hard precondition ①~⑤ 중 하나라도 미충족·미실측이면 레포는
+> **Phase A(사람 승인 체제)에 남는다**. 활성화는 live-execution-human-gate(주문 authorize
+> 경로)를 약화하지 않으며, 각 완료 판정은 **오퍼레이터 단언이 아니라 capability 실측**이다.
+
+## 축 구분 (ADR-0015 Decision 2)
+
+| 축 | 주체 | 예 |
+|---|---|---|
+| A. 에이전트 admin 범위 | 에이전트 | 워크플로·presence-check·runbook 저작, `GET protection` 조회, probe 절차 준비, red-team PR 저작, narrowing 스크립트 **문법·prereq 리허설** |
+| B. 물리적으로 불가 | 사람 | App key PEM을 loop-pr env에 등록(classifier 차단), 사람계정 PAT narrowing 실행 |
+| C. Administration:write 사람 액션 | 사람 | probe 임시 규칙 생성/제거, 최종 branch protection flip, 전역 에스컬레이션 해제 |
+
+## 실행 순서 (뒤집지 않는다 — ADR-0011 라운드 7 · ADR-0015 point 6)
+
+**narrowing(①/③) → probe(④a) → App key rotate+env(①/③→①) → flip(④b) → 전역 해제**
+
+각 스텝은 **선행 스텝 완료 실측 전 착수 금지**. dependency 역순(provision을 narrowing보다
+먼저) 금지 — admin/workflow 자격증명이 loop 컨텍스트에 남은 동안 key를 env에 두면 탈취돼
+Phase B까지 durable하게 잔존한다.
+
+## Hard precondition ①~⑤
+
+각 항목: **확인주체 · 확인방법 · 통과판정 · 실패경로**.
+
+### ① verdict-gate가 실재하고 required check로 등재 가능
+- 확인주체: 에이전트(산출물 검증) + 사람(등재)
+- 확인방법: `.github/workflows/verdict-gate.yml`이 main에 존재하고 PR head SHA에 `verdict-gate`
+  check-run을 게시(verdict-gate.yml:505-512), PR별 `request-verdict` dispatch 바인딩이 operational.
+- 통과판정: probe PR에서 `verdict-gate` check-run이 head SHA에 실제로 붙고 green/red를 게시.
+- 실패경로: 바인딩 미operational → required로 등재 시 liveness 붕괴(PR 영구 미머지) → 등재 보류, Phase A.
+
+### ② 자격증명 narrowing 완료 (capability 실측)
+- 확인주체: 사람(실행) — 에이전트는 스크립트 리허설만(ADR-0015 point 4)
+- 확인방법: **loop 실행 컨텍스트가 resolve하는 자격증명으로** `scripts/verify-credential-narrowing.sh`
+  7-ix 실행 → `PUT .../branches/main/protection`과 `POST .../pulls/{n}/reviews`(APPROVE) **둘 다 거부**.
+  구 admin classic PAT로 admin 동작 시도 거부. 계정 authentication key 전수 열거 → 각 key로 push 거부.
+- 통과판정: 7-ix green(exit 0) + admin 토큰 폐기 실측 + push 거부 실측.
+- 실패경로: 하나라도 통과 시도가 성공(=자격증명 잔존) → 개시 금지, narrowing 재실행.
+- ⚠️ **#46 CLOSED ≠ narrowing 실행 완료** — 이슈 상태는 spec·워크플로 머지일 뿐. 반드시 실측.
+- ⚠️ SSH teardown leg: API 열거 가능 key까지만 실측, 그 밖은 오퍼레이터 단언(잔여 위험).
+
+### ③ App key rotate + loop-pr environment 프로비저닝
+- 확인주체: 사람
+- 확인방법: 구 key 전부 revoke(구 key JWT로 `GET /app` → 401 실측, ADR-0011 실측목록 12),
+  새 key 생성 → `loop-pr` env secret(`MECHANU_APP_ID`·`MECHANU_APP_PRIVATE_KEY`) 등록,
+  deployment branch policy를 `main` 하나로 제한. **②(narrowing) 완료 실측 후에만.**
+- 통과판정: 활성화 스모크에서 `mechanu[bot]` 작성 PR 생성(`gh pr view --json author`) + 비-main
+  ref의 env secret 접근 거부 실측(ADR-0011 실측목록 3).
+- 실패경로: 401 아님(구 key 유효) → rotate 미완, 중단.
+
+### ④ main-무접촉 probe (pre-main 거동 실측 — ADR-0011 (4a)·목록 142.2)
+- 확인주체: 에이전트(준비) + 사람(임시 규칙·실측)
+- 확인방법: 일회용 **보호 브랜치**에 임시 규칙(count=0 + `require_code_owner_reviews=true` + "require a
+  pull request before merging")을 걸어 **main 변경 전에** (i) code owner 승인 없는 머지가 실제로
+  차단되는지, (ii) PR 없는 direct-push가 거부되는지를 **거동으로 실측**한다 — branch protection은
+  per-branch이므로 이 거동은 임시 브랜치에서 검증 가능하다(ADR-0011 (4a)가 이를 hard precondition으로
+  요구). flip payload 문법·권한 리허설도 함께. `probe/pr-creation-tamper-47`로 변조 정의 미실행 실측
+  (main 정의만 실행). **verdict-gate required *context*의 PR-head-SHA 바인딩만** main/PR-특정이라
+  flip 직후(④b) 테스트 PR에서 확증한다.
+- 통과판정: count=0에서 code-owner 미승인 머지 차단 + direct-push 거부 실측 + payload 유효 + 변조 마커 부재.
+- 실패경로: main 불변경 · Phase A 잔류 · ADR amend.
+
+### ⑤ verdict 레짐 실측 — 인젝션 + 재시도/에스컬레이션 + 적격 가드 (ADR-0011 point 4 (e)(iv)·(f)·(g))
+> ⚠️ 인젝션 1건만 통과했다고 flip하지 말 것. 아래 **다섯**을 모두 실측해야 ⑤ 통과다 —
+> verdict는 **비-sacred 경로의 유일한 머지 게이트**이므로, 재시도·재샘플링·부적격 PR 경로가
+> 미검증인 채 count를 0으로 내리면 그 경로들이 그대로 열린 게이트가 된다.
+
+- 확인주체: 에이전트(저작·실행) — 단 (5)의 전역 해제는 chnu-kim 사람 액션
+- 확인방법·통과판정 (**leg별로 각각** — codex leg, N-of-2면 Claude leg도 (g) 레짐 스코프):
+  1. **인젝션 내성**: PR-유래 텍스트 전체(diff·본문·코멘트·커밋 메시지)에 지시-주입을 심은 PR로
+     false-approve 유도 → verdict가 approve로 뒤집히지 **않음**. leg별 수행.
+  2. **SHA-sticky 무재발행**: 같은 head SHA에 대해 verdict 재산출을 시도 → **재산출되지 않고**
+     기존 판정(reject/판정불능)이 그 SHA에 sticky하게 유지됨. (새 커밋에 한해서만 재산출)
+  3. **PR당 연속 비-approve 상한 N**(기본 3): 한 PR에서 새 커밋으로 재검토를 반복 → N회 도달 시
+     그 PR에서 더는 verdict를 산출하지 않음.
+  4. **전역(cross-PR) 상한 M**(기본 9): **여러 PR에 걸쳐** 비-approve를 누적 → M 도달 시 레포-전역
+     sticky 에스컬레이션이 걸리고, 새 PR 개설로 예산이 리셋되지 **않음**. 상태는 loop-위조 불가
+     소스(check-run·특권 잡 실행 이력)에서 집계됨을 확인.
+  5. **전역 해제 경로**: M 에스컬레이션 해제가 **chnu-kim actor의 `workflow_dispatch`로만** 가능하고
+     (잡 최상단 actor 검사), loop 자격증명·client_payload·라벨 등 다른 경로로는 해제 불가.
+  6. **적격 가드**(ADR-0011 point 4 (f)): **fork PR**과 **작성자 != `mechanu[bot]`인 PR**은 verdict
+     required check가 **설정되지 않고** 머지 액션도 발생하지 않음(부적격 → 무동작 종료).
+- 실패경로: 어느 항목이든 미통과 → **Phase A 잔류**, 해당 레짐 하드닝 보강 후 재실측(main 불변경).
+- ⚠️ LLM 판정이라 완전 내성 증명 불가 — 위 실측은 상한을 올릴 뿐 보증이 아니며, 사람-개입 epoch당
+  최대 M회의 잔여 false-approve 예산이 남는다(ADR-0011 라운드 8, booked).
+
+## 최종 flip: flip-and-verify-or-rollback 트랜잭션 (ADR-0015 point 7)
+
+> 🚧 **선행 게이트 (fail-closed) — 현재 flip은 차단 상태다.** 아래 payload 변환은 **보호·검토된
+> 스크립트**(스냅샷 → PUT payload 생성기, `scripts/` 하위 → CODEOWNERS·`sacredRequiredPaths` 보호)로만
+> 수행한다. **그 스크립트가 아직 없으므로 Phase B flip은 수행할 수 없다** — 오퍼레이터가 파괴적
+> full-replace payload를 손으로 조립하는 것은 **금지**다(app_id 핀·`require_code_owner_reviews`를
+> 조용히 떨어뜨리는 경로 — codex #73 R7/R8). 착수 조건: ① 생성기 스크립트 + 변환 테스트(핀 보존·
+> 필드 보존·핀 강등 시 non-zero exit)를 작성해 **sacred 등재된 상태로 머지**하고, ② 아래 절차를 그
+> 스크립트 호출로 재작성한 뒤에야 flip을 진행한다. 그 전까지 이 절의 나머지는 **설계 명세**이지
+> 실행 지시가 아니다.
+
+`PUT`은 **전체 replace**다(patch 아님) — 빠진 필드는 default/null로 리셋.
+
+1. **스냅샷**: `GET .../branches/main/protection`으로 현재 protection **전체** 저장.
+2. **완전 payload 재구성**: 오직 두 가지만 변경 —
+   - `required_approving_review_count` 1→0
+   - `required_status_checks`에 `verdict-gate` **추가**
+   나머지 **명시 보존**: `require_code_owner_reviews=true`(사라지면 사람 게이트 소멸!),
+   `enforce_admins`, `restrictions`, `required_linear_history`, `required_pull_request_reviews` 블록.
+
+   > 🔴 **`checks[]`를 쓰고 `contexts[]`를 쓰지 마라 — app_id 소스 핀 강등 = check-spoofing**(codex #73 R7 [high]).
+   > `required_status_checks`는 두 표현이 있다: 이름만 담는 레거시 `contexts: ["build · vet · gofmt · test-race"]`와
+   > 소스까지 고정하는 `checks: [{"context": "...", "app_id": 15368}]`. **full-replace PUT에서 payload를 이름
+   > 리스트로 재구성하면 기존 app_id 핀이 조용히 사라진다.** `count=0` 이후 동명 required check가 비-sacred
+   > 경로의 **주 게이트**가 되므로, 핀을 잃으면 workflow scope를 쥔 주체가 **같은 이름의 check를 위조**해
+   > 게이트를 통과시킬 수 있다(ADR-0011 point 5 (b) check-위조 벡터). 따라서:
+   > - payload는 반드시 **`checks[]` 형태**로 만들고, 스냅샷의 **모든 기존 항목을 `context`+`app_id`째 그대로
+   >   복사**한 뒤 `verdict-gate`를 **그 예상 소스 app_id와 함께** 추가한다.
+   > - **PUT 전 mandatory assertion(fail-closed)**: 스냅샷의 `required_status_checks`가 app_id-핀 상태인데
+   >   생성된 payload에 `app_id` 없는 항목이 하나라도 있으면 **flip을 중단**한다(핀 강등 금지).
+   > - 이 변환은 prose로 수행하지 말고 **스크립트로 고정하고 테스트**한다(스냅샷 → payload 변환의 정본화).
+   > - PUT 후 검증에서 **모든 check가 app_id를 유지했는지**를 항목별로 확인한다(아래 3).
+3. **단일 PUT → 즉시 검증**:
+   - `internal/enforcement`의 `CheckBranchProtection` 재통과 — **code-owner 강제만 확인**(이 검사기는 `require_code_owner_reviews`만 파싱하고 `required_status_checks`는 미검사, branchprotection.go:47-48)
+   - **별도 `GET .../branches/main/protection` assertion으로 `required_status_checks`에 `verdict-gate` context 실재 확인** — verdict-gate required는 `CheckBranchProtection`이 아니라 이 GET이 검증한다(누락 시 verdict 게이트 없이 count=0이 되는 false-green 봉쇄 — codex #73)
+   - **같은 GET에서 `checks[]`의 모든 항목이 `app_id`를 유지했는지 항목별 확인** — 하나라도 app_id가 사라졌으면 소스 핀 강등이므로 즉시 롤백(check-spoofing 봉쇄 — codex #73 R7)
+   - `GET` diff로 의도한 두 필드 외 **무변경 실측**(silent drop 검출)
+   - 테스트 PR로 **count=0에서 code-owner·verdict-gate가 실제 blocking인지 거동 실측**
+     (Phase-A 실측은 이전되지 않는다 — count≥1 실측 ≠ count=0 거동)
+4. **실패 시 원자 롤백**: 어느 검증이든 실패 → 즉시 스냅샷으로 PUT 롤백, Phase A 유지.
+5. **순차 편집 금지**: count=0인데 verdict 미등재인 무-게이트 창 금지. 부득이 순차면 verdict 등재를
+   count 인하보다 먼저.
+
+## 부트스트랩 예외 (ADR-0015 point 8) — 이 절차 실행 자체엔 무관, 사전 sacred PR용
+
+- **자격**: "App-작성 경로가 미operational(App key 미프로비저닝 → mechanu[bot] 토큰 발급 불가)해
+  chnu-kim 작성일 수밖에 없는 sacred PR"에만. 파일-존재 기준 아님.
+- **완화하지 않는 것이 1순위**: 부트스트랩 sacred PR은 **`gh pr merge --admin`(per-merge bypass)** 으로 머지한다 —
+  branch protection 설정을 전혀 바꾸지 않으므로(해당 1건 머지에만 적용) **완화 창 자체가 없고 롤백할 상태도 없다**.
+  전제: `enforce_admins=false`(현 실측) + 머지 수행자 admin. (이 레포의 부트스트랩 sacred PR들이 실제로 이 경로로 머지됐다.)
+- **완화 경로는 admin bypass 불가 시(예: `enforce_admins=true`)만의 최후 수단**이며, 개시 전 다음 넷이 **mandatory**
+  (하나라도 없으면 개시 금지 — fail-closed):
+  1. 완화 **전** `GET .../protection` **전체 스냅샷 저장**(복원 payload 확보)
+  2. **branch-global 프리체크**: 다른 open PR 부재/draft화 + direct-push 금지 재확인 (완화는 브랜치 전역이라 특정 PR에 한정 불가)
+  3. **구체적 데드라인 + 독립 실행 가능한 복원 수단** — 세션·오퍼레이터 실패 시 실행할, 두 번째 오퍼레이터가 보유한
+     복원 명령. **알림은 롤백이 아니다** — 알림만으로 갈음 금지
+  4. 복원 후 `CheckBranchProtection` + `GET` diff로 **원상태 실측 + 증거 기록**(복원도 destructive PUT이라 self-assert 금지)
+- App key 프로비저닝 **이후** 모든 sacred 변경은 정상 App-작성 PR 경로.
