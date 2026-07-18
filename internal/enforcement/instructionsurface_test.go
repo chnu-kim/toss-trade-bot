@@ -21,11 +21,14 @@ func TestSacredRequiredPaths_CoversEveryAgentInstructionFile(t *testing.T) {
 }
 
 func TestSacredRequiredPaths_CoversEveryOrchestrationSkill(t *testing.T) {
-	// Only the repo-local skills that gate or generate gate evidence are sacred.
+	// Every repo-local skill that gates or generates gate evidence: dispatch-issue
+	// (orchestration: eligibility, risk stops, delegation, PR handoff) and
+	// opensource-maintainer (the pre-commit secret gate PROCEDURE — protecting only its
+	// scripts lets a loop weaken the instruction to skip them; PR #81 R4).
 	// NOTE: codex-pr-review also gates (it IS the review invocation) but lives in the
 	// user-global skills directory rather than this repo — CODEOWNERS cannot reach it.
 	// That trust-boundary gap is booked, not closed here.
-	for _, dir := range []string{"dispatch-issue"} {
+	for _, dir := range []string{"dispatch-issue", "opensource-maintainer"} {
 		assertGlobFullyRegistered(t,
 			filepath.Join("../../.claude/skills", dir), "*.md",
 			filepath.Join(".claude/skills", dir))

@@ -140,6 +140,7 @@ var sacredRequiredPaths = []string{
 	// Both pass the rule's own test: "would editing this change a gate verdict or its
 	// evidence?" (codex adversarial review on PR #81, R3 — same class, fifth instance.)
 	".claude/skills/dispatch-issue/SKILL.md",
+	".claude/skills/opensource-maintainer/SKILL.md",
 	// This package itself (#64). The checker that decides whether the sacred
 	// paths are protected was, until now, the one gate-defining component with
 	// no protection of its own: neither .github/CODEOWNERS nor this slice

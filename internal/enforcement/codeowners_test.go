@@ -217,6 +217,45 @@ func TestCheckCodeowners_MissingInstructionSurfacesFailsClosed(t *testing.T) {
 	}
 }
 
+func TestCheckCodeowners_SecretGateProcedureCarveOutCaught(t *testing.T) {
+	// The secret-gate SKILL.md says WHEN and HOW to run the scanner. Protecting only
+	// the scripts lets a later, narrower ownerless entry strip the procedure while
+	// scan.sh stays owned — the loop then weakens "run the scanner before commit"
+	// without tripping the check, and secrets/environment-specific data can land
+	// while presence-check stays green (codex adversarial review on PR #81, R4 —
+	// same class, sixth instance). The directory rule still matching is not enough:
+	// GitHub resolves last-match-wins entirely.
+	content := `/.github/workflows/ @chnu-kim
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+/docs/adr/0011-*.md @chnu-kim
+/docs/adr/0012-*.md @chnu-kim
+/docs/adr/0013-*.md @chnu-kim
+/docs/adr/0014-*.md @chnu-kim
+/docs/adr/0015-*.md @chnu-kim
+/docs/runbooks/phase-b-entry.md @chnu-kim
+/scripts/ @chnu-kim
+/.claude/skills/opensource-maintainer/ @chnu-kim
+/.claude/skills/opensource-maintainer/SKILL.md
+/.claude/skills/dispatch-issue/ @chnu-kim
+/CLAUDE.md @chnu-kim
+/.claude/agents/ @chnu-kim
+/.github/workflows/verdict-gate.yml @chnu-kim
+/internal/gate/ @chnu-kim
+/cmd/verdict-gate/ @chnu-kim
+/configs/gate/ @chnu-kim
+/internal/enforcement/ @chnu-kim
+/.github/CODEOWNERS @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if got.Satisfied {
+		t.Fatal("a narrower ownerless entry stripping the secret-gate procedure must not satisfy the check")
+	}
+}
+
 func TestCheckCodeowners_MissingSacredPath(t *testing.T) {
 	// docs/adr/0009-*.md line removed entirely.
 	content := `/.github/workflows/ @chnu-kim
