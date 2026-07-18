@@ -98,6 +98,14 @@ Phase B까지 durable하게 잔존한다.
 
 - **자격**: "App-작성 경로가 미operational(App key 미프로비저닝 → mechanu[bot] 토큰 발급 불가)해
   chnu-kim 작성일 수밖에 없는 sacred PR"에만. 파일-존재 기준 아님.
-- **branch-global 프리체크**: 완화 창 개시 전 (i) 다른 open PR 부재/draft화, (ii) direct-push 금지 재확인.
-- **crash-safe 복원**: 완화에 짧은 만료/외부 알림 backstop, 같은-세션 복원, 복원 후 `CheckBranchProtection`+`GET` diff 실측.
+- **완화하지 않는 것이 1순위**: 부트스트랩 sacred PR은 **`gh pr merge --admin`(per-merge bypass)** 으로 머지한다 —
+  branch protection 설정을 전혀 바꾸지 않으므로(해당 1건 머지에만 적용) **완화 창 자체가 없고 롤백할 상태도 없다**.
+  전제: `enforce_admins=false`(현 실측) + 머지 수행자 admin. (이 레포의 부트스트랩 sacred PR들이 실제로 이 경로로 머지됐다.)
+- **완화 경로는 admin bypass 불가 시(예: `enforce_admins=true`)만의 최후 수단**이며, 개시 전 다음 넷이 **mandatory**
+  (하나라도 없으면 개시 금지 — fail-closed):
+  1. 완화 **전** `GET .../protection` **전체 스냅샷 저장**(복원 payload 확보)
+  2. **branch-global 프리체크**: 다른 open PR 부재/draft화 + direct-push 금지 재확인 (완화는 브랜치 전역이라 특정 PR에 한정 불가)
+  3. **구체적 데드라인 + 독립 실행 가능한 복원 수단** — 세션·오퍼레이터 실패 시 실행할, 두 번째 오퍼레이터가 보유한
+     복원 명령. **알림은 롤백이 아니다** — 알림만으로 갈음 금지
+  4. 복원 후 `CheckBranchProtection` + `GET` diff로 **원상태 실측 + 증거 기록**(복원도 destructive PUT이라 self-assert 금지)
 - App key 프로비저닝 **이후** 모든 sacred 변경은 정상 App-작성 PR 경로.
