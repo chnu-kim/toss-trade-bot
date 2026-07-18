@@ -364,9 +364,23 @@ func adrProtectsWiringProblems(decls []adrDecl, sacred []string, coEntries []cod
 // or deleting a sacred ADR leaves CheckCodeowners passing on a path nothing
 // lives at, while the forward completeness check simply stops seeing the ADR.
 // Emptying a protects: declaration is the same hole from the other end.
-// Non-ADR sacred paths (workflows, runbooks, scripts, gate code) are out of
-// scope here — they have no frontmatter SSOT and keep their own dedicated
-// fail-closed tests.
+//
+// # Ownership boundary with the non-ADR sacred paths
+//
+// Only docs/adr entries are checked here. Every other sacred path — workflows,
+// the phase-b-entry runbook, scripts/, gate code, this package itself, and the
+// secret scanner/allowlist registered by #27 — has no frontmatter, therefore no
+// protects: SSOT to derive completeness from, and is deliberately NOT this
+// check's business. Each of those keeps its own dedicated fail-closed test
+// (TestCheckCodeowners_MissingSecretScannerFailsClosed for the scanner,
+// TestSacredRequiredPaths_CoversEveryEnforcementGoFile for this package, and so
+// on).
+//
+// The two layers are complementary, not redundant: this one answers "is every
+// ADR that *declares* protection actually wired?", those answer "is this
+// specific known path still owned?". Nothing is asserted twice, and no sacred
+// path falls between them — a path with frontmatter belongs here, a path
+// without belongs to its own test.
 func sacredADRPathProblems(decls []adrDecl, sacred []string) []string {
 	byPath := make(map[string]adrDecl, len(decls))
 	for _, d := range decls {

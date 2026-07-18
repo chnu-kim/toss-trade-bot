@@ -111,6 +111,18 @@ var sacredRequiredPaths = []string{
 	"internal/gate/verdict.go",
 	"cmd/verdict-gate/main.go",
 	"configs/gate/risk-classification.json",
+	// The commit-time/CI secret scanner, its regression suite, and its
+	// allowlist manifest (#27). ci.yml runs scan.sh directly against the PR
+	// checkout to block leaks, which makes it gate-defining (enforcement)
+	// code exactly like internal/gate above — same "main에 있음 ≠ 보호됨"
+	// rule (ADR-0011 point 4(b) round 9 / point 11). Unprotected, a PR could
+	// neuter the scanner (drop patterns, exit 0) or append an allowlist entry
+	// in the same change and ship the very leak this gate exists to stop.
+	// The allowlist is listed because it is enforcement *configuration*: an
+	// entry there suppresses findings, so adding one must require owner review.
+	".claude/skills/opensource-maintainer/scripts/scan.sh",
+	".claude/skills/opensource-maintainer/scripts/scan_test.sh",
+	".claude/skills/opensource-maintainer/allowlist.txt",
 	// This package itself (#64). The checker that decides whether the sacred
 	// paths are protected was, until now, the one gate-defining component with
 	// no protection of its own: neither .github/CODEOWNERS nor this slice

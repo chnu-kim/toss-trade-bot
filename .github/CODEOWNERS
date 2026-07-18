@@ -75,6 +75,14 @@
 # 확정(configs/gate/risk-classification.json). 위 이유와 동일하게 보호 대상.
 /configs/gate/ @chnu-kim
 
+# 커밋 전/CI 시크릿 스캐너와 그 회귀 스위트·allowlist 매니페스트(이슈 #27).
+# ci.yml이 PR 체크아웃에서 이 스크립트를 직접 실행해 유출을 차단하므로 이건
+# 게이트-정의(enforcement) 코드다 — 위 verdict-gate 로직과 같은 이유로 보호한다
+# ("main에 있음 ≠ 보호됨", ADR-0011 point 4(b) 라운드 9·point 11). 보호가 없으면
+# PR이 같은 변경 안에서 스캐너를 무력화(패턴 삭제·exit 0)하거나 allowlist에 항목을
+# 추가해, 이 게이트가 막으려는 바로 그 유출을 통과시킬 수 있다.
+/.claude/skills/opensource-maintainer/ @chnu-kim
+
 # presence-check 구현 자신(#64) — sacred 경로를 지키는 *검사기*가 무보호면 보호
 # 전체가 공동화된다. 이 패키지가 sacredRequiredPaths 목록과 CODEOWNERS 판정
 # 로직(last-match-wins)을 들고 있으므로, loop가 이 코드를 고칠 수 있으면 목록에서
