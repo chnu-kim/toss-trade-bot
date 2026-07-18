@@ -176,6 +176,24 @@ func (f *failOnAppend) LoadUnresolvedIntents(ctx context.Context) ([]store.Inten
 	return f.inner.LoadUnresolvedIntents(ctx)
 }
 
+// resolvedDuplicateJournal simulates re-submitting an intentId whose row already
+// exists but has been RESOLVED (#35): AppendIntent hits a PK collision, yet the
+// unresolved scan that drives idempotency does not surface the resolved row (so the
+// submit path cannot tell this duplicate replay apart from a durability failure).
+type resolvedDuplicateJournal struct{ collisionErr error }
+
+func (j *resolvedDuplicateJournal) AppendIntent(context.Context, store.Intent) error {
+	return j.collisionErr
+}
+
+func (j *resolvedDuplicateJournal) AppendMarker(context.Context, string, store.MarkerKind, string) error {
+	return nil
+}
+
+func (j *resolvedDuplicateJournal) LoadUnresolvedIntents(context.Context) ([]store.Intent, error) {
+	return nil, nil
+}
+
 // cancelAfterAppend is a journal decorator that cancels the caller ctx the instant
 // a chosen marker's own durable write succeeds, exercising the window between a
 // committed marker and its mandatory audit emit. The underlying marker write ran
@@ -876,28 +894,59 @@ func TestSubmitIntentSubmitAttemptedStoreFailureTripsGlobal(t *testing.T) {
 	}
 }
 
-// TestSubmitIntentPreparedStoreFailureTripsGlobal pins ADR-0005 point 6 for the
-// prepared marker's GENUINE failure (distinct from the PK-race replay branch, which
-// stays a duplicate with no trip): it trips the global halt, returns a hard error,
-// and no POST happens.
-func TestSubmitIntentPreparedStoreFailureTripsGlobal(t *testing.T) {
+// TestSubmitIntentPreparedFailureDoesNotTrip pins that a prepared AppendIntent
+// failure returns a hard error but does NOT trip the global halt. order cannot
+// distinguish a PK collision (a duplicate replay of an already-resolved intent —
+// its row remains but is out of the unresolved set) from a genuine durability
+// failure without store support #34 may not add, so it must not halt the whole bot
+// on what may be a mere duplicate (fail-closed-wrong-direction). Money-safety holds
+// regardless: a prepared failure means no POST. Contrast submit-attempted / acked,
+// whose autoincrement markers cannot PK-collide and DO fail-closed below.
+func TestSubmitIntentPreparedFailureDoesNotTrip(t *testing.T) {
 	ctx := context.Background()
 	st := newStore(t)
-	ks := newKill(t, st)
-	api := &stubAPI{resp: OrderResponse{OrderID: "ord-x"}}
+	g := allowingGuard()
+	api := &stubAPI{}
 	j := &failOnAppend{inner: st, failIntent: true, err: errors.New("disk full")}
 
 	sub, err := NewSubmitter(SubmitterConfig{
-		Journal: j, Audit: &fakeAudit{}, Guard: ks, API: api, AccountSeq: 1, Wake: func() {},
+		Journal: j, Audit: &fakeAudit{}, Guard: g, API: api, AccountSeq: 1, Wake: func() {},
 	})
 	if err != nil {
 		t.Fatalf("NewSubmitter: %v", err)
 	}
 	if _, err := sub.SubmitIntent(ctx, Intent{IntentID: "i1", Request: validReq("AAPL")}); err == nil {
-		t.Fatalf("prepared store failure returned nil error; want a hard error")
+		t.Fatalf("prepared failure returned nil error; want a hard error")
 	}
-	if allowed, _ := ks.CanSubmit("AAPL"); allowed {
-		t.Fatalf("global halt not tripped after prepared store failure")
+	if g.tripCount() != 0 {
+		t.Fatalf("prepared failure tripped the global halt %d time(s); must not (may be a duplicate replay)", g.tripCount())
+	}
+	if api.calls() != 0 {
+		t.Fatalf("POST calls = %d, want 0", api.calls())
+	}
+}
+
+// TestSubmitIntentPreparedPKCollisionDoesNotTrip is the direct regression guard for
+// the spurious-halt bug: re-submitting a RESOLVED intentId hits an AppendIntent PK
+// collision that the unresolved scan does not surface. It must return a hard error
+// WITHOUT tripping the global halt and without a POST — a duplicate replay must
+// never halt the whole bot.
+func TestSubmitIntentPreparedPKCollisionDoesNotTrip(t *testing.T) {
+	g := allowingGuard()
+	api := &stubAPI{}
+	j := &resolvedDuplicateJournal{collisionErr: errors.New("UNIQUE constraint failed: intents.intent_id")}
+
+	sub, err := NewSubmitter(SubmitterConfig{
+		Journal: j, Audit: &fakeAudit{}, Guard: g, API: api, AccountSeq: 1, Wake: func() {},
+	})
+	if err != nil {
+		t.Fatalf("NewSubmitter: %v", err)
+	}
+	if _, err := sub.SubmitIntent(context.Background(), Intent{IntentID: "resolved-1", Request: validReq("AAPL")}); err == nil {
+		t.Fatalf("expected a hard error on a duplicate (resolved) intentId")
+	}
+	if g.tripCount() != 0 {
+		t.Fatalf("a duplicate replay tripped the global halt %d time(s); must not (fail-closed-wrong-direction)", g.tripCount())
 	}
 	if api.calls() != 0 {
 		t.Fatalf("POST calls = %d, want 0", api.calls())

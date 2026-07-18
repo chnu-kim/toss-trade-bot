@@ -280,7 +280,9 @@ func (s *Submitter) SubmitIntent(ctx context.Context, intent Intent) (Outcome, e
 	// exists AND a strategy violates its contract by reusing a resolved intentId.
 	// Full idempotency (returning the prior outcome) needs a single-intent store read
 	// that includes resolved rows — a #35/store follow-up, out of #34's store-no-edit
-	// scope.
+	// scope. The SAME store support is what the prepared-append failure path (below)
+	// needs to safely fail-closed on a genuine durability failure without also
+	// halting on a duplicate replay — one follow-up unblocks both.
 	if existing, found, err := s.lookup(ctx, intent.IntentID); err != nil {
 		return Outcome{}, err
 	} else if found {
@@ -303,22 +305,27 @@ func (s *Submitter) SubmitIntent(ctx context.Context, intent Intent) (Outcome, e
 	rec := store.Intent{IntentID: intent.IntentID, ClientOrderID: clientOrderID, Payload: payload}
 	if err := s.journal.AppendIntent(ctx, rec); err != nil {
 		// A concurrent submit for the same intentId may have won the PRIMARY-KEY
-		// race and created the row first. If the intent now exists, this is an
+		// race and created the row first. If the intent is in the live set, this is an
 		// idempotent replay (return existing state, no POST, no trip).
 		if existing, found, lerr := s.lookup(ctx, intent.IntentID); lerr == nil && found {
 			return duplicateOutcome(existing), nil
 		}
-		if isCallerCanceled(ctx, err) {
-			// The caller cancelled/timed out before anything was POSTed — a clean
-			// abort, not a durability-medium failure. Nothing durable was recorded;
-			// return the error without a halt (ADR-0005 point 6 escalates the medium
-			// failing, not the caller walking away).
-			return Outcome{}, fmt.Errorf("order: prepared append aborted for %q: %w", intent.IntentID, err)
-		}
-		// Otherwise the prepared append GENUINELY failed to durably record. If we
-		// cannot journal the intent we cannot safely submit — fail-closed (ADR-0005
-		// point 6), symmetric to the audit-failure escalation. Nothing was POSTed.
-		return Outcome{}, s.tripOnStoreFailure(ctx, store.MarkerPrepared, err)
+		// Otherwise the append failed and we CANNOT cleanly tell the two causes apart:
+		// (i) a PK collision the fallback scan missed because the intent is already
+		// RESOLVED (its row remains but leaves the unresolved set — a duplicate replay),
+		// versus (ii) a genuine durability-medium failure. store exposes no collision
+		// sentinel (only ErrIntentNotFound/ErrSchemaTooNew) and #34 must not modify
+		// store, so this discrimination is impossible here. Given that, DO NOT trip the
+		// global halt: a duplicate replay must never halt the whole bot
+		// (fail-closed-wrong-direction). Return a HARD error instead. Money-safety holds
+		// either way — a prepared failure means no POST. This is the SAME root as the
+		// idempotency limitation noted above (Finding B): the global escalation of a
+		// genuine prepared durability failure (ADR-0005 point 6) is deferred to the same
+		// store follow-up (a single-intent read incl. resolved, or a collision sentinel)
+		// that would let order distinguish the two. NB submit-attempted/acked have no
+		// such ambiguity — their markers table uses an autoincrement PK, so those
+		// AppendMarker calls cannot PK-collide and DO fail-closed on durability failure.
+		return Outcome{}, fmt.Errorf("order: prepared append for %q failed (no POST made; not escalated — cannot distinguish a duplicate replay from a durability failure without store support): %w", intent.IntentID, err)
 	}
 	if err := s.emit(ctx, intent.IntentID, "", store.MarkerPrepared); err != nil {
 		// audit fail-closed already tripped the global halt inside emit; the
