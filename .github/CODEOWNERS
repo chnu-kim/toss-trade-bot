@@ -106,8 +106,8 @@
 # 오케스트레이션 스킬 — 워커 leaf만 보호하고 그것을 *호출하는* 절차를 놔두면 게이트는 그대로 꺼진다.
 # dispatch-issue는 이슈 적격성·risk:critical 정지 조건·계정 고정·worktree 격리·워커 위임 강제·
 # PR 핸드오프·정리를 결정한다 — "고치면 게이트 판정이나 그 증거가 바뀌나?" 테스트를 통과한다.
-# (codex-pr-review 스킬도 같은 테스트를 통과하나 사용자 전역 ~/.claude/skills/에 살아 이 레포
-#  CODEOWNERS로 보호 불가 — 신뢰 경계 밖이라는 알려진 한계로 book한다.)
+# (codex-pr-review 스킬도 같은 테스트를 통과하나 이 레포가 아니라 사용자 전역 스킬 디렉터리에
+#  설치돼 있어 레포 CODEOWNERS로 보호 불가 — 신뢰 경계 밖이라는 알려진 한계로 book한다.)
 # (PR #81 적대 리뷰 R3: leaf는 보호하고 orchestrator를 놓친 같은 클래스 다섯 번째 발생.)
 /.claude/skills/dispatch-issue/ @chnu-kim
 

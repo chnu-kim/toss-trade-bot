@@ -23,7 +23,7 @@ func TestSacredRequiredPaths_CoversEveryAgentInstructionFile(t *testing.T) {
 func TestSacredRequiredPaths_CoversEveryOrchestrationSkill(t *testing.T) {
 	// Only the repo-local skills that gate or generate gate evidence are sacred.
 	// NOTE: codex-pr-review also gates (it IS the review invocation) but lives in the
-	// USER-GLOBAL ~/.claude/skills/, outside this repo — CODEOWNERS cannot protect it.
+	// user-global skills directory rather than this repo — CODEOWNERS cannot reach it.
 	// That trust-boundary gap is booked, not closed here.
 	for _, dir := range []string{"dispatch-issue"} {
 		assertGlobFullyRegistered(t,
