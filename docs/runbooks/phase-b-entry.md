@@ -80,7 +80,8 @@ Phase B까지 durable하게 잔존한다.
    `enforce_admins`, 기존 contexts(`build · vet · gofmt · test-race`, app_id 15368),
    `restrictions`, `required_linear_history`, `required_pull_request_reviews` 블록.
 3. **단일 PUT → 즉시 검증**:
-   - `internal/enforcement`의 `CheckBranchProtection` 재통과(code-owner·verdict required 확인)
+   - `internal/enforcement`의 `CheckBranchProtection` 재통과 — **code-owner 강제만 확인**(이 검사기는 `require_code_owner_reviews`만 파싱하고 `required_status_checks`는 미검사, branchprotection.go:47-48)
+   - **별도 `GET .../branches/main/protection` assertion으로 `required_status_checks`에 `verdict-gate` context 실재 확인** — verdict-gate required는 `CheckBranchProtection`이 아니라 이 GET이 검증한다(누락 시 verdict 게이트 없이 count=0이 되는 false-green 봉쇄 — codex #73)
    - `GET` diff로 의도한 두 필드 외 **무변경 실측**(silent drop 검출)
    - 테스트 PR로 **count=0에서 code-owner·verdict-gate가 실제 blocking인지 거동 실측**
      (Phase-A 실측은 이전되지 않는다 — count≥1 실측 ≠ count=0 거동)
