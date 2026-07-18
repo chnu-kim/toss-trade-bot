@@ -22,6 +22,8 @@ var ErrSchemaTooNew = errors.New("store: database schema is newer than this bina
 // READS it to decide eligibility and does not touch the schema — so V3 and #14
 // do not collide on this file. V4 (issue #29) enforces the ADR-0002 2-marker
 // protocol's integrity in the schema itself (UNIQUE + shape CHECKs on markers).
+// V5 (issue #14) indexes the retention pass's candidate selection so it cannot
+// full-scan the journal while holding the single write connection.
 //
 // The version number is the shared contract that keeps concurrently-open store
 // issues from colliding: whichever merges first claims the next number and the
@@ -34,6 +36,7 @@ const (
 	schemaVersionV2 = 2
 	schemaVersionV3 = 3
 	schemaVersionV4 = 4
+	schemaVersionV5 = 5
 )
 
 // migrations is the ordered migration list. Index i migrates the schema from
@@ -44,6 +47,7 @@ var migrations = []string{
 	schemaV2,
 	schemaV3,
 	schemaV4,
+	schemaV5,
 }
 
 // schemaV1 creates the three areas of live state: the order journal (intents +
@@ -270,6 +274,61 @@ INSERT INTO markers_v4 (seq, intent_id, kind, order_id, at)
 DROP TABLE markers;
 ALTER TABLE markers_v4 RENAME TO markers;
 CREATE UNIQUE INDEX ux_markers_intent_kind ON markers(intent_id, kind);
+`
+
+// pruneIndexName is the index schemaV5 creates. prune.go's candidate query is
+// written to be served by it, and TestPruneCandidateSelectionUsesTheIndex asserts
+// the planner actually picks it — the two are a twin artifact, so moving one
+// without the other must break a test rather than quietly restore a full scan.
+const pruneIndexName = "idx_intents_prunable"
+
+// schemaV5 makes the retention pass's candidate selection indexed (issue #14,
+// codex review). It is additive — it creates an index and edits no shipped
+// migration.
+//
+// This is an availability guard, not a micro-optimization. PruneTerminalIntents
+// opens the DEDICATED WRITE transaction and only then selects its candidates, so
+// whatever that SELECT costs is paid while every other writer waits: AppendIntent,
+// AppendMarker, ResolveIntent. The pre-existing indexes do not help it —
+// idx_intents_unresolved is partial on resolved_at IS NULL, i.e. precisely the rows
+// prune skips — so without this index each pass full-scans intents and then sorts
+// them in a temp B-tree. The batch limit bounds how many rows are DELETED but not
+// how many are EXAMINED, so on a grown journal a retention pass could stall the
+// submit path's marker append. That inverts the whole point of the loop: retention
+// exists so a full disk can never block submit-attempted, and it must not block it
+// on the way there. The hazard also compounds — the bigger the backlog, the longer
+// the scan, and a backlog is exactly when prune runs hardest.
+//
+// The index mirrors pruneCandidateQuery exactly:
+//
+//   - the partial WHERE matches the query's two IS NOT NULL conjuncts, so SQLite's
+//     planner can prove the index applies. It also keeps the index SMALL and, more
+//     importantly, keeps it off the hot path: a newly appended intent has resolved_at
+//     NULL and is therefore not indexed at all, so the submit path pays nothing for
+//     it. Only ResolveIntent and finalizeFullyAudited touch it, once each, on rows
+//     that are never written again.
+//   - the leading key is the EXPRESSION MAX(resolved_at, fully_audited_at) — the same
+//     expression the query filters and orders by — which is what makes the scan
+//     genuinely bounded. An index leading on plain resolved_at would look right and
+//     still be wrong: the planner could range-bound only that column and would then
+//     walk every older row testing the second cutoff, so a backlog of
+//     old-resolved-but-recently-finalized rows (precisely what a reconciler draining
+//     a crash tail creates) would be an unbounded prefix examined on every pass. With
+//     the expression as the key, eligibility is one monotone value and the scan stops
+//     at the first row past the cutoff. Verified through the planner rather than
+//     assumed: TestPruneCandidateSelectionUsesTheIndex asserts the range bound is
+//     present, not merely that the index is used.
+//   - intent_id trails it to complete the ORDER BY, so the batch is read out in order
+//     with no temp B-tree, and LIMIT ends the traversal.
+//
+// SQLite's two-argument MAX() is the scalar function (the aggregate is the one-arg
+// form) and is deterministic, so it is legal in an index expression.
+//
+// Adding an index is not a data-shape change, so unlike V4 this migration cannot
+// fail on pre-existing rows.
+const schemaV5 = `
+CREATE INDEX idx_intents_prunable ON intents(MAX(resolved_at, fully_audited_at), intent_id)
+	WHERE resolved_at IS NOT NULL AND fully_audited_at IS NOT NULL;
 `
 
 // migrate brings the database up to the latest migration, running each pending

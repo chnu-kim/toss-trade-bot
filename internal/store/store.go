@@ -270,12 +270,22 @@ func (d *DB) schemaVersion(ctx context.Context) (int, error) {
 // see issue #24. Rollback after a successful Commit is a documented no-op
 // (sql.ErrTxDone), so this is safe on the happy path too.
 func (d *DB) Atomically(ctx context.Context, fn func(tx Tx) error) error {
+	return d.withWriteTx(ctx, func(q querier) error { return fn(&txn{q: q}) })
+}
+
+// withWriteTx is the one place a write transaction is opened, so every writer —
+// Atomically's Tx callbacks and the internal query functions alike (prune.go) —
+// shares the same single-connection serialization, the same commit-error wrapping
+// and, crucially, the same deferred-Rollback panic safety net described above.
+// Duplicating that net per call site is how it eventually gets forgotten in one of
+// them, which would wedge every later write on the sole write connection (#24).
+func (d *DB) withWriteTx(ctx context.Context, fn func(q querier) error) error {
 	sqlTx, err := d.writeDB.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("store: begin tx: %w", err)
 	}
 	defer sqlTx.Rollback() //nolint:errcheck // no-op after a successful Commit; panic safety net otherwise
-	if err := fn(&txn{q: sqlTx}); err != nil {
+	if err := fn(sqlTx); err != nil {
 		return err
 	}
 	if err := sqlTx.Commit(); err != nil {
