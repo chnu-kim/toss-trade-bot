@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/url"
+	"time"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver, registered as "sqlite"
 )
@@ -38,6 +39,16 @@ type Store interface {
 
 	SetCounter(ctx context.Context, c Counter) error
 	Counter(ctx context.Context, name string) (Counter, error)
+
+	// Audit-ack ↔ prune-gate wiring (ADR-0006 point 4). RecordAuditAck records one
+	// lifecycle record's durable ack; FinalizeFullyAudited sets the per-intent
+	// prune-gate flag once ALL are acked; FullyAudited reads it;
+	// UnackedLifecycleRecords reconstructs the still-un-acked records a restart
+	// reconciler must re-emit. See the Tx methods for the full contract.
+	RecordAuditAck(ctx context.Context, intentID, recordKey string) error
+	FinalizeFullyAudited(ctx context.Context, intentID string) (bool, error)
+	FullyAudited(ctx context.Context, intentID string) (time.Time, bool, error)
+	UnackedLifecycleRecords(ctx context.Context, intentID string) ([]LifecycleRecord, error)
 
 	Close() error
 }
@@ -198,6 +209,24 @@ func (d *DB) SetCounter(ctx context.Context, c Counter) error {
 	return d.Atomically(ctx, func(tx Tx) error { return tx.SetCounter(ctx, c) })
 }
 
+// RecordAuditAck durably records one lifecycle record's ack as its own commit
+// (ADR-0006 point 4: each lifecycle marker audit fsync → store transaction ack).
+func (d *DB) RecordAuditAck(ctx context.Context, intentID, recordKey string) error {
+	return d.Atomically(ctx, func(tx Tx) error { return tx.RecordAuditAck(ctx, intentID, recordKey) })
+}
+
+// FinalizeFullyAudited sets the prune-gate flag iff every lifecycle record is
+// durably acked (and the intent is resolved), committing as one durable event.
+func (d *DB) FinalizeFullyAudited(ctx context.Context, intentID string) (bool, error) {
+	var done bool
+	err := d.Atomically(ctx, func(tx Tx) error {
+		var e error
+		done, e = tx.FinalizeFullyAudited(ctx, intentID)
+		return e
+	})
+	return done, err
+}
+
 // --- reads: served by the read handle (concurrent under WAL) ---
 
 // LoadUnresolvedIntents returns every intent still open (ResolvedAt == nil),
@@ -232,4 +261,23 @@ func (d *DB) Lifecycle(ctx context.Context) (LifecycleState, error) {
 // zero-value Counter with that name (Value 0), not an error.
 func (d *DB) Counter(ctx context.Context, name string) (Counter, error) {
 	return readCounter(ctx, d.readDB, name)
+}
+
+// FullyAudited reads the per-intent prune-gate flag.
+func (d *DB) FullyAudited(ctx context.Context, intentID string) (time.Time, bool, error) {
+	return readFullyAudited(ctx, d.readDB, intentID)
+}
+
+// UnackedLifecycleRecords reconstructs the still-un-acked lifecycle records for an
+// intent. The load reads the intent (with markers) and its ack set, so it runs in
+// one read transaction to pin a single SQLite snapshot — otherwise a concurrent ack
+// commit between the two queries could drop a record that is actually still
+// un-acked from the result.
+func (d *DB) UnackedLifecycleRecords(ctx context.Context, intentID string) ([]LifecycleRecord, error) {
+	tx, err := d.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("store: begin read tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // read-only; Rollback just releases the snapshot
+	return unackedLifecycleRecords(ctx, tx, intentID)
 }

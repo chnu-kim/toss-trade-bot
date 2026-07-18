@@ -36,6 +36,28 @@ type Tx interface {
 
 	SetCounter(ctx context.Context, c Counter) error
 	Counter(ctx context.Context, name string) (Counter, error)
+
+	// RecordAuditAck idempotently records that the lifecycle audit record
+	// identified by recordKey (a store-local key from ReconstructLifecycleRecords)
+	// is durably acked for intentID. It records the ack fact only
+	// (boolean/timestamp, no audit content — ADR-0005 point 5) and does NOT set the
+	// prune-gate flag. Call FinalizeFullyAudited after recording to gate the flag on
+	// ALL lifecycle records (ADR-0006 point 4 — the terminal alone must not set it).
+	RecordAuditAck(ctx context.Context, intentID, recordKey string) error
+	// FinalizeFullyAudited sets the intent's fully-audited flag iff it is resolved
+	// AND every lifecycle record reconstructed from its journal state has a recorded
+	// ack; it returns whether the intent is (now or already) fully audited.
+	// Idempotent and preservation-safe: until all records are acked the flag stays
+	// unset, so prune (#14) preserves the intent.
+	FinalizeFullyAudited(ctx context.Context, intentID string) (bool, error)
+	// FullyAudited reads the prune-gate flag: the time it was set and whether it is
+	// set.
+	FullyAudited(ctx context.Context, intentID string) (time.Time, bool, error)
+	// UnackedLifecycleRecords returns the lifecycle records reconstructed from
+	// intentID's journal state that do NOT yet have a recorded ack — the set a
+	// restart reconciler must re-emit (ADR-0006 point 4 recovery loop; the driver is
+	// out of scope). Deterministic.
+	UnackedLifecycleRecords(ctx context.Context, intentID string) ([]LifecycleRecord, error)
 }
 
 // querier is the read/write surface shared by *sql.Tx and *sql.DB, letting the
@@ -85,6 +107,18 @@ func (t *txn) SetCounter(ctx context.Context, c Counter) error {
 }
 func (t *txn) Counter(ctx context.Context, name string) (Counter, error) {
 	return readCounter(ctx, t.q, name)
+}
+func (t *txn) RecordAuditAck(ctx context.Context, intentID, recordKey string) error {
+	return recordAuditAck(ctx, t.q, intentID, recordKey)
+}
+func (t *txn) FinalizeFullyAudited(ctx context.Context, intentID string) (bool, error) {
+	return finalizeFullyAudited(ctx, t.q, intentID)
+}
+func (t *txn) FullyAudited(ctx context.Context, intentID string) (time.Time, bool, error) {
+	return readFullyAudited(ctx, t.q, intentID)
+}
+func (t *txn) UnackedLifecycleRecords(ctx context.Context, intentID string) ([]LifecycleRecord, error) {
+	return unackedLifecycleRecords(ctx, t.q, intentID)
 }
 
 // --- shared query functions (work over any querier) ---

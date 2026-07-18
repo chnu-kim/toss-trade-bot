@@ -13,7 +13,12 @@
 //     with no coexisting records, so a crash cannot leave a stale clean beside a
 //     running (ADR-0012 Decision 1(c) sentinel fail-open #1),
 //   - reconstruction-resistant persistent counters (e.g. token-refresh
-//     failures) that a restart must not silently reset (ADR-0004 point 7).
+//     failures) that a restart must not silently reset (ADR-0004 point 7),
+//   - the per-intent fully-audited ack flag plus its lifecycle-audit ack ledger
+//     (V3, issue #20): boolean/timestamp bookkeeping that gates prune on "every
+//     lifecycle audit record durably acked", never on the terminal alone
+//     (ADR-0006 point 4). It holds ack facts only, no audit content — the audit
+//     history stays in the sink (ADR-0005 point 5).
 //
 // store is substrate only: it exposes the halt phase and sentinel value plus the
 // atomic transitions, but the judgment logic — when pending becomes halted, when
@@ -41,8 +46,11 @@
 //     connection so concurrent Atomically callers serialize instead of racing
 //     into a spurious SQLITE_BUSY fail-closed (ADR-0005 follow-up).
 //
-// Out of scope for this package: retention/prune (issue #14, the ack-flag
-// column — a later migration), the audit/observability sink (ADR-0005 point 5),
-// disk-full → halt wiring (killswitch, ADR-0004), and the durable-before-visible
-// judgment/wiring that consumes the halt phase and sentinel (#32/#36).
+// Out of scope for this package: the retention/prune loop (issue #14) that READS
+// the fully-audited flag this package now sets (#20 sets it, #14 reads it to gate
+// deletion), the audit/observability sink itself (ADR-0005 point 5, internal/audit),
+// the restart reconciler DRIVER that re-emits UnackedLifecycleRecords (ADR-0003;
+// this package exposes the reconstruction function, not the driver), disk-full →
+// halt wiring (killswitch, ADR-0004), and the durable-before-visible judgment/wiring
+// that consumes the halt phase and sentinel (#32/#36).
 package store

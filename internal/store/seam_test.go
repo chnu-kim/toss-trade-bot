@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 // fakeStore is a stand-in a consumer package (order/killswitch/reconciler)
@@ -55,6 +56,16 @@ func (f *fakeStore) SetCounter(context.Context, Counter) error { return nil }
 func (f *fakeStore) Counter(_ context.Context, name string) (Counter, error) {
 	return Counter{Name: name}, nil
 }
+func (f *fakeStore) RecordAuditAck(context.Context, string, string) error { return nil }
+func (f *fakeStore) FinalizeFullyAudited(context.Context, string) (bool, error) {
+	return false, nil
+}
+func (f *fakeStore) FullyAudited(context.Context, string) (time.Time, bool, error) {
+	return time.Time{}, false, nil
+}
+func (f *fakeStore) UnackedLifecycleRecords(context.Context, string) ([]LifecycleRecord, error) {
+	return nil, nil
+}
 func (f *fakeStore) Close() error { return nil }
 
 type fakeTx struct{ f *fakeStore }
@@ -78,6 +89,16 @@ func (t fakeTx) Lifecycle(ctx context.Context) (LifecycleState, error) { return 
 func (t fakeTx) SetCounter(context.Context, Counter) error             { return nil }
 func (t fakeTx) Counter(ctx context.Context, name string) (Counter, error) {
 	return t.f.Counter(ctx, name)
+}
+func (t fakeTx) RecordAuditAck(context.Context, string, string) error { return nil }
+func (t fakeTx) FinalizeFullyAudited(context.Context, string) (bool, error) {
+	return false, nil
+}
+func (t fakeTx) FullyAudited(context.Context, string) (time.Time, bool, error) {
+	return time.Time{}, false, nil
+}
+func (t fakeTx) UnackedLifecycleRecords(context.Context, string) ([]LifecycleRecord, error) {
+	return nil, nil
 }
 
 // compile-time assurance the fakes satisfy the seams.

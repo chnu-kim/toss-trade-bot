@@ -75,8 +75,8 @@ func TestMigrationVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("schemaVersion: %v", err)
 	}
-	if v != schemaVersionV2 {
-		t.Fatalf("schema version = %d, want %d", v, schemaVersionV2)
+	if v != schemaVersionV3 {
+		t.Fatalf("schema version = %d, want %d", v, schemaVersionV3)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -92,8 +92,8 @@ func TestMigrationVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("schemaVersion (reopen): %v", err)
 	}
-	if v2 != schemaVersionV2 {
-		t.Fatalf("schema version after reopen = %d, want %d", v2, schemaVersionV2)
+	if v2 != schemaVersionV3 {
+		t.Fatalf("schema version after reopen = %d, want %d", v2, schemaVersionV3)
 	}
 }
 
