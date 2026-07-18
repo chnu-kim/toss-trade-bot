@@ -620,6 +620,72 @@ func TestUpgradeOverViolatingDataFailsClosed(t *testing.T) {
 	}
 }
 
+// TestUpgradeImportsPostTerminalMarkerWithNonLaterTimestamp pins a KNOWN,
+// deliberate limitation rather than asserting desired behaviour: the
+// post-terminal migration probe is best-effort, so a genuinely post-terminal
+// marker whose `at` ties or predates the resolution (a backwards clock step, or
+// two writes landing in the same nanosecond) is imported silently.
+//
+// It cannot be fixed by adding a durable resolution sequence: legacy rows carry no
+// such value to reconstruct, so the evidence simply is not there. The blast radius
+// is bounded and fail-safe, which is what this test actually verifies — the intent
+// stays terminally resolved (it cannot re-enter the live set that gates
+// submissions), and the extra reconstructed lifecycle record leaves the intent
+// un-finalized so prune preserves it (#14).
+//
+// If a future change ever does make this provable, this test will fail and should
+// be replaced by one asserting rejection.
+func TestUpgradeImportsPostTerminalMarkerWithNonLaterTimestamp(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.db")
+	ctx := context.Background()
+
+	seedLegacyDB(t, path, preIntegrityVersion, func(db *sql.DB) {
+		mustExec(t, db, `INSERT INTO intents (intent_id, client_order_id, payload, created_at, resolved_at, resolution) VALUES ('i1', 'c1', NULL, 100, 150, 'filled')`)
+		mustExec(t, db, `INSERT INTO markers (seq, intent_id, kind, order_id, at) VALUES (1, 'i1', 'prepared', '', 101)`)
+		mustExec(t, db, `INSERT INTO markers (seq, intent_id, kind, order_id, at) VALUES (2, 'i1', 'submit-attempted', '', 102)`)
+		// Appended AFTER the resolution in reality (seq 3 > 2), but stamped at the
+		// same instant as it — the probe's blind spot.
+		mustExec(t, db, `INSERT INTO markers (seq, intent_id, kind, order_id, at) VALUES (3, 'i1', 'acked', 'ord-1', 150)`)
+	})
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("known limitation: this journal is expected to upgrade silently, got %v", err)
+	}
+	defer db.Close()
+
+	// Bounded blast radius #1: the intent stays terminally resolved. A post-terminal
+	// marker must never put it back in the live set that gates new submissions.
+	live, err := db.LoadUnresolvedIntents(ctx)
+	if err != nil {
+		t.Fatalf("LoadUnresolvedIntents: %v", err)
+	}
+	for _, in := range live {
+		if in.IntentID == "i1" {
+			t.Fatal("an imported post-terminal marker resurrected a resolved intent into the live set")
+		}
+	}
+
+	// Bounded blast radius #2: the stray marker adds a lifecycle record that is not
+	// acked, so the intent never becomes fully audited and prune preserves it.
+	if _, set, err := db.FullyAudited(ctx, "i1"); err != nil || set {
+		t.Fatalf("FullyAudited = %v (err %v), want unset so prune preserves the intent", set, err)
+	}
+	recs, err := db.UnackedLifecycleRecords(ctx, "i1")
+	if err != nil {
+		t.Fatalf("UnackedLifecycleRecords: %v", err)
+	}
+	if len(recs) == 0 {
+		t.Fatal("expected the imported marker to leave un-acked lifecycle records (prune stays blocked)")
+	}
+
+	// And going forward the exact guard applies: appendMarker refuses to extend the
+	// resolved intent further, timestamps irrelevant.
+	if err := db.AppendMarker(ctx, "i1", MarkerSubmitAttempted, ""); !errors.Is(err, ErrMarkerAfterTerminal) {
+		t.Fatalf("post-upgrade append on the resolved intent err = %v, want ErrMarkerAfterTerminal", err)
+	}
+}
+
 // TestUpgradeIsIdempotent: reopening an already-upgraded database is a no-op —
 // the rebuild must not run twice (which would either fail or silently re-key seq).
 func TestUpgradeIsIdempotent(t *testing.T) {

@@ -192,8 +192,11 @@ CREATE TABLE audit_acks (
 // ErrMigrationDataViolation) rather than repairing them — see that sentinel for
 // why deleting the evidence of a duplicate submit is not an option.
 //
-// The migration validates ALL the invariants V4 introduces, not only the three
-// the table constraints can express. The other two are cross-row rules enforced
+// The migration validates every invariant V4 introduces, not only the three the
+// table constraints can express — exactly where the stored data proves the rule,
+// and best-effort where it does not (see the post-terminal probe below, whose
+// limits are stated rather than papered over). The other two are cross-row rules
+// enforced
 // by appendMarker (no marker after terminal; no transition before its
 // predecessor), and an upgrade that admitted rows violating them would leave the
 // database in a state the running code declares impossible. Since a CHECK cannot
@@ -211,15 +214,31 @@ CREATE TABLE audit_acks (
 // unchallenged. Unlike the post-terminal probe this needs no timestamp proxy —
 // seq is exact.
 //
-// The post-terminal probe compares markers.at against intents.resolved_at. That
-// is a timestamp proxy for the causal rule ("was this row inserted while the
-// intent was still unresolved"), which the schema does not record; the comparison
-// is exact as long as the wall clock is monotonic across the two writes, and ties
-// are read as legal. A backwards clock step spanning a marker/resolve pair could
-// therefore misjudge it — accepted deliberately, because the failure it can cause
-// is a loud refusal to boot (the direction this store already chooses for
-// ErrUnsafeDBPath/ErrSchemaTooNew), not a silent import of a journal that
-// contradicts the protocol.
+// The post-terminal probe is different in kind: it is BEST-EFFORT, not a proof,
+// and the claim above is bounded accordingly. It compares markers.at against
+// intents.resolved_at, a wall-clock proxy for the causal rule ("was this row
+// inserted while the intent was still unresolved") that the schema simply does
+// not record — pre-V4 rows carry no shared append sequence spanning marker writes
+// and resolutions. It is exact while the wall clock is monotonic across the two
+// writes; ties are read as legal. It therefore has BOTH error directions:
+//
+//   - false positive (a backwards clock step across a legal marker/resolve pair):
+//     a loud refusal to boot, the direction this store already chooses for
+//     ErrUnsafeDBPath/ErrSchemaTooNew;
+//   - false negative (a genuinely post-terminal marker whose at ties or predates
+//     the resolution): silently imported.
+//
+// Adding a durable resolution sequence to intents would NOT close the false
+// negative, because legacy rows have no such value to reconstruct — it would only
+// re-prove what appendMarker already enforces exactly for new writes. So the real
+// choice is a best-effort probe or none, and a probe that catches the realistic
+// cases strictly dominates: its misses are bounded to bookkeeping in the fail-safe
+// direction. An imported post-terminal marker yields one extra reconstructed
+// lifecycle record, which keeps fully_audited_at unset and therefore makes prune
+// PRESERVE the intent (#14); it cannot resurrect a resolved intent into the live
+// set, because liveness is read from intents.resolved_at and not from markers.
+// TestUpgradeImportsPostTerminalMarkerWithNonLaterTimestamp pins this limitation
+// so it stays visible rather than becoming folklore.
 const schemaV4 = `
 CREATE TABLE markers_v4_precheck (
 	violation INTEGER NOT NULL,
