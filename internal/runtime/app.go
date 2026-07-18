@@ -40,7 +40,10 @@ type App struct {
 	// sentinel is the lifecycle seam Boot/Shutdown judge through. It is a.db in
 	// production; the narrow interface keeps the judgment testable against an
 	// injected store and keeps the journal out of reach.
-	sentinel  SentinelStore
+	sentinel SentinelStore
+	// quiesce settles outstanding token-refresh escalations before the sentinel
+	// decision. It is the client's own wait in production; tests substitute it.
+	quiesce   func(context.Context) error
 	sink      *audit.Writer
 	guard     *killswitch.Switch
 	rec       *reconciler.Reconciler
@@ -157,6 +160,7 @@ func Assemble(ctx context.Context, cfg config.Config, logger *slog.Logger) (app 
 		client:    client,
 		db:        db,
 		sentinel:  db,
+		quiesce:   client.WaitForRefreshFailureReports,
 		sink:      sink,
 		guard:     guard,
 		rec:       rec,
@@ -236,17 +240,30 @@ func (a *App) Run(ctx context.Context) error {
 			"drain_timeout", a.cfg.ShutdownTimeout.String())
 	}
 
-	// The token-refresh escalation hook stays registered through the sentinel
-	// decision on purpose. Token flights are detached from the supervisor, so a
-	// refresh that failed just before shutdown may still be running its
-	// post-flight notification; de-registering here would DROP that report even
-	// though the store is still open and could persist it — and the run could
-	// then certify itself clean with an uncounted non-reconstructable failure.
-	// Leaving it registered is strictly safer: a report that lands before the
-	// close is durably counted (and a resulting halt survives via the durable
-	// halt row even if the clean was already written), while one that lands
-	// after the close fails into an in-memory latch on a process that is exiting
-	// anyway — the same residual a crash has.
+	// Settle outstanding token-refresh escalations before judging the sentinel.
+	//
+	// sup.Wait is not sufficient here: token issuance runs on flights DETACHED
+	// from the supervisor, so a refresh that failed moments before shutdown may
+	// still owe its escalation. Certifying the run clean underneath it would be
+	// worse than crashing — a crash leaves the sentinel unclean (fail-closed),
+	// whereas a clean marker over a lost non-reconstructable failure lets the
+	// next boot come up unhalted with no evidence left to re-derive.
+	//
+	// The hook also stays registered throughout, so a report that lands while the
+	// store is still open is durably counted rather than dropped. Waiting makes
+	// the outcome deterministic: each owed report either persists, or fails into
+	// the kill switch's in-memory latch — which the eligibility check then sees
+	// and refuses the clean for.
+	qctx, qcancel := context.WithTimeout(context.WithoutCancel(ctx), tokenEscalationTimeout)
+	if err := a.quiesce(qctx); err != nil {
+		// Unsettled escalations mean this run cannot prove the failure was
+		// counted, so it is not a proven-normal exit.
+		a.logger.Warn("token refresh escalations did not settle before shutdown; the run will not be certified clean",
+			"err", err)
+		drained = false
+	}
+	qcancel()
+
 	sd := Shutdown(ctx, ShutdownPlan{
 		Sentinel: a.sentinel,
 		Guard:    a.guard,

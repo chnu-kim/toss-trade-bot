@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -207,5 +208,139 @@ func TestClient_SetTokenRefreshFailureHook_NilIsIgnored(t *testing.T) {
 	}
 	if _, err := c.tokens.get(context.Background()); err == nil {
 		t.Fatal("expected the issuance error")
+	}
+}
+
+// The quiesce seam below exists because a token-refresh failure is
+// NON-RECONSTRUCTABLE: nothing in the journal can re-derive it. Its report runs
+// on a detached flight goroutine that no supervisor tracks, so a graceful
+// shutdown could otherwise certify the run "clean" while that report is still in
+// flight — and if the report then fails (e.g. the store just closed), the
+// failure is latched only in memory in an exiting process. The next boot would
+// trust the clean marker and come up unhalted, losing the escalation. A crash
+// would have been SAFER (it leaves the sentinel unclean), which is what makes
+// this a real fail-open rather than an accepted residual.
+
+func TestWaitForFailureReports_ReturnsImmediatelyWhenIdle(t *testing.T) {
+	m := newTokenManager(func(ctx context.Context) (string, time.Duration, error) {
+		return "tok", time.Hour, nil
+	})
+	if err := m.waitForFailureReports(context.Background()); err != nil {
+		t.Fatalf("idle wait: %v", err)
+	}
+}
+
+// TestWaitForFailureReports_BlocksUntilTheHookCompletes is the core assertion:
+// the outstanding-report count must rise BEFORE the flight's waiters are
+// released, so a shutdown that starts the instant a caller returns still sees
+// the pending report.
+func TestWaitForFailureReports_BlocksUntilTheHookCompletes(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	m := newTokenManager(func(ctx context.Context) (string, time.Duration, error) {
+		return "", 0, errors.New("toss: token issuance failed (500)")
+	})
+	var hookDone atomic.Bool
+	m.setRefreshFailureHook(func(at time.Time) {
+		close(entered)
+		<-release
+		hookDone.Store(true)
+	})
+
+	if _, err := m.get(context.Background()); err == nil {
+		t.Fatal("expected the issuance error")
+	}
+	<-entered
+
+	waited := make(chan error, 1)
+	go func() { waited <- m.waitForFailureReports(context.Background()) }()
+
+	select {
+	case <-waited:
+		t.Fatal("wait returned while a refresh-failure report was still running")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case err := <-waited:
+		if err != nil {
+			t.Fatalf("wait: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("wait did not return after the hook completed")
+	}
+	if !hookDone.Load() {
+		t.Fatal("wait returned before the hook finished")
+	}
+}
+
+// TestWaitForFailureReports_CountsRiseBeforeWaitersAreReleased closes the race
+// the whole seam exists for: if the count rose only inside the notify goroutine,
+// a shutdown starting right after get() returned could observe zero pending
+// reports and certify clean anyway.
+func TestWaitForFailureReports_CountsRiseBeforeWaitersAreReleased(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	m := newTokenManager(func(ctx context.Context) (string, time.Duration, error) {
+		return "", 0, errors.New("toss: token issuance failed (500)")
+	})
+	m.setRefreshFailureHook(func(at time.Time) { <-release })
+
+	// The moment get() returns, a report is already outstanding.
+	if _, err := m.get(context.Background()); err == nil {
+		t.Fatal("expected the issuance error")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	if err := m.waitForFailureReports(ctx); err == nil {
+		t.Fatal("wait must not report quiescence while a report is outstanding")
+	}
+}
+
+func TestWaitForFailureReports_RespectsContext(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	m := newTokenManager(func(ctx context.Context) (string, time.Duration, error) {
+		return "", 0, errors.New("toss: token issuance failed (500)")
+	})
+	m.setRefreshFailureHook(func(at time.Time) { <-release })
+	if _, err := m.get(context.Background()); err == nil {
+		t.Fatal("expected the issuance error")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := m.waitForFailureReports(ctx); err == nil {
+		t.Fatal("wait must honour a cancelled context instead of blocking forever")
+	}
+}
+
+// TestWaitForFailureReports_ClearsAfterAPanickingHook keeps a panicking hook
+// from wedging every future shutdown on a report that will never complete.
+func TestWaitForFailureReports_ClearsAfterAPanickingHook(t *testing.T) {
+	m := newTokenManager(func(ctx context.Context) (string, time.Duration, error) {
+		return "", 0, errors.New("toss: token issuance failed (500)")
+	})
+	m.setRefreshFailureHook(func(at time.Time) { panic("boom") })
+	if _, err := m.get(context.Background()); err == nil {
+		t.Fatal("expected the issuance error")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := m.waitForFailureReports(ctx); err != nil {
+		t.Fatalf("a panicking hook must still release the outstanding report: %v", err)
+	}
+}
+
+func TestClient_WaitForRefreshFailureReports(t *testing.T) {
+	c, err := NewClient("https://openapi.tossinvest.com", "id", "secret")
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if err := c.WaitForRefreshFailureReports(context.Background()); err != nil {
+		t.Fatalf("idle wait: %v", err)
 	}
 }

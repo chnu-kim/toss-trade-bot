@@ -90,6 +90,15 @@ type tokenManager struct {
 	// (ADR-0004 point 7). It fires once per FLIGHT, not per waiter: issuance is
 	// single-flight, so one failure shared by N waiters is one refresh failure.
 	onRefreshFailure func(occurredAt time.Time)
+
+	// pendingFailureReports counts refresh-failure escalations that have been
+	// observed but not yet finished reporting. It is incremented while m.mu is
+	// held, at the moment the failure is recorded — BEFORE the flight's waiters
+	// are released — so a shutdown that begins the instant a caller returns still
+	// observes the outstanding report. reportsIdle is closed whenever the count
+	// falls to zero, so waiters do not have to poll.
+	pendingFailureReports int
+	reportsIdle           chan struct{}
 }
 
 func newTokenManager(issue issueFunc) *tokenManager {
@@ -136,7 +145,13 @@ func (m *tokenManager) setRefreshFailureHook(fn func(occurredAt time.Time)) {
 //     and an unattended process must not die because an escalation callback
 //     panicked (the panic would otherwise escape the flight goroutine, which has
 //     already used up its own recover).
+//
+// The outstanding-report count is released here (and ONLY here), including when
+// the hook panics — otherwise one panicking escalation would wedge every future
+// shutdown behind a report that can never complete.
 func (m *tokenManager) notifyRefreshFailure(at time.Time) {
+	defer m.releaseFailureReport()
+
 	m.mu.Lock()
 	hook := m.onRefreshFailure
 	logger := m.logger
@@ -150,6 +165,57 @@ func (m *tokenManager) notifyRefreshFailure(at time.Time) {
 		}
 	}()
 	hook(at)
+}
+
+// retainFailureReportLocked marks one refresh-failure escalation as outstanding.
+// Caller holds m.mu.
+func (m *tokenManager) retainFailureReportLocked() {
+	if m.pendingFailureReports == 0 {
+		m.reportsIdle = make(chan struct{})
+	}
+	m.pendingFailureReports++
+}
+
+// releaseFailureReport marks one outstanding escalation as finished — whether it
+// persisted, failed into the kill switch's latch, or panicked. "Finished" is the
+// property shutdown needs: a failed report has already latched an in-memory halt,
+// which is what makes the clean sentinel refuse.
+func (m *tokenManager) releaseFailureReport() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pendingFailureReports--
+	if m.pendingFailureReports == 0 && m.reportsIdle != nil {
+		close(m.reportsIdle)
+		m.reportsIdle = nil
+	}
+}
+
+// waitForFailureReports blocks until no refresh-failure escalation is
+// outstanding, or ctx expires.
+//
+// A graceful shutdown must call this BEFORE deciding the clean-shutdown
+// sentinel. Token flights are detached from any supervisor, so without it a run
+// could certify itself clean while a non-reconstructable token failure was still
+// being reported — and if that report then failed (say, because the store had
+// just closed), the failure would survive only as an in-memory latch in an
+// exiting process, leaving the next boot to trust a clean marker and come up
+// unhalted. A crash is SAFER than that, since it leaves the sentinel unclean.
+func (m *tokenManager) waitForFailureReports(ctx context.Context) error {
+	for {
+		m.mu.Lock()
+		if m.pendingFailureReports == 0 {
+			m.mu.Unlock()
+			return nil
+		}
+		idle := m.reportsIdle
+		m.mu.Unlock()
+
+		select {
+		case <-idle:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // get returns a valid token. It has three regimes, by cache state:
@@ -322,6 +388,13 @@ func (m *tokenManager) startFlightLocked(ctx context.Context) *issuance {
 			m.mu.Lock()
 			m.finishLocked(fl)
 			failedAt := m.now()
+			// Claim the outstanding report while still holding the lock, i.e.
+			// BEFORE the waiters are released below. A shutdown triggered the
+			// instant a caller returns must be able to see that this escalation
+			// is still owed, or it could certify the run clean without it.
+			if fl.err != nil {
+				m.retainFailureReportLocked()
+			}
 			m.mu.Unlock()
 			close(fl.done)
 			// Escalate AFTER the waiters are released and the lock is dropped:

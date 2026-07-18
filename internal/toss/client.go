@@ -161,6 +161,25 @@ func (c *Client) SetTokenRefreshFailureHook(fn func(occurredAt time.Time)) {
 	c.tokens.setRefreshFailureHook(fn)
 }
 
+// WaitForRefreshFailureReports blocks until every observed token-refresh failure
+// has finished being reported through the hook, or ctx expires.
+//
+// A graceful shutdown MUST call this before certifying the run clean. Token
+// issuance runs on flights detached from any supervisor, so a shutdown can
+// otherwise race a refresh failure whose escalation has not been reported yet;
+// if that report then fails (for instance because the store has just closed),
+// the non-reconstructable failure survives only as an in-memory latch in a
+// process that is exiting, and the next boot trusts the clean marker and comes
+// up unhalted. Waiting here makes the outcome deterministic: the report either
+// persists (counted) or fails into the kill switch's latch (which refuses the
+// clean sentinel).
+//
+// It returns ctx.Err() if reports are still outstanding when ctx expires; the
+// caller should treat that as "not cleanly drained" rather than as success.
+func (c *Client) WaitForRefreshFailureReports(ctx context.Context) error {
+	return c.tokens.waitForFailureReports(ctx)
+}
+
 // Format, String and GoString use VALUE receivers on purpose: with pointer
 // receivers only *Client satisfies fmt.Stringer, so formatting a Client value
 // (logging `*client`, or embedding Client in a struct printed with %+v) would

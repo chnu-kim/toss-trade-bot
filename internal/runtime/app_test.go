@@ -383,3 +383,101 @@ func (s *flipFailingSentinel) SetLifecycle(ctx context.Context, ls store.Lifecyc
 	}
 	return s.SentinelStore.SetLifecycle(ctx, ls)
 }
+
+// TestApp_RunWaitsForTokenReportsBeforeCertifyingClean is the process-level half
+// of the quiesce contract. Token flights are detached from the supervisor, so
+// draining sup.Wait is NOT enough: an outstanding non-reconstructable
+// token-failure report must be settled before the run may call itself clean.
+func TestApp_RunWaitsForTokenReportsBeforeCertifyingClean(t *testing.T) {
+	cfg := testConfig(t)
+	app, err := Assemble(context.Background(), cfg, discardLogger())
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+
+	rec := &recorder{}
+	app.quiesce = func(ctx context.Context) error {
+		rec.add("quiesce")
+		return nil
+	}
+	app.sentinel = &recordingSentinel{SentinelStore: app.db, rec: rec}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- app.Run(ctx) }()
+	waitFor(t, 3*time.Second, func() bool {
+		lc, err := readLifecycle(t, cfg.StorePath)
+		return err == nil && lc == store.LifecycleRunning
+	})
+	if err := app.Guard().ClearHalt(context.Background()); err != nil {
+		t.Fatalf("ClearHalt: %v", err)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return")
+	}
+
+	q, clean := rec.indexOf("quiesce"), rec.indexOf("set-lifecycle-clean")
+	if q == -1 || clean == -1 {
+		t.Fatalf("missing shutdown steps: %v", rec.snapshot())
+	}
+	if q > clean {
+		t.Fatalf("token reports must settle before the clean sentinel; got %v", rec.snapshot())
+	}
+}
+
+// TestApp_RunRefusesCleanWhenTokenReportsDoNotSettle: if an escalation is still
+// outstanding when the budget expires, the run cannot prove the failure was
+// counted, so it must leave the sentinel unclean — the next boot then comes up
+// conservatively halted instead of silently losing the evidence.
+func TestApp_RunRefusesCleanWhenTokenReportsDoNotSettle(t *testing.T) {
+	cfg := testConfig(t)
+	app, err := Assemble(context.Background(), cfg, discardLogger())
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	app.quiesce = func(ctx context.Context) error {
+		return context.DeadlineExceeded
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- app.Run(ctx) }()
+	waitFor(t, 3*time.Second, func() bool {
+		lc, err := readLifecycle(t, cfg.StorePath)
+		return err == nil && lc == store.LifecycleRunning
+	})
+	// Clear the boot halt so the ONLY remaining reason to refuse a clean is the
+	// unsettled token report.
+	if err := app.Guard().ClearHalt(context.Background()); err != nil {
+		t.Fatalf("ClearHalt: %v", err)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return")
+	}
+
+	lc, err := readLifecycle(t, cfg.StorePath)
+	if err != nil {
+		t.Fatalf("read sentinel: %v", err)
+	}
+	if lc != store.LifecycleRunning {
+		t.Fatalf("sentinel = %q, want running (an unsettled token report must refuse the clean)", lc)
+	}
+}
+
+// recordingSentinel notes lifecycle writes so a test can order them against the
+// rest of the shutdown sequence.
+type recordingSentinel struct {
+	SentinelStore
+	rec *recorder
+}
+
+func (s *recordingSentinel) SetLifecycle(ctx context.Context, ls store.LifecycleState) error {
+	s.rec.add("set-lifecycle-" + string(ls))
+	return s.SentinelStore.SetLifecycle(ctx, ls)
+}
