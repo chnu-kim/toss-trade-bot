@@ -135,18 +135,36 @@ var sacredRequiredPaths = []string{
 	// directory rule alone, following the internal/gate precedent: ownership
 	// resolves last-match-wins, so a later, narrower ownerless entry can strip
 	// exactly one file while the directory rule still looks protective.
-	// TestSacredRequiredPaths_CoversEveryEnforcementSourceFile keeps this list
+	// TestSacredRequiredPaths_CoversEveryEnforcementGoFile keeps this list
 	// complete as the package grows.
+	//
+	// _test.go files are included here, unlike internal/gate. There the gate
+	// logic sits in non-test files and the tests merely verify it; here the
+	// enforcement IS the tests — TestADRProtectsCompleteness_RealRepo,
+	// TestSacredADRRegistry_* and TestSacredRequiredPaths_* are the only things
+	// standing between this repo and silent de-wiring, and nothing else
+	// re-checks them. Omitting them would leave the completeness suite
+	// strippable by a later ownerless entry while CheckCodeowners still passed,
+	// since an unlisted path is never evaluated (codex adversarial-review
+	// [high] on PR #74).
 	"internal/enforcement/adrprotects.go",
+	"internal/enforcement/adrprotects_test.go",
 	"internal/enforcement/branchprotection.go",
+	"internal/enforcement/branchprotection_test.go",
 	"internal/enforcement/codeowners.go",
 	"internal/enforcement/codeowners_pattern.go",
+	"internal/enforcement/codeowners_pattern_test.go",
+	"internal/enforcement/codeowners_test.go",
 	"internal/enforcement/doc.go",
 	"internal/enforcement/github_client.go",
 	"internal/enforcement/identity.go",
+	"internal/enforcement/identity_test.go",
 	"internal/enforcement/presence.go",
+	"internal/enforcement/presence_test.go",
+	"internal/enforcement/protectedbranch_test.go",
 	"internal/enforcement/pullrequest.go",
 	"internal/enforcement/repocontent.go",
+	"internal/enforcement/repocontent_test.go",
 	"internal/enforcement/result.go",
 	"internal/enforcement/workflowrevision.go",
 }

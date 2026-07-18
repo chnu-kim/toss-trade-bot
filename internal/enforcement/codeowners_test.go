@@ -448,17 +448,27 @@ func TestCheckCodeowners_NarrowerCarveOutOnOneGateFileNotCaught(t *testing.T) {
 	}
 }
 
-// TestSacredRequiredPaths_CoversEveryEnforcementSourceFile keeps the checker's
-// own self-registration from drifting, the same way sacredADRRegistry keeps the
-// ADR roster from drifting: a .go file added to this package later must be
+// TestSacredRequiredPaths_CoversEveryEnforcementGoFile keeps the checker's own
+// self-registration from drifting, the same way sacredADRRegistry keeps the ADR
+// roster from drifting: a .go file added to this package later must be
 // registered too, or it becomes an unprotected hole in the checker.
 //
+// _test.go files are included deliberately, unlike the internal/gate precedent.
+// In internal/gate the gate logic lives in non-test files and the tests merely
+// verify it; in THIS package the enforcement IS the tests —
+// TestADRProtectsCompleteness_RealRepo, TestSacredADRRegistry_* and this test
+// are the only things standing between the repo and silent de-wiring. Leaving
+// them out would let a later ownerless entry for, say,
+// /internal/enforcement/adrprotects_test.go make the whole completeness suite
+// editable with no code-owner review while CheckCodeowners still passed,
+// because that path would never be evaluated (codex adversarial-review [high]
+// on PR #74).
+//
 // Files are registered INDIVIDUALLY rather than relying on the
-// /internal/enforcement/ directory rule alone, following the internal/gate
-// precedent: GitHub resolves ownership by last-match-wins, so a later, narrower
-// ownerless entry can strip exactly one file while the directory rule still
-// looks protective.
-func TestSacredRequiredPaths_CoversEveryEnforcementSourceFile(t *testing.T) {
+// /internal/enforcement/ directory rule alone: GitHub resolves ownership by
+// last-match-wins, so a later, narrower ownerless entry can strip exactly one
+// file while the directory rule still looks protective.
+func TestSacredRequiredPaths_CoversEveryEnforcementGoFile(t *testing.T) {
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatalf("read package dir: %v", err)
@@ -471,17 +481,17 @@ func TestSacredRequiredPaths_CoversEveryEnforcementSourceFile(t *testing.T) {
 	var found int
 	for _, e := range entries {
 		name := e.Name()
-		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+		if e.IsDir() || !strings.HasSuffix(name, ".go") {
 			continue
 		}
 		found++
 		path := "internal/enforcement/" + name
 		if !registered[path] {
-			t.Errorf("%s가 sacredRequiredPaths에 미등재 — 검사기 자신의 파일이 무보호면 presence-check 전체가 공동화된다. 같은 PR에서 .github/CODEOWNERS와 함께 등재하라", path)
+			t.Errorf("%s가 sacredRequiredPaths에 미등재 — 검사기 자신의 파일이 무보호면 presence-check 전체가 공동화된다(이 패키지는 테스트가 곧 강제 로직이다). 같은 PR에서 등재하라", path)
 		}
 	}
 	if found == 0 {
-		t.Fatal("enforcement 소스 파일을 하나도 찾지 못함 — 경로 해석 오류로 보임")
+		t.Fatal("enforcement .go 파일을 하나도 찾지 못함 — 경로 해석 오류로 보임")
 	}
 }
 
