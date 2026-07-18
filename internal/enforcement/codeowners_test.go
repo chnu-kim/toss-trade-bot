@@ -25,6 +25,7 @@ const validCodeowners = `# enforcement-integrity sacred invariant (ADR-0009) 의
 /docs/adr/0014-*.md @chnu-kim
 /docs/adr/0015-*.md @chnu-kim
 /docs/runbooks/phase-b-entry.md @chnu-kim
+/scripts/ @chnu-kim
 
 /.github/workflows/verdict-gate.yml @chnu-kim
 /internal/gate/ @chnu-kim
@@ -95,6 +96,7 @@ func TestCheckCodeowners_Missing0012FailsClosed(t *testing.T) {
 /docs/adr/0014-*.md @chnu-kim
 /docs/adr/0015-*.md @chnu-kim
 /docs/runbooks/phase-b-entry.md @chnu-kim
+/scripts/ @chnu-kim
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
@@ -124,6 +126,7 @@ func TestCheckCodeowners_Missing0013FailsClosed(t *testing.T) {
 /docs/adr/0014-*.md @chnu-kim
 /docs/adr/0015-*.md @chnu-kim
 /docs/runbooks/phase-b-entry.md @chnu-kim
+/scripts/ @chnu-kim
 /.github/workflows/verdict-gate.yml @chnu-kim
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
@@ -153,6 +156,7 @@ func TestCheckCodeowners_Missing0014FailsClosed(t *testing.T) {
 /docs/adr/0013-*.md @chnu-kim
 /docs/adr/0015-*.md @chnu-kim
 /docs/runbooks/phase-b-entry.md @chnu-kim
+/scripts/ @chnu-kim
 /.github/workflows/verdict-gate.yml @chnu-kim
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
@@ -183,6 +187,7 @@ func TestCheckCodeowners_Missing0015FailsClosed(t *testing.T) {
 /docs/adr/0013-*.md @chnu-kim
 /docs/adr/0014-*.md @chnu-kim
 /docs/runbooks/phase-b-entry.md @chnu-kim
+/scripts/ @chnu-kim
 /.github/workflows/verdict-gate.yml @chnu-kim
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
@@ -225,6 +230,38 @@ func TestCheckCodeowners_MissingPhaseBRunbookFailsClosed(t *testing.T) {
 	got := CheckCodeowners(content)
 	if got.Satisfied {
 		t.Fatal("missing sacred path (phase-b-entry runbook) must not satisfy the check")
+	}
+}
+
+func TestCheckCodeowners_MissingNarrowingScriptFailsClosed(t *testing.T) {
+	// scripts/verify-credential-narrowing.sh is the capability-measurement path
+	// that decides hard precondition ② ("credential narrowing complete"). If a
+	// loop-controlled change can weaken it without a code-owner gate, the loop
+	// manufactures its own green for the very check meant to prove it no longer
+	// holds admin/approve capability — a false-green on the linchpin of Phase
+	// A/B entry ordering (codex adversarial finding on PR #73).
+	// Otherwise-VALID sample with only the /scripts/ rule removed.
+	content := `/.github/workflows/ @chnu-kim
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+/docs/adr/0011-*.md @chnu-kim
+/docs/adr/0012-*.md @chnu-kim
+/docs/adr/0013-*.md @chnu-kim
+/docs/adr/0014-*.md @chnu-kim
+/docs/adr/0015-*.md @chnu-kim
+/docs/runbooks/phase-b-entry.md @chnu-kim
+/.github/workflows/verdict-gate.yml @chnu-kim
+/internal/gate/ @chnu-kim
+/cmd/verdict-gate/ @chnu-kim
+/configs/gate/ @chnu-kim
+/.github/CODEOWNERS @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if got.Satisfied {
+		t.Fatal("missing sacred path (verify-credential-narrowing.sh) must not satisfy the check")
 	}
 }
 
@@ -293,6 +330,7 @@ func TestCheckCodeowners_CommentsAndBlankLinesIgnored(t *testing.T) {
 /docs/adr/0014-*.md @chnu-kim
 /docs/adr/0015-*.md @chnu-kim
 /docs/runbooks/phase-b-entry.md @chnu-kim
+/scripts/ @chnu-kim
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
@@ -386,6 +424,7 @@ func TestCheckCodeowners_LaterEntryWithSameOwnerStillSatisfies(t *testing.T) {
 /docs/adr/0014-*.md @chnu-kim
 /docs/adr/0015-*.md @chnu-kim
 /docs/runbooks/phase-b-entry.md @chnu-kim
+/scripts/ @chnu-kim
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
@@ -422,6 +461,7 @@ func TestCheckCodeowners_MissingGateLogicPackage(t *testing.T) {
 /docs/adr/0014-*.md @chnu-kim
 /docs/adr/0015-*.md @chnu-kim
 /docs/runbooks/phase-b-entry.md @chnu-kim
+/scripts/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
@@ -446,6 +486,7 @@ func TestCheckCodeowners_GateArtifactOwnerStripped(t *testing.T) {
 /docs/adr/0014-*.md @chnu-kim
 /docs/adr/0015-*.md @chnu-kim
 /docs/runbooks/phase-b-entry.md @chnu-kim
+/scripts/ @chnu-kim
 /internal/gate/
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
@@ -478,6 +519,7 @@ func TestCheckCodeowners_NarrowerCarveOutOnOneGateFileNotCaught(t *testing.T) {
 /docs/adr/0014-*.md @chnu-kim
 /docs/adr/0015-*.md @chnu-kim
 /docs/runbooks/phase-b-entry.md @chnu-kim
+/scripts/ @chnu-kim
 /internal/gate/ @chnu-kim
 /internal/gate/sanity.go
 /cmd/verdict-gate/ @chnu-kim
@@ -511,6 +553,7 @@ func TestCheckCodeowners_PRCreationWorkflowCarveOutCaught(t *testing.T) {
 /docs/adr/0014-*.md @chnu-kim
 /docs/adr/0015-*.md @chnu-kim
 /docs/runbooks/phase-b-entry.md @chnu-kim
+/scripts/ @chnu-kim
 /.github/workflows/pr-creation.yml
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
@@ -538,6 +581,7 @@ docs/adr/0013-*.md @chnu-kim
 docs/adr/0014-*.md @chnu-kim
 docs/adr/0015-*.md @chnu-kim
 docs/runbooks/phase-b-entry.md @chnu-kim
+scripts/** @chnu-kim
 internal/gate/** @chnu-kim
 cmd/verdict-gate/** @chnu-kim
 configs/gate/** @chnu-kim

@@ -49,6 +49,14 @@
 # 보호된 ADR을 우회해 활성화 경로를 조용히 약화할 수 있다("main에 있음 ≠ 보호됨", ADR-0011 point 4(b)).
 /docs/runbooks/phase-b-entry.md @chnu-kim
 
+# 활성화 증명·변환 스크립트 — hard precondition의 *증거*를 만들어내는 load-bearing 코드.
+# verify-credential-narrowing.sh는 ②(narrowing) 완료 판정의 capability 실측 경로이고, 향후
+# 추가될 flip payload 생성기는 count=0 전환의 파괴적 PUT을 만든다. 이들이 무보호면 loop가
+# 검증 스크립트를 약화시켜 narrowing을 false-green으로 통과시키거나(증거 위조), payload
+# 생성기를 고쳐 app_id 핀·code-owner 설정을 조용히 떨굴 수 있다. 디렉터리 규칙으로 두어
+# 이후 추가되는 활성화 스크립트도 자동 보호한다(ADR-0015 point 9 (g)).
+/scripts/ @chnu-kim
+
 # ADR-0008 verdict 게이트 workflow(이슈 #48) — 특권 verdict-생성 잡의 트리거·
 # 인젝션 하드닝·적격 가드·머지 스텝 정의. /.github/workflows/ 디렉터리 규칙에
 # 이미 포함되지만, sacredRequiredPaths의 대표 파일로 명시 등재한다.

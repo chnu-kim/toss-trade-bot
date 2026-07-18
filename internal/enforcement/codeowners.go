@@ -78,6 +78,13 @@ var sacredRequiredPaths = []string{
 	// loop PR could reorder provisioning ahead of narrowing or drop rollback
 	// without tripping the code-owner gate that protects ADR-0015 itself.
 	"docs/runbooks/phase-b-entry.md",
+	// The credential-narrowing verifier is the capability-measurement path that
+	// decides hard precondition ② ("narrowing complete"). If a loop-controlled
+	// change can weaken it, the loop manufactures its own green for the check
+	// that is supposed to prove it no longer holds admin/approve capability —
+	// a false-green on the linchpin of the whole Phase A/B entry order. Same
+	// twin-artifact rule as the runbook (codex adversarial finding on PR #73).
+	"scripts/verify-credential-narrowing.sh",
 	// Every non-test .go source file in internal/gate, individually — not
 	// just one representative file (codex:review [P2] finding on #48's PR:
 	// the privileged workflow compiles and executes the whole package via

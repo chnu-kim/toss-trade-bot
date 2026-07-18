@@ -92,6 +92,15 @@ Phase B까지 durable하게 잔존한다.
 
 ## 최종 flip: flip-and-verify-or-rollback 트랜잭션 (ADR-0015 point 7)
 
+> 🚧 **선행 게이트 (fail-closed) — 현재 flip은 차단 상태다.** 아래 payload 변환은 **보호·검토된
+> 스크립트**(스냅샷 → PUT payload 생성기, `scripts/` 하위 → CODEOWNERS·`sacredRequiredPaths` 보호)로만
+> 수행한다. **그 스크립트가 아직 없으므로 Phase B flip은 수행할 수 없다** — 오퍼레이터가 파괴적
+> full-replace payload를 손으로 조립하는 것은 **금지**다(app_id 핀·`require_code_owner_reviews`를
+> 조용히 떨어뜨리는 경로 — codex #73 R7/R8). 착수 조건: ① 생성기 스크립트 + 변환 테스트(핀 보존·
+> 필드 보존·핀 강등 시 non-zero exit)를 작성해 **sacred 등재된 상태로 머지**하고, ② 아래 절차를 그
+> 스크립트 호출로 재작성한 뒤에야 flip을 진행한다. 그 전까지 이 절의 나머지는 **설계 명세**이지
+> 실행 지시가 아니다.
+
 `PUT`은 **전체 replace**다(patch 아님) — 빠진 필드는 default/null로 리셋.
 
 1. **스냅샷**: `GET .../branches/main/protection`으로 현재 protection **전체** 저장.
