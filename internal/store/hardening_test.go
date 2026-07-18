@@ -402,3 +402,48 @@ func TestOpenRejectsUnsafePath(t *testing.T) {
 		}
 	}
 }
+
+// TestSetLifecycleFailsWhenSingletonRowMissing is the sentinel twin of the L-1
+// halt guard. The clean-shutdown sentinel is the other fail-closed singleton in
+// this schema, and it was the one writer still returning a false durable-ack:
+// with the id=1 row absent the UPDATE matches zero rows and used to report
+// success. That is worse than a lost write, because #36's shutdown judgment
+// reports "clean sentinel written" — and the next boot then trusts durable state
+// on the strength of a marker that does not exist (ADR-0012 sentinel fail-open
+// #1 re-entering through a corrupted store).
+func TestSetLifecycleFailsWhenSingletonRowMissing(t *testing.T) {
+	db := openTemp(t)
+	ctx := context.Background()
+
+	// Simulate a botched migration rebuild / backup restore / manual tampering.
+	if _, err := db.writeDB.ExecContext(ctx, "DELETE FROM lifecycle WHERE id = 1"); err != nil {
+		t.Fatalf("delete lifecycle singleton: %v", err)
+	}
+
+	if err := db.SetLifecycle(ctx, LifecycleClean); !errors.Is(err, ErrLifecycleRowMissing) {
+		t.Fatalf("SetLifecycle(clean) with missing singleton err = %v, want ErrLifecycleRowMissing (no false durable-ack)", err)
+	}
+	if err := db.SetLifecycle(ctx, LifecycleRunning); !errors.Is(err, ErrLifecycleRowMissing) {
+		t.Fatalf("SetLifecycle(running) with missing singleton err = %v, want ErrLifecycleRowMissing", err)
+	}
+}
+
+// TestLifecycleAckImpliesRecorded is the happy-path side of the same invariant:
+// a nil return must mean the value is durably readable back.
+func TestLifecycleAckImpliesRecorded(t *testing.T) {
+	db := openTemp(t)
+	ctx := context.Background()
+
+	for _, want := range []LifecycleState{LifecycleClean, LifecycleRunning} {
+		if err := db.SetLifecycle(ctx, want); err != nil {
+			t.Fatalf("SetLifecycle(%s): %v", want, err)
+		}
+		got, err := db.Lifecycle(ctx)
+		if err != nil {
+			t.Fatalf("Lifecycle: %v", err)
+		}
+		if got != want {
+			t.Fatalf("Lifecycle = %q after an acked write of %q", got, want)
+		}
+	}
+}

@@ -85,6 +85,20 @@ type tokenManager struct {
 	now           func() time.Time
 	issue         issueFunc
 	logger        *slog.Logger
+
+	// onRefreshFailure escalates a failed issuance attempt to the kill switch
+	// (ADR-0004 point 7). It fires once per FLIGHT, not per waiter: issuance is
+	// single-flight, so one failure shared by N waiters is one refresh failure.
+	onRefreshFailure func(occurredAt time.Time)
+
+	// pendingFailureReports counts refresh-failure escalations that have been
+	// observed but not yet finished reporting. It is incremented while m.mu is
+	// held, at the moment the failure is recorded — BEFORE the flight's waiters
+	// are released — so a shutdown that begins the instant a caller returns still
+	// observes the outstanding report. reportsIdle is closed whenever the count
+	// falls to zero, so waiters do not have to poll.
+	pendingFailureReports int
+	reportsIdle           chan struct{}
 }
 
 func newTokenManager(issue issueFunc) *tokenManager {
@@ -107,6 +121,116 @@ func (m *tokenManager) setLogger(l *slog.Logger) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.logger = l
+}
+
+// setRefreshFailureHook registers the escalation seam described on
+// Client.SetTokenRefreshFailureHook. Safe to call concurrently, though it is
+// meant for boot-time wiring.
+func (m *tokenManager) setRefreshFailureHook(fn func(occurredAt time.Time)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onRefreshFailure = fn
+}
+
+// notifyRefreshFailure invokes the escalation hook for one failed issuance.
+//
+// Two properties are deliberate and load-bearing:
+//
+//   - It runs OUTSIDE m.mu and after the flight's waiters have been released.
+//     The production hook performs a durable store write; holding the manager
+//     lock across an fsync would stall every token caller, and running it before
+//     the waiters are released would put that fsync on the critical path of
+//     every request waiting for a token.
+//   - It has its own recover boundary. The hook calls out into the kill switch,
+//     and an unattended process must not die because an escalation callback
+//     panicked (the panic would otherwise escape the flight goroutine, which has
+//     already used up its own recover).
+//
+// The outstanding-report count is released here (and ONLY here), including when
+// the hook panics — otherwise one panicking escalation would wedge every future
+// shutdown behind a report that can never complete.
+func (m *tokenManager) notifyRefreshFailure(at time.Time) {
+	defer m.releaseFailureReport()
+
+	m.mu.Lock()
+	hook := m.onRefreshFailure
+	logger := m.logger
+	m.mu.Unlock()
+	if hook == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("toss: token refresh failure hook panicked", "panic", r)
+		}
+	}()
+	hook(at)
+}
+
+// retainFailureReportLocked marks one refresh-failure escalation as outstanding.
+// Caller holds m.mu.
+func (m *tokenManager) retainFailureReportLocked() {
+	if m.pendingFailureReports == 0 {
+		m.reportsIdle = make(chan struct{})
+	}
+	m.pendingFailureReports++
+}
+
+// releaseFailureReport marks one outstanding escalation as finished — whether it
+// persisted, failed into the kill switch's latch, or panicked. "Finished" is the
+// property shutdown needs: a failed report has already latched an in-memory halt,
+// which is what makes the clean sentinel refuse.
+func (m *tokenManager) releaseFailureReport() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pendingFailureReports--
+	if m.pendingFailureReports == 0 && m.reportsIdle != nil {
+		close(m.reportsIdle)
+		m.reportsIdle = nil
+	}
+}
+
+// waitForRefreshQuiescence blocks until token refresh is quiescent — no
+// issuance flight running AND no failure report owed — or ctx expires.
+//
+// A graceful shutdown must call this BEFORE deciding the clean-shutdown
+// sentinel. Token flights are detached from any supervisor, so without it a run
+// could certify itself clean while a non-reconstructable token failure was still
+// being reported — and if that report then failed (say, because the store had
+// just closed), the failure would survive only as an in-memory latch in an
+// exiting process, leaving the next boot to trust a clean marker and come up
+// unhalted. A crash is SAFER than that, since it leaves the sentinel unclean.
+//
+// BOTH conditions are required. Waiting only on owed reports would return
+// immediately for a refresh that is still in flight and has not failed YET; that
+// flight could then fail after the clean sentinel was written and the store
+// closed, which is the very outcome this wait exists to prevent.
+//
+// The two conditions can never both read idle while a failure is owed: the
+// flight clears m.inflight and claims its report inside the SAME critical
+// section, and it claims the report before closing fl.done. So a waiter woken by
+// fl.done always observes the claim.
+func (m *tokenManager) waitForRefreshQuiescence(ctx context.Context) error {
+	for {
+		m.mu.Lock()
+		if m.pendingFailureReports == 0 && m.inflight == nil {
+			m.mu.Unlock()
+			return nil
+		}
+		// Wake on whichever is outstanding. A running flight is waited on first
+		// because its completion is what may CREATE an owed report.
+		wake := m.reportsIdle
+		if m.inflight != nil {
+			wake = m.inflight.done
+		}
+		m.mu.Unlock()
+
+		select {
+		case <-wake:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // get returns a valid token. It has three regimes, by cache state:
@@ -278,8 +402,21 @@ func (m *tokenManager) startFlightLocked(ctx context.Context) *issuance {
 			}
 			m.mu.Lock()
 			m.finishLocked(fl)
+			failedAt := m.now()
+			// Claim the outstanding report while still holding the lock, i.e.
+			// BEFORE the waiters are released below. A shutdown triggered the
+			// instant a caller returns must be able to see that this escalation
+			// is still owed, or it could certify the run clean without it.
+			if fl.err != nil {
+				m.retainFailureReportLocked()
+			}
 			m.mu.Unlock()
 			close(fl.done)
+			// Escalate AFTER the waiters are released and the lock is dropped:
+			// the hook does durable I/O and must not sit on the token path.
+			if fl.err != nil {
+				m.notifyRefreshFailure(failedAt)
+			}
 		}()
 		fl.token, fl.ttl, fl.err = m.issue(ictx)
 		switch {

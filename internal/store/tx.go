@@ -19,6 +19,18 @@ import (
 // anomaly.
 var ErrHaltRowMissing = errors.New("store: halt singleton row (id=1) missing")
 
+// ErrLifecycleRowMissing is the clean-shutdown sentinel's twin of
+// ErrHaltRowMissing: SetLifecycle returns it when the lifecycle singleton row
+// (id = 1) is absent, so its UPDATE matches zero rows.
+//
+// The sentinel needs this check for the same reason the halt writers do, and the
+// consequence here is arguably worse. A false durable-ack makes a graceful
+// shutdown report "clean sentinel written" when nothing was written, so the next
+// boot decides whether to trust durable state on the strength of a marker that
+// does not exist (ADR-0012 Decision 1(c) sentinel fail-open #1, re-entering
+// through a corrupted store instead of through a crash).
+var ErrLifecycleRowMissing = errors.New("store: lifecycle singleton row (id=1) missing")
+
 // ErrResolutionConflict is returned by ResolveIntent when an already-terminally-
 // resolved intent is re-resolved with a DIFFERENT resolution than the one durably
 // recorded. Re-resolving with the SAME resolution is genuinely idempotent (nil);
@@ -360,12 +372,23 @@ func clearHalt(ctx context.Context, q querier) error {
 }
 
 // execHaltSingleton runs a halt-table UPDATE and enforces that it matched the
-// singleton row exactly once. SQLite counts every WHERE-matched row for an UPDATE
-// (a zero-change re-trip still reports 1), so RowsAffected != 1 means the id=1 row
-// is absent and the write would otherwise be a false durable-ack (ErrHaltRowMissing,
-// L-1). This closes the halt-write side of the fail-open the same way readHalt
-// already fails closed on a missing row on the read side.
+// singleton row exactly once (ErrHaltRowMissing, L-1).
 func execHaltSingleton(ctx context.Context, q querier, what, query string, args ...any) error {
+	return execSingleton(ctx, q, what, ErrHaltRowMissing, query, args...)
+}
+
+// execSingleton runs a single-row-table UPDATE and enforces that it matched that
+// row exactly once. SQLite counts every WHERE-matched row for an UPDATE (a
+// zero-change rewrite still reports 1), so RowsAffected != 1 means the id=1 row
+// is absent and the write would otherwise be a false durable-ack. This closes the
+// write side of the fail-open the same way the readers already fail closed on a
+// missing row.
+//
+// Both fail-closed singletons in this schema — the global halt and the
+// clean-shutdown sentinel — share this guard, so a future single-row table
+// cannot quietly skip it (the halt writers had it, the sentinel did not, and
+// that asymmetry was itself the defect).
+func execSingleton(ctx context.Context, q querier, what string, missing error, query string, args ...any) error {
 	res, err := q.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("store: %s: %w", what, err)
@@ -375,7 +398,7 @@ func execHaltSingleton(ctx context.Context, q querier, what, query string, args 
 		return fmt.Errorf("store: %s: %w", what, err)
 	}
 	if n != 1 {
-		return fmt.Errorf("store: %s: %w (rows affected = %d)", what, ErrHaltRowMissing, n)
+		return fmt.Errorf("store: %s: %w (rows affected = %d)", what, missing, n)
 	}
 	return nil
 }
@@ -403,12 +426,9 @@ func readHalt(ctx context.Context, q querier) (HaltState, error) {
 // An unknown value is rejected by the table CHECK, which surfaces as an error —
 // store returns truth or error, never a silently-coerced state.
 func setLifecycle(ctx context.Context, q querier, s LifecycleState) error {
-	if _, err := q.ExecContext(ctx,
+	return execSingleton(ctx, q, fmt.Sprintf("set lifecycle %q", s), ErrLifecycleRowMissing,
 		`UPDATE lifecycle SET state = ? WHERE id = 1`, string(s),
-	); err != nil {
-		return fmt.Errorf("store: set lifecycle %q: %w", s, err)
-	}
-	return nil
+	)
 }
 
 func readLifecycle(ctx context.Context, q querier) (LifecycleState, error) {
