@@ -7,6 +7,10 @@
 .env
 .env.*
 !configs/env.example
+# 로컬 Claude 설정(권한 allowlist·활성 플러그인) — 머신-로컬. 머신-로컬 전역 ignore에만
+# 의존하면 전역 ignore 없는 머신·CI·협업자 환경에서 그대로 커밋된다("언제든 public
+# 전환 가능" 정책 위반) → 보호를 레포 규칙으로 이전한다.
+**/.claude/settings.local.json
 
 # Dependencies
 /vendor/
