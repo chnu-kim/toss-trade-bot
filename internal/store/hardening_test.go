@@ -69,6 +69,53 @@ func TestOpenTightensGroupOtherReadableFile(t *testing.T) {
 	}
 }
 
+// TestSecureDBFileTightensSidecars is the M-2 upgrade-path guard for the WAL/SHM
+// sidecars: SQLite only sets a sidecar's mode when it CREATES it, so a
+// pre-hardening database whose -wal/-shm an older binary left at 0644 (holding
+// uncheckpointed journal pages — the same sensitive data as the .db) would keep
+// leaking after upgrade if only the main file were tightened. secureDBFile must
+// repair pre-existing sidecars in place — and must NOT create absent ones (an
+// empty -wal/-shm invented here could corrupt SQLite's WAL recovery). Tested
+// directly (rather than via Open) because SQLite discards and recreates empty
+// sidecars on open, which would mask whether the repair actually fired.
+func TestSecureDBFileTightensSidecars(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "store.db")
+
+	// A pre-hardening WAL database left behind group/other-readable: the main file
+	// AND its sidecars all at 0644.
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if err := os.WriteFile(path+suffix, nil, 0o644); err != nil {
+			t.Fatalf("seed %s: %v", path+suffix, err)
+		}
+	}
+
+	if err := secureDBFile(path); err != nil {
+		t.Fatalf("secureDBFile: %v", err)
+	}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		info, err := os.Stat(path + suffix)
+		if err != nil {
+			t.Fatalf("stat %s: %v", path+suffix, err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Errorf("%s mode = %#o, want 0o600 (M-2 sidecar tighten)", path+suffix, perm)
+		}
+	}
+
+	// On a fresh database the sidecars are absent; secureDBFile must only repair,
+	// never create them (SQLite creates the real sidecars itself, 0o600-inherited).
+	fresh := filepath.Join(t.TempDir(), "store.db")
+	if err := secureDBFile(fresh); err != nil {
+		t.Fatalf("secureDBFile fresh: %v", err)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(fresh + suffix); !os.IsNotExist(err) {
+			t.Errorf("secureDBFile created sidecar %s (err=%v); it must repair, not create", fresh+suffix, err)
+		}
+	}
+}
+
 // TestHaltWritersFailWhenSingletonRowMissing is the L-1 guard: if the halt
 // singleton (id=1) is absent, the UPDATE matches zero rows. The write must fail
 // closed (ErrHaltRowMissing) rather than return a false durable-ack — otherwise

@@ -161,14 +161,22 @@ func validateDBPath(path string) error {
 }
 
 // secureDBFile ensures the main database file exists with owner-only permissions
-// (0o600) BEFORE SQLite opens it, so neither the .db nor its WAL/SHM sidecars
-// (which inherit the main file's mode) are readable by other accounts on a shared
-// host — the DB holds order intents, client_order_ids, and halt reasons, i.e. the
-// account's whole trading activity (M-2). A freshly created file is made 0o600
-// (0o600 has no group/other bits, so any umask only tightens it further); an
-// existing file that is group/other-accessible is tightened in place — a fail-safe
-// repair so an unattended upgrade from a pre-hardening 0o644 database keeps booting
-// instead of refusing to start — and if it cannot be tightened Open fails closed
+// (0o600) BEFORE SQLite opens it, so neither the .db nor its WAL/SHM sidecars are
+// readable by other accounts on a shared host — the DB (and its uncheckpointed
+// journal pages in the -wal) holds order intents, client_order_ids, and halt
+// reasons, i.e. the account's whole trading activity (M-2). A freshly created file
+// is made 0o600 (0o600 has no group/other bits, so any umask only tightens it
+// further).
+//
+// It then tightens the main file AND any pre-existing -wal/-shm sidecars that are
+// group/other-accessible. SQLite only sets a sidecar's mode when it CREATES it
+// (inheriting the main file's mode), so sidecars an older pre-hardening binary left
+// at 0o644 (e.g. a crash-left WAL) would otherwise stay world-readable after an
+// upgrade even though the main file is now 0o600. The sidecars are never created
+// here — an empty -wal/-shm invented before open would corrupt SQLite's WAL
+// recovery — so an absent sidecar is skipped (SQLite creates the real one
+// 0o600-inherited). This is a fail-safe repair (an unattended upgrade keeps booting
+// rather than refusing to start); if a file cannot be tightened Open fails closed
 // rather than proceeding with world-readable trading data.
 func secureDBFile(path string) error {
 	f, err := os.OpenFile(path, os.O_CREATE, 0o600)
@@ -178,13 +186,18 @@ func secureDBFile(path string) error {
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("store: pre-create %s: %w", path, err)
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return fmt.Errorf("store: stat %s: %w", path, err)
-	}
-	if perm := info.Mode().Perm(); perm&0o077 != 0 {
-		if err := os.Chmod(path, 0o600); err != nil {
-			return fmt.Errorf("store: tighten permissions on %s (mode %#o is group/other-accessible): %w", path, perm, err)
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		info, err := os.Stat(p)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue // absent sidecar: SQLite will create it 0o600-inherited
+			}
+			return fmt.Errorf("store: stat %s: %w", p, err)
+		}
+		if perm := info.Mode().Perm(); perm&0o077 != 0 {
+			if err := os.Chmod(p, 0o600); err != nil {
+				return fmt.Errorf("store: tighten permissions on %s (mode %#o is group/other-accessible): %w", p, perm, err)
+			}
 		}
 	}
 	return nil
