@@ -43,6 +43,37 @@ type Intent struct {
 	ResolvedAt    *time.Time
 	Resolution    string
 	Markers       []Marker
+	// FullyAuditedAt is the prune-gate flag (ADR-0006 point 4): non-nil once every
+	// lifecycle audit record for this intent has been durably acked, nil otherwise.
+	// It is nil for any unresolved intent (the terminal record cannot yet exist),
+	// so LoadUnresolvedIntents always leaves it nil; loadIntentByID surfaces it for
+	// resolved intents. #14 reads it to gate prune; this issue sets it.
+	FullyAuditedAt *time.Time
+}
+
+// LifecycleRecord is one order-lifecycle audit record reconstructed
+// deterministically from journal state (markers + resolution) — a store-local DTO,
+// NOT an audit event. store is a leaf and never imports audit (ADR-0005 point 2,
+// ADR-0006 point 2): a consumer (the future reconciler) maps a LifecycleRecord to
+// an audit.OrderLifecycleEvent, re-emits it, and on the durable ack records it back
+// via RecordAuditAck(IntentID, Key). Fields:
+//
+//   - Key is the opaque store-local ack identity; round-trip it unchanged. It is
+//     NOT the audit idempotency key (that is synthesized inside audit).
+//   - Marker is the marker kind ("prepared"/"submit-attempted"/"acked") for a
+//     transition record, or the terminal resolution string for the terminal record.
+//   - OrderID is empty before it is acquired and the acquired orderId at/after the
+//     acked marker (ADR-0002/0006 key reuse), so the consumer synthesizes the right
+//     audit key.
+//   - OccurredAt is the journal timestamp of the transition (or resolution).
+//   - Terminal marks the final execution-snapshot record (exists only once resolved).
+type LifecycleRecord struct {
+	IntentID   string
+	Key        string
+	Marker     string
+	OrderID    string
+	OccurredAt time.Time
+	Terminal   bool
 }
 
 // Marker is one persisted journal transition for an intent. Seq is the durable

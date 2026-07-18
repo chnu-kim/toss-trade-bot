@@ -271,8 +271,10 @@ func TestMigrationV2PreservesExistingHalt(t *testing.T) {
 	}
 	defer db.Close()
 
-	if v, err := db.schemaVersion(ctx); err != nil || v != schemaVersionV2 {
-		t.Fatalf("schema version after migrate = %d, err %v, want %d", v, err, schemaVersionV2)
+	// Open now migrates a V1-seeded DB all the way to the latest (V3); the V2 halt
+	// preservation asserted below is unaffected because V3 is additive.
+	if v, err := db.schemaVersion(ctx); err != nil || v != schemaVersionV3 {
+		t.Fatalf("schema version after migrate = %d, err %v, want %d", v, err, schemaVersionV3)
 	}
 	hs, err := db.Halt(ctx)
 	if err != nil {
