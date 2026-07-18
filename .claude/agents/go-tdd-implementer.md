@@ -140,9 +140,18 @@ fi
 > 확인을 요청한다 — 특히 sacred 경로 PR을 사람 계정으로 잘못 만들면 self-approval 교착이 재발한다.
 
 PR이 확인되면 **그 직후**(dispatch 직후가 아니라 dispatch로 PR 생성이 확인된 직후) **반드시
-`codex-pr-review` 스킬을 `--wait --base main`으로 실행**한다(글로벌 지침: codex 리뷰 + 적대적 리뷰
-병렬, 결과 verbatim 회수). Skill 툴로 `codex-pr-review` 호출, args `--wait --base main`. 자율 머지
-(Phase B, ADR-0008 verdict 게이트)가 가동된 뒤에는 이 역할을 verdict-게이트 workflow가 흡수한다.
+`codex-pr-review` 스킬을 `--wait --base origin/main`으로 실행**한다(글로벌 지침: codex 리뷰 + 적대적
+리뷰 병렬, 결과 verbatim 회수). Skill 툴로 `codex-pr-review` 호출, args `--wait --base origin/main`.
+자율 머지(Phase B, ADR-0008 verdict 게이트)가 가동된 뒤에는 이 역할을 verdict-게이트 workflow가
+흡수한다.
+
+> 🔴 **`--base main`이 아니라 `--base origin/main`이다**(운영 불변식 1). 워크트리의 로컬 `main` ref는
+> 갱신되지 않아 stale diff로 이미 머지된 남의 변경을 리뷰 대상에 포함시킨다. **이 문서에서 codex를
+> 부르는 모든 자리가 `origin/main`인지 확인**하고, 편집 시 `--base main`을 되살리지 마라 —
+> `grep -n -- "--base main" .claude/agents/go-tdd-implementer.md`가 **아무것도 반환하지 않아야**
+> 한다(단 `gh pr create --base main`은 PR의 *base 브랜치*라 별개다 — 그건 그대로 둔다).
+> *이 각주 자체가 회귀의 산물이다*: 불변식을 산문으로만 적고 흐름 끝의 실제 명령을 안 고쳤다가
+> 적대 리뷰가 잡았다(PR #81). 규칙과 그 규칙이 지배하는 **명령**은 같은 변경에서 함께 움직인다.
 
 ⚠️ **비동기 대기 금지**: companion `review`/`adversarial-review`는 `--wait` 여부와 무관하게 항상
 foreground(동기) 실행이다 — 별도 백그라운드 job이 없다. 이 호출을 Bash의 `run_in_background:true`로
