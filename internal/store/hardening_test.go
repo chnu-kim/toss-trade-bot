@@ -116,6 +116,33 @@ func TestSecureDBFileTightensSidecars(t *testing.T) {
 	}
 }
 
+// TestSecureDBFileNormalizesOwnerBits guards the invariant under a restrictive
+// umask: os.OpenFile(..., 0o600) masks off owner bits too, so under a umask like
+// 0o200/0o400 a fresh DB could be created 0o400/0o000, failing SQLite open or
+// violating the promised 0o600. secureDBFile must normalize a regular DB/sidecar
+// file to EXACTLY 0o600, not just clear group/other bits. Seeding an
+// owner-restricted file exercises the same repair branch deterministically without
+// mutating the process-global umask.
+func TestSecureDBFileNormalizesOwnerBits(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "store.db")
+	if err := os.WriteFile(path, nil, 0o400); err != nil {
+		t.Fatalf("seed 0400 file: %v", err)
+	}
+
+	if err := secureDBFile(path); err != nil {
+		t.Fatalf("secureDBFile: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("owner-restricted file mode after secureDBFile = %#o, want 0o600 (normalize owner bits)", perm)
+	}
+}
+
 // TestOpenRejectsNonRegularPathWithoutDamage guards the permission-repair path
 // against collateral damage: if the configured DB path (or a sidecar path) is
 // accidentally a directory or other non-regular entry, Open must fail closed

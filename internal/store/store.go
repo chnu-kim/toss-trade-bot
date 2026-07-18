@@ -165,19 +165,21 @@ func validateDBPath(path string) error {
 // readable by other accounts on a shared host — the DB (and its uncheckpointed
 // journal pages in the -wal) holds order intents, client_order_ids, and halt
 // reasons, i.e. the account's whole trading activity (M-2). A freshly created file
-// is made 0o600 (0o600 has no group/other bits, so any umask only tightens it
-// further).
+// is created via O_CREATE and then normalized below.
 //
-// It then tightens the main file AND any pre-existing -wal/-shm sidecars that are
-// group/other-accessible. SQLite only sets a sidecar's mode when it CREATES it
-// (inheriting the main file's mode), so sidecars an older pre-hardening binary left
-// at 0o644 (e.g. a crash-left WAL) would otherwise stay world-readable after an
-// upgrade even though the main file is now 0o600. The sidecars are never created
-// here — an empty -wal/-shm invented before open would corrupt SQLite's WAL
-// recovery — so an absent sidecar is skipped (SQLite creates the real one
-// 0o600-inherited). This is a fail-safe repair (an unattended upgrade keeps booting
-// rather than refusing to start); if a file cannot be tightened Open fails closed
-// rather than proceeding with world-readable trading data.
+// It then normalizes the main file AND any pre-existing -wal/-shm sidecars to
+// EXACTLY 0o600. Normalizing (rather than only clearing group/other bits) is
+// necessary on two fronts: a restrictive umask (e.g. 0o200/0o400) also strips OWNER
+// bits from the O_CREATE mode, so a fresh DB could be left 0o400/0o000 — failing
+// SQLite open or silently violating the 0o600 guarantee — and sidecars an older
+// pre-hardening binary left at 0o644 (e.g. a crash-left WAL) must be tightened even
+// though the main file is now 0o600 (SQLite only sets a sidecar's mode when it
+// CREATES it, inheriting the main file's mode, so a reused sidecar keeps its old
+// mode). The sidecars are never created here — an empty -wal/-shm invented before
+// open would corrupt SQLite's WAL recovery — so an absent sidecar is skipped
+// (SQLite creates the real one 0o600-inherited). This is a fail-safe repair (an
+// unattended upgrade keeps booting rather than refusing to start); if a file cannot
+// be normalized Open fails closed rather than proceeding with the wrong mode.
 func secureDBFile(path string) error {
 	f, err := os.OpenFile(path, os.O_CREATE, 0o600)
 	if err != nil {
@@ -202,9 +204,9 @@ func secureDBFile(path string) error {
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("store: %s is not a regular file (mode %s); refusing to open", p, info.Mode())
 		}
-		if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		if perm := info.Mode().Perm(); perm != 0o600 {
 			if err := os.Chmod(p, 0o600); err != nil {
-				return fmt.Errorf("store: tighten permissions on %s (mode %#o is group/other-accessible): %w", p, perm, err)
+				return fmt.Errorf("store: normalize permissions on %s (mode %#o) to 0o600: %w", p, perm, err)
 			}
 		}
 	}
