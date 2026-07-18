@@ -23,6 +23,14 @@ const RequiredOwner = "@chnu-kim"
 // by new files, not renamed, and the workflow/CODEOWNERS self-reference paths
 // are structural, not content that changes.
 //
+// This list is a hand-written mirror of an SSOT that lives elsewhere: ADR
+// frontmatter's protects: field (ADR-0010). That mirror is no longer trusted to
+// stay in sync by convention — TestADRProtectsCompleteness_RealRepo
+// (adrprotects.go) derives the requirement from the frontmatter and fails
+// closed if any ADR declaring a non-empty protects: is absent from this slice
+// or from .github/CODEOWNERS. Add a new sacred ADR to both surfaces; the test
+// will tell you precisely which one you forgot.
+//
 // The verdict-gate.yml/internal/gate/cmd/verdict-gate/configs/gate entries
 // (#48) are the ADR-0011 point 11 registration for the ADR-0008 verdict
 // gate's own judgement logic, CLI, and risk-classification mapping: all three
