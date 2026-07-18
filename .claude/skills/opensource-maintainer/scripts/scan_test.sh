@@ -109,7 +109,11 @@ rm -rf "$D"
 
 echo "== fail-closed: git 레포 아님 → exit 2 =="
 D=$(mktemp -d)
+# GIT_CEILING_DIRECTORIES로 상위 탐색을 막아, 임시 디렉토리의 조상이 우연히 git 레포여도
+# (예: 일부 CI runner의 TMPDIR 배치) 확실히 "레포 아님"으로 판정되게 한다(테스트 hermetic).
+export GIT_CEILING_DIRECTORIES="$(dirname "$D")"
 OUT=$(run_scan bash "$D"); RC=$?
+unset GIT_CEILING_DIRECTORIES
 [ "$RC" -eq 2 ] && pass "비-git 디렉토리 exit 2(fail-closed)" || fail "비-git 디렉토리 exit=$RC (2 기대)"
 rm -rf "$D"
 

@@ -59,3 +59,10 @@ jobs:
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
           "$(go env GOPATH)/bin/govulncheck" ./...
+
+      # 커밋 전 시크릿 게이트(scan.sh)의 회귀 테스트를 CI에서도 강제한다. scan_test.sh는
+      # go test가 아닌 독립 셸 테스트라 CI에 명시 배선하지 않으면 게이트가 조용히
+      # false-green으로 퇴행(정규식 오수정 등)해도 CI가 초록으로 통과할 수 있다.
+      # (bash 3.2 fail-open 케이스는 runner의 bash가 4.4+라 자동 SKIP된다.)
+      - name: Secret-gate regression (scan.sh)
+        run: bash .claude/skills/opensource-maintainer/scripts/scan_test.sh
