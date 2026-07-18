@@ -58,6 +58,12 @@ var sacredRequiredPaths = []string{
 	// as ADR-0004/0012 (a mirror-coherence break is a money-guard fail-open).
 	// Same twin-artifact rule (codex review finding on PR #63).
 	"docs/adr/0013-killswitch-mirror-concurrency.md",
+	// ADR-0014 declares protects: [live-execution-human-gate] — it governs the
+	// single reconciler's ambiguous local fail-closed / backlog global
+	// escalation / bounded LIVE re-count, completing the kill-switch truth-
+	// confirmation the sacred live-execution set (ADR-0004/0012/0013) depends
+	// on. Same twin-artifact rule.
+	"docs/adr/0014-reconciler-escalation-bounded-recount.md",
 	// Every non-test .go source file in internal/gate, individually — not
 	// just one representative file (codex:review [P2] finding on #48's PR:
 	// the privileged workflow compiles and executes the whole package via

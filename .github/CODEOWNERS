@@ -34,6 +34,10 @@
 # protects: [live-execution-human-gate] — 미러 정합성 붕괴 = money-guard fail-open이라
 # 0004/0012와 같은 sacred set이므로 code-owner 리뷰 대상(ADR-0013).
 /docs/adr/0013-*.md @chnu-kim
+# 0014: 단일 reconciler의 ambiguous 국소 fail-closed·backlog 전역 에스컬레이션·
+# bounded LIVE re-count. protects: [live-execution-human-gate] — reconciler가
+# 킬스위치 진실확정·에스컬레이션을 완성하므로 0004/0012/0013과 같은 sacred set(ADR-0014).
+/docs/adr/0014-*.md @chnu-kim
 
 # ADR-0008 verdict 게이트 workflow(이슈 #48) — 특권 verdict-생성 잡의 트리거·
 # 인젝션 하드닝·적격 가드·머지 스텝 정의. /.github/workflows/ 디렉터리 규칙에

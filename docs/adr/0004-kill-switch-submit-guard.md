@@ -66,6 +66,8 @@ verification: []
    - **토큰 갱신 불가** → **전역** halt.
    - **"예상외 손실"은 미래 트리거 후보로만 남긴다** — API가 못 받친다. `holdings`는 집계뿐이고 `trades`엔 orderId가 없어 손익을 개별 주문에 엮을 수 없다(ADR-0003). 체결/P&L 추적 설계가 생길 때 별도로 붙인다.
 
+   > **Amend (ADR-0014)**: '임계 판단은 킬 스위치 한 곳' 원칙은 **ambiguous 신호에 한해 예외**다. ambiguous 빈도의 카운터는 곧 journal(재구성 가능·reconciler 소유)이고 `killswitch.Config`에 ambiguous 임계 필드가 없으며 #35가 killswitch를 수정하지 않으므로, ambiguous **전역** 에스컬레이션 임계 판단은 **reconciler가 소유**한다(척도는 시간-윈도우 rate가 아니라 미해소 `unresolved-ambiguous` **backlog 건수** — hazard가 시간으로 노화하지 않아 rate는 fail-open). ambiguous **종목** 차단(1건)은 임계 판단 이전의 무조건 floor다. order-failure·token-refresh 임계는 이 원칙대로 killswitch가 계속 소유한다. 상세·근거는 ADR-0014 Decision 1·2. 이 예외는 아래 Alternatives의 '임계 판단을 신호 발신처(order/reconciler)에 분산 — 기각'에도 **ambiguous 한정**으로 적용된다.
+
    **에스컬레이션 임계 상태(카운터·시간 윈도우)에도 point 4의 재시작 비대칭 규칙을 그대로 적용한다.** 트립된 halt만 지키고 트립 직전까지 쌓인 카운터가 휘발하면, 크래시/재시작 루프가 임계 도달 전에 카운터를 계속 리셋해 에스컬레이션 자체를 우회한다(무인 24/7 + 의존성 열화 시 크래시 루프는 현실적 위협). 따라서:
    - **journal에서 재구성 가능한 신호는 기동 시 재계산한다** — ambiguous 빈도는 `unresolved-ambiguous` intent와 그 타임스탬프(ADR-0002 `submit-attempted` 시각)에서 다시 센다. 별도 persist 없음(공짜).
    - **journal에서 재구성 불가한 신호는 카운터+윈도우를 동일 트랜잭션 저장소에 persist한다** — 토큰 갱신 실패처럼 순수 런타임 신호가 여기 해당한다(희소 신호라 쓰기 부담 작음).
