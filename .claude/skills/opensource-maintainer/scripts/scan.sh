@@ -54,11 +54,14 @@ scan() { # $1=설명  $2=패턴  $3(opt)=제외 grep -vE 패턴  $4(opt)=추가 
 
 echo "🔎 opensource-maintainer 스캔 ($SCOPE)"
 
-# 1) 시크릿 — 키워드 뒤에 대입되는 실값(빈 placeholder·환경변수명 참조·코드 식별자 대입은
-#    제외). 구분자는 `:`·`=`뿐 아니라 Go의 `:=`도 매칭하고, 값 앞 따옴표는 선택이라 따옴표
-#    없는 YAML(`client_secret: 실값`)도 잡는다. 과검출은 아래 제외 목록이 흡수한다.
+# 1) 시크릿 — 키워드 뒤에 대입되는 실값. 구분자는 `:`·`=`뿐 아니라 Go의 `:=`도 매칭한다.
+#    값이 따옴표로 감싼 리터럴이면(의도적 하드코딩) 12자+ 무엇이든 후보로 본다. 따옴표 없는
+#    값은 "숫자 1개 이상 + 충분한 길이"를 요구한다 — 실제 시크릿(토큰·키)은 거의 항상 숫자를
+#    포함하는 반면, `field: identifier`(예: Go 구조체의 `clientSecret: clientSecret`) 같은
+#    일반 코드 식별자 대입은 숫자가 없어 과검출되지 않게 하기 위함이다. 나머지 과검출은
+#    아래 제외 목록·모델 판단이 흡수한다(놓치는 것보다 과검출이 안전한 방향).
 scan "시크릿 의심 (키=값 대입)" \
-  '(client_secret|client_id|api[_-]?key|secret_key|access_token|refresh_token|secret|token|password|passwd)["'"'"'`]?[[:space:]]*(:=|[:=])[[:space:]]*["'"'"'`]?[A-Za-z0-9._/+-]{12,}' \
+  '(client_secret|client_id|api[_-]?key|secret_key|access_token|refresh_token|secret|token|password|passwd)["'"'"'`]?[[:space:]]*(:=|[:=])[[:space:]]*(["'"'"'`][A-Za-z0-9._/+-]{12,}|[A-Za-z0-9._/+-]*[0-9][A-Za-z0-9._/+-]{7,})' \
   'getenv|os\.Getenv|process\.env|example|placeholder|<.*>|YOUR_|xxx+|\$\{' \
   '-i'
 scan "AWS 액세스 키" 'AKIA[0-9A-Z]{16}'
