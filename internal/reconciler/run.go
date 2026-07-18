@@ -34,6 +34,14 @@ var ErrTickerStopped = errors.New("reconciler: re-evaluation ticker stopped")
 func (r *Reconciler) BootScan(ctx context.Context) error {
 	// Pass 1 — marker branching, ambiguous floor, backlog escalation, auto-clear.
 	if err := r.reconcile(ctx); err != nil {
+		// A shutdown that lands mid-scan is not a sick reconciler. Promoting it would
+		// latch bootHalt and write a durable global halt, so an ordinary Ctrl-C during
+		// startup would leave the NEXT run blocked until a human cleared it — an
+		// outage manufactured from a normal event. The gate is left shut either way,
+		// which is already the safe state, so there is nothing to escalate.
+		if ctx.Err() != nil {
+			return fmt.Errorf("reconciler: boot scan aborted by shutdown (gate left shut): %w", err)
+		}
 		r.promoteFailClosed(ctx, reasonBootScanFailed)
 		return fmt.Errorf("reconciler: boot scan pass 1 failed (fail-closed, gate left shut): %w", err)
 	}

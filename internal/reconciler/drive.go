@@ -323,6 +323,16 @@ func (r *Reconciler) resolve(ctx context.Context, v intentView, resolution strin
 // abandonReset permanently gives up a fill's pending success reset (see the
 // verdictFilled branch). Skipping a reset only ever leaves the failure counter
 // high, which is the over-halt direction.
+//
+// The bookkeeping is in-memory, and that is sound because of a reachability
+// pairing rather than durability: the ONLY caller is a journal durability failure
+// on a fill's resolve, and that same failure trips a DURABLE global halt. A
+// restart in that window therefore inherits a standing, human-clear-only block —
+// the stale reset cannot become new exposure, and a human must look at the bot
+// before it trades again. (#35 cannot add a durable per-intent marker: store and
+// killswitch are consume-only here.) TestAbandonedResetAlwaysPairsWithADurableHalt
+// pins the pairing, so a change that abandons a reset without a durable halt fails
+// a test rather than silently becoming a restart fail-open.
 func (r *Reconciler) abandonReset(intentID string) {
 	r.mu.Lock()
 	r.abandonedResets[intentID] = struct{}{}

@@ -223,3 +223,70 @@ func TestSuccessResetFollowsItsOwnResolve(t *testing.T) {
 		t.Fatalf("the success reset ran before its own resolve, making it replayable: %v", r.log.snapshot())
 	}
 }
+
+// TestBootScanCancellationDoesNotPromoteFailClosed — codex review round 2 [P2].
+//
+// A shutdown that lands while the boot scan is inside the journal scan surfaces
+// as a context error. Promoting that to a fail-closed halt would latch bootHalt
+// and write a durable global halt, so an ordinary Ctrl-C during startup would
+// leave the NEXT run blocked until a human cleared it — a self-inflicted outage
+// from a normal event (fail-closed-wrong-direction). The gate stays shut either
+// way, which is the safe state; nothing needs to be escalated.
+func TestBootScanCancellationDoesNotPromoteFailClosed(t *testing.T) {
+	r := newRig(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.journal.setLoadErr(context.Canceled)
+
+	if err := r.rec.BootScan(ctx); err == nil {
+		t.Fatal("BootScan reported success despite a cancelled scan")
+	}
+	if r.log.contains("notify-scan-complete") {
+		t.Fatal("the replay gate opened on a cancelled scan")
+	}
+	if r.log.contains("boot-halt") {
+		t.Fatal("a cancelled shutdown was promoted to a fail-closed halt")
+	}
+	if got := haltPhase(t, r.db); got != store.HaltNone {
+		t.Fatalf("halt phase = %q, want a clean shutdown to leave no durable halt behind", got)
+	}
+}
+
+// TestAbandonedResetAlwaysPairsWithADurableHalt is the reachability argument that
+// keeps the abandoned-reset bookkeeping safe even though it is in-memory only
+// (codex review round 2 [P1]).
+//
+// The map cannot be made durable here — #35 does not modify store or killswitch,
+// and there is no per-intent durable marker for "this reset was abandoned". What
+// makes that acceptable is that the ONLY way to set it is a journal durability
+// failure on a fill's resolve, and that same failure trips a DURABLE global halt.
+// So a restart in that window inherits a standing, human-clear-only block: the
+// stale reset cannot produce new exposure, and a human has to look at the bot
+// before it trades again.
+//
+// This test pins that pairing. If a future change ever lets a reset be abandoned
+// WITHOUT a durable halt standing, the in-memory map stops being sufficient and
+// the residual becomes a genuine restart fail-open.
+func TestAbandonedResetAlwaysPairsWithADurableHalt(t *testing.T) {
+	r := newRig(t)
+	seedAcked(t, r.db, "i-fill", "AAA", "ord-1")
+	r.api.setOrder(order.Order{
+		OrderID: "ord-1", Symbol: "AAA", Status: order.OrderStatusFilled,
+		Execution: order.OrderExecution{FilledQuantity: "1"},
+	})
+	r.journal.failResolve("i-fill", errors.New("durable medium failure"))
+
+	if err := r.boot(); err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+
+	if !r.rec.resetAbandoned("i-fill") {
+		t.Fatal("a fill whose resolve failed did not abandon its success reset")
+	}
+	if got := haltPhase(t, r.db); got != store.HaltHalted {
+		t.Fatalf("halt phase = %q; an abandoned reset must always be paired with a durable halt, otherwise the in-memory bookkeeping is not restart-safe", got)
+	}
+	if allowed, _ := r.canSubmit("AAA"); allowed {
+		t.Fatal("submissions were allowed in the window where a stale reset can exist")
+	}
+}
