@@ -146,6 +146,14 @@ func (r *Reconciler) reconcileSymbolBlocks(needBlock map[string]struct{}) {
 	}
 }
 
+// isBlocked reports whether THIS reconciler currently holds a block on symbol.
+func (r *Reconciler) isBlocked(symbol string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.blocked[symbol]
+	return ok
+}
+
 // tripSymbol publishes the memory-only per-symbol floor and remembers that THIS
 // reconciler published it (so auto-clear stays scoped to its own blocks).
 func (r *Reconciler) tripSymbol(ctx context.Context, symbol, reason string, occurredAt time.Time) {

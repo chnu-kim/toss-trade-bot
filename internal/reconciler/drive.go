@@ -119,8 +119,20 @@ func (r *Reconciler) applyVerdict(ctx context.Context, l lookup, inDoubt []time.
 	v := l.view
 	switch l.verdict {
 	case verdictLookupFailed:
-		// Already logged in stage 1. Nothing is resolved and nothing is blocked: a
-		// transient lookup failure is a delay, not evidence of an unidentified order.
+		// Already logged in stage 1. Nothing is resolved, and no NEW block is
+		// created: a transient lookup failure is a delay, not evidence of an
+		// unidentified order (ADR-0014 Decision 10).
+		//
+		// But an EXISTING block for this symbol must be preserved. The auto-clear in
+		// phase 3 reconciles against the evidence a cycle established, and this cycle
+		// established nothing about this order — its blocking evidence was not
+		// disproved, it was merely unobserved. Dropping the symbol from needBlock
+		// here would let one network blip re-open a symbol whose order is still in
+		// doubt, which is the over-clear ADR-0014 Decision 4 exists to prevent.
+		// Ignorance never releases a safety block.
+		if v.symbolErr == nil && r.isBlocked(v.symbol) {
+			needBlock[v.symbol] = struct{}{}
+		}
 
 	case verdictUnknownStatus:
 		// A standing "we cannot tell what this order is doing" — preserve and block

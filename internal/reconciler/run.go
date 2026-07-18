@@ -40,6 +40,9 @@ func (r *Reconciler) BootScan(ctx context.Context) error {
 
 	// Every re-derived block is now published — only now may new exposure resume.
 	r.guard.NotifyScanComplete()
+	r.mu.Lock()
+	r.scanComplete = true
+	r.mu.Unlock()
 	r.logger.Info("restart scan complete: replay gate opened")
 
 	// Pass 2 — audit re-emit driver. Safe after the gate: it creates no new
@@ -81,7 +84,7 @@ func (r *Reconciler) Run(ctx context.Context) error {
 		ticks = t.C
 	}
 
-	r.runCycle(ctx, r.BootScan)
+	r.runCycle(ctx, r.cycle)
 
 	for {
 		select {
@@ -97,11 +100,31 @@ func (r *Reconciler) Run(ctx context.Context) error {
 				r.promoteFailClosed(ctx, reasonLoopUnsustainable)
 				return ErrTickerStopped
 			}
-			r.runCycle(ctx, r.Reconcile)
+			r.runCycle(ctx, r.cycle)
 		case <-r.wake:
-			r.runCycle(ctx, r.Reconcile)
+			r.runCycle(ctx, r.cycle)
 		}
 	}
+}
+
+// cycle is what the loop actually runs each time: the restart scan until it has
+// succeeded once, and the ordinary live reconciliation afterwards.
+//
+// The retry is load-bearing, not tidiness. Only the boot scan opens the replay
+// gate, and a failed boot scan deliberately leaves it shut. If the loop then moved
+// on to plain live cycles, that shut gate would never be re-opened: the bot would
+// stay blocked by replay-gate-closed forever — surviving even the operator
+// clearing the promoted halt, and even later scans succeeding — until someone
+// restarted the process. Fail-closed must be recoverable, so the scan is retried
+// on the normal cadence until it completes.
+func (r *Reconciler) cycle(ctx context.Context) error {
+	r.mu.Lock()
+	done := r.scanComplete
+	r.mu.Unlock()
+	if !done {
+		return r.BootScan(ctx)
+	}
+	return r.Reconcile(ctx)
 }
 
 // runCycle executes one cycle inside a recover boundary and accounts sustained

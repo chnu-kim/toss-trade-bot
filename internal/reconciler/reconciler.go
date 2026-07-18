@@ -216,6 +216,11 @@ type Reconciler struct {
 	// every tick. It is memory-only: after a restart one duplicate re-emit is
 	// merged by the audit idempotency key (at-least-once, ADR-0006 point 3).
 	lastFill map[string]audit.FillSnapshot
+	// scanComplete records that the restart scan has succeeded once and the replay
+	// gate has been opened. Until then the loop keeps retrying the scan instead of
+	// running ordinary live cycles, because the gate is opened by nothing else (see
+	// cycle).
+	scanComplete bool
 	// consecutiveFailures counts structurally failed cycles for Decision 12.
 	consecutiveFailures int
 	// promoted latches the fail-closed promotion so it is logged/tripped once.
