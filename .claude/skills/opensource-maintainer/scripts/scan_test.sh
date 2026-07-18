@@ -131,6 +131,27 @@ OUT=$(run_scan bash "$D" --all); RC=$?
   || fail "인라인 마커로 게이트 우회 가능(false-green): RC=$RC"
 rm -rf "$D"
 
+echo "== 제외 목록은 '값'에만 적용된다 (같은 줄 산문으로 우회 불가) =="
+# 줄 전체에 제외 regex를 걸면 진짜 자격증명 옆에 'example' 한 단어만 적어도 숨길 수 있다.
+D=$(make_repo \
+  'prose1.yml|client_secret: RealLeakValue123456 # example value copied from docs' \
+  'prose2.yml|api_key: RealLeakValue987654 (placeholder for now)' \
+  'prose3.yml|access_token: RealLeakValue555555 # YOUR_TEAM should rotate this')
+OUT=$(run_scan bash "$D" --all); RC=$?
+grep -q 'prose1.yml' <<<"$OUT" && pass "값 뒤 'example' 주석으로 우회 불가" || fail "example 산문으로 시크릿 은닉(false-green)"
+grep -q 'prose2.yml' <<<"$OUT" && pass "값 뒤 'placeholder' 산문으로 우회 불가" || fail "placeholder 산문으로 은닉(false-green)"
+grep -q 'prose3.yml' <<<"$OUT" && pass "값 뒤 'YOUR_' 산문으로 우회 불가" || fail "YOUR_ 산문으로 은닉(false-green)"
+[ "$RC" -eq 1 ] && pass "산문 우회 시도에도 exit 1" || fail "exit=$RC (1 기대)"
+rm -rf "$D"
+
+# 반대 방향: 값 자체가 진짜 placeholder면 계속 제외돼야 한다(과검출 방지 유지).
+D=$(make_repo \
+  'ph1.go|const clientSecret = "YOUR_CLIENT_SECRET_HERE"' \
+  'ph2.yml|client_secret: example-placeholder-value')
+OUT=$(run_scan bash "$D" --all); RC=$?
+[ "$RC" -eq 0 ] && pass "값 자체가 placeholder면 제외 유지(exit 0)" || { fail "placeholder 값 과검출(exit=$RC)"; printf '%s\n' "$OUT"; }
+rm -rf "$D"
+
 echo "== --content-only: 커밋 설정 점검만 건너뛰고 내용 스캔은 유지 =="
 # CI 러너엔 user.email이 없어 설정 점검이 항상 실패한다 → --content-only로 그 절만 건너뛴다.
 # 단, 내용(시크릿) 스캔이 함께 약해지면 안 된다.
