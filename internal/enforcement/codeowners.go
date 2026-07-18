@@ -64,6 +64,12 @@ var sacredRequiredPaths = []string{
 	// confirmation the sacred live-execution set (ADR-0004/0012/0013) depends
 	// on. Same twin-artifact rule.
 	"docs/adr/0014-reconciler-escalation-bounded-recount.md",
+	// ADR-0015 declares protects: [enforcement-integrity, live-execution-human-gate]
+	// — it fixes the Phase A/B activation procedure (credential ordering,
+	// flip-and-verify-or-rollback, bootstrap-exception scope) as an ADR-0011
+	// amendment; a later, narrower CODEOWNERS entry stripping its protection would
+	// let the loop quietly rewrite the gate-activation contract. Same twin-artifact rule.
+	"docs/adr/0015-loop-pr-amendment-bootstrap-activation.md",
 	// Every non-test .go source file in internal/gate, individually — not
 	// just one representative file (codex:review [P2] finding on #48's PR:
 	// the privileged workflow compiles and executes the whole package via

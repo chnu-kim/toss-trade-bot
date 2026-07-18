@@ -38,6 +38,11 @@
 # bounded LIVE re-count. protects: [live-execution-human-gate] — reconciler가
 # 킬스위치 진실확정·에스컬레이션을 완성하므로 0004/0012/0013과 같은 sacred set(ADR-0014).
 /docs/adr/0014-*.md @chnu-kim
+# 0015: Phase A/B 활성화의 물리적으로 불가능한 두 스텝(App key materialize·사람계정
+# narrowing)을 sanctioned 사람-액션 부트스트랩으로 확정(ADR-0011 amend). protects:
+# [enforcement-integrity, live-execution-human-gate] — 게이트 활성화 절차·flip 트랜잭션을
+# 정의하므로 조용한 개정이 enforcement를 약화(ADR-0015).
+/docs/adr/0015-*.md @chnu-kim
 
 # ADR-0008 verdict 게이트 workflow(이슈 #48) — 특권 verdict-생성 잡의 트리거·
 # 인젝션 하드닝·적격 가드·머지 스텝 정의. /.github/workflows/ 디렉터리 규칙에

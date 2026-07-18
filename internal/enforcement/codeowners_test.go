@@ -23,6 +23,7 @@ const validCodeowners = `# enforcement-integrity sacred invariant (ADR-0009) 의
 /docs/adr/0012-*.md @chnu-kim
 /docs/adr/0013-*.md @chnu-kim
 /docs/adr/0014-*.md @chnu-kim
+/docs/adr/0015-*.md @chnu-kim
 
 /.github/workflows/verdict-gate.yml @chnu-kim
 /internal/gate/ @chnu-kim
@@ -91,6 +92,7 @@ func TestCheckCodeowners_Missing0012FailsClosed(t *testing.T) {
 /docs/adr/0011-*.md @chnu-kim
 /docs/adr/0013-*.md @chnu-kim
 /docs/adr/0014-*.md @chnu-kim
+/docs/adr/0015-*.md @chnu-kim
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
@@ -118,6 +120,7 @@ func TestCheckCodeowners_Missing0013FailsClosed(t *testing.T) {
 /docs/adr/0011-*.md @chnu-kim
 /docs/adr/0012-*.md @chnu-kim
 /docs/adr/0014-*.md @chnu-kim
+/docs/adr/0015-*.md @chnu-kim
 /.github/workflows/verdict-gate.yml @chnu-kim
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
@@ -145,6 +148,7 @@ func TestCheckCodeowners_Missing0014FailsClosed(t *testing.T) {
 /docs/adr/0011-*.md @chnu-kim
 /docs/adr/0012-*.md @chnu-kim
 /docs/adr/0013-*.md @chnu-kim
+/docs/adr/0015-*.md @chnu-kim
 /.github/workflows/verdict-gate.yml @chnu-kim
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
@@ -154,6 +158,35 @@ func TestCheckCodeowners_Missing0014FailsClosed(t *testing.T) {
 	got := CheckCodeowners(content)
 	if got.Satisfied {
 		t.Fatal("missing sacred path (0014) must not satisfy the check")
+	}
+}
+
+func TestCheckCodeowners_Missing0015FailsClosed(t *testing.T) {
+	// ADR-0015 declares protects: [enforcement-integrity, live-execution-human-gate]
+	// and joins the sacred set (ADR-0011 amendment: Phase A/B activation procedure).
+	// A CODEOWNERS that drops its line must fail check (a) — the twin-artifact rule:
+	// the protects: declaration and the CODEOWNERS/sacredRequiredPaths registration
+	// must move together. Otherwise-VALID sample with only the /docs/adr/0015-*.md
+	// line removed.
+	content := `/.github/workflows/ @chnu-kim
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+/docs/adr/0011-*.md @chnu-kim
+/docs/adr/0012-*.md @chnu-kim
+/docs/adr/0013-*.md @chnu-kim
+/docs/adr/0014-*.md @chnu-kim
+/.github/workflows/verdict-gate.yml @chnu-kim
+/internal/gate/ @chnu-kim
+/cmd/verdict-gate/ @chnu-kim
+/configs/gate/ @chnu-kim
+/.github/CODEOWNERS @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if got.Satisfied {
+		t.Fatal("missing sacred path (0015) must not satisfy the check")
 	}
 }
 
@@ -220,6 +253,7 @@ func TestCheckCodeowners_CommentsAndBlankLinesIgnored(t *testing.T) {
 /docs/adr/0012-*.md @chnu-kim
 /docs/adr/0013-*.md @chnu-kim
 /docs/adr/0014-*.md @chnu-kim
+/docs/adr/0015-*.md @chnu-kim
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
@@ -311,6 +345,7 @@ func TestCheckCodeowners_LaterEntryWithSameOwnerStillSatisfies(t *testing.T) {
 /docs/adr/0012-*.md @chnu-kim
 /docs/adr/0013-*.md @chnu-kim
 /docs/adr/0014-*.md @chnu-kim
+/docs/adr/0015-*.md @chnu-kim
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
@@ -345,6 +380,7 @@ func TestCheckCodeowners_MissingGateLogicPackage(t *testing.T) {
 /docs/adr/0012-*.md @chnu-kim
 /docs/adr/0013-*.md @chnu-kim
 /docs/adr/0014-*.md @chnu-kim
+/docs/adr/0015-*.md @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
@@ -367,6 +403,7 @@ func TestCheckCodeowners_GateArtifactOwnerStripped(t *testing.T) {
 /docs/adr/0012-*.md @chnu-kim
 /docs/adr/0013-*.md @chnu-kim
 /docs/adr/0014-*.md @chnu-kim
+/docs/adr/0015-*.md @chnu-kim
 /internal/gate/
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
@@ -397,6 +434,7 @@ func TestCheckCodeowners_NarrowerCarveOutOnOneGateFileNotCaught(t *testing.T) {
 /docs/adr/0012-*.md @chnu-kim
 /docs/adr/0013-*.md @chnu-kim
 /docs/adr/0014-*.md @chnu-kim
+/docs/adr/0015-*.md @chnu-kim
 /internal/gate/ @chnu-kim
 /internal/gate/sanity.go
 /cmd/verdict-gate/ @chnu-kim
@@ -428,6 +466,7 @@ func TestCheckCodeowners_PRCreationWorkflowCarveOutCaught(t *testing.T) {
 /docs/adr/0012-*.md @chnu-kim
 /docs/adr/0013-*.md @chnu-kim
 /docs/adr/0014-*.md @chnu-kim
+/docs/adr/0015-*.md @chnu-kim
 /.github/workflows/pr-creation.yml
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
@@ -453,6 +492,7 @@ docs/adr/0011-*.md @chnu-kim
 docs/adr/0012-*.md @chnu-kim
 docs/adr/0013-*.md @chnu-kim
 docs/adr/0014-*.md @chnu-kim
+docs/adr/0015-*.md @chnu-kim
 internal/gate/** @chnu-kim
 cmd/verdict-gate/** @chnu-kim
 configs/gate/** @chnu-kim
