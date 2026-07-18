@@ -3,12 +3,26 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
+	"os"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver, registered as "sqlite"
 )
+
+// ErrUnsafeDBPath is returned by Open when the database path contains a character
+// that would corrupt the SQLite URI DSN. openConn builds the DSN as
+// "file:" + path + "?" + query, so a '#' in the path is read as a URI fragment
+// boundary — SQLite then silently opens a *truncated, different* file (verified:
+// ".../data#prod/store.db" opens ".../data") — a '?' misparses the pragma query
+// (durability pragmas can be lost), and a raw '%' is misread as a percent-escape
+// introducer. Because "reopen the SAME journal" is load-bearing for restart
+// recovery (ADR-0003/0005), a path that could point the engine at a different
+// file must fail closed at Open, not silently degrade.
+var ErrUnsafeDBPath = errors.New("store: database path contains characters unsafe for the SQLite URI DSN (#, ?, or %)")
 
 // Store is the consumer-facing seam. order/killswitch/reconciler depend on this
 // interface and fake it for unit tests; store's own durability, crash, and
@@ -70,6 +84,19 @@ var _ Store = (*DB)(nil)
 // migrations. Durability is fixed at synchronous=FULL + WAL and must not be
 // relaxed (ADR-0005 point 4).
 func Open(path string) (*DB, error) {
+	// Fail closed BEFORE touching the filesystem if the path would corrupt the URI
+	// DSN (silent wrong-file / lost pragmas — L-8), so no stray file is pre-created
+	// for a path we are about to reject.
+	if err := validateDBPath(path); err != nil {
+		return nil, err
+	}
+	// Pre-create the main file owner-only so the .db and its WAL/SHM sidecars are
+	// never group/other-readable (M-2). This runs before openConn because SQLite
+	// keeps an existing file's mode.
+	if err := secureDBFile(path); err != nil {
+		return nil, err
+	}
+
 	writeDB, err := openConn(path, true)
 	if err != nil {
 		return nil, err
@@ -116,6 +143,99 @@ func openConn(path string, write bool) (*sql.DB, error) {
 		return nil, fmt.Errorf("store: ping %s: %w", path, err)
 	}
 	return db, nil
+}
+
+// validateDBPath rejects paths whose characters break the "file:PATH?query" URI
+// DSN grammar (see ErrUnsafeDBPath). Rejection (rather than escaping) is chosen
+// deliberately: SQLite URI percent-decoding rules are subtle and a mis-escape
+// would reintroduce the very silent-wrong-file hazard this guards against, so a
+// loud fail-closed refusal at startup is the robust choice. os.Stat-after-open
+// verification is not sufficient on its own here because secureDBFile pre-creates
+// the intended path, so the intended path always exists even when SQLite opened a
+// different (truncated) file.
+func validateDBPath(path string) error {
+	if i := strings.IndexAny(path, "#?%"); i >= 0 {
+		return fmt.Errorf("%w: %q (offending %q at index %d)", ErrUnsafeDBPath, path, string(path[i]), i)
+	}
+	return nil
+}
+
+// secureDBFile ensures the main database file exists with owner-only permissions
+// (0o600) BEFORE SQLite opens it, so neither the .db nor its WAL/SHM sidecars are
+// readable by other accounts on a shared host — the DB (and its uncheckpointed
+// journal pages in the -wal) holds order intents, client_order_ids, and halt
+// reasons, i.e. the account's whole trading activity (M-2). A freshly created file
+// is created via O_CREATE and then normalized below.
+//
+// It then normalizes the main file AND any pre-existing -wal/-shm sidecars to
+// EXACTLY 0o600. Normalizing (rather than only clearing group/other bits) is
+// necessary on two fronts: a restrictive umask (e.g. 0o200/0o400) also strips OWNER
+// bits from the O_CREATE mode, so a fresh DB could be left 0o400/0o000 — failing
+// SQLite open or silently violating the 0o600 guarantee — and sidecars an older
+// pre-hardening binary left at 0o644 (e.g. a crash-left WAL) must be tightened even
+// though the main file is now 0o600 (SQLite only sets a sidecar's mode when it
+// CREATES it, inheriting the main file's mode, so a reused sidecar keeps its old
+// mode). The sidecars are never created here — an empty -wal/-shm invented before
+// open would corrupt SQLite's WAL recovery — so an absent sidecar is skipped
+// (SQLite creates the real one 0o600-inherited). This is a fail-safe repair (an
+// unattended upgrade keeps booting rather than refusing to start); if a file cannot
+// be normalized Open fails closed rather than proceeding with the wrong mode.
+func secureDBFile(path string) error {
+	// Lstat the main path FIRST — never open an existing entry for read before
+	// validating it. Lstat (not Stat) so a SYMLINK is reported as the link itself and
+	// rejected by the IsRegular check below: Stat would follow the link, letting a
+	// symlinked path (operator misconfig, or a co-tenant-planted link in a writable
+	// store dir — M-2's shared-host threat) redirect the chmod to an arbitrary target
+	// (CWE-59) and SQLite open through it at the wrong journal. Lstat also does not
+	// block on a FIFO/socket the way open() does (misconfigured special path fails
+	// closed instead of hanging Open) and needs no read permission on the file (an
+	// owner-unreadable 0o200/0o000 DB is still reachable for the chmod repair). Create
+	// the file only when it is genuinely absent.
+	switch info, err := os.Lstat(path); {
+	case err == nil:
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("store: %s is not a regular file (mode %s); refusing to open", path, info.Mode())
+		}
+	case os.IsNotExist(err):
+		// O_EXCL so that if a symlink or special file races into existence between the
+		// Lstat and here, we get a fail-closed EEXIST rather than following/opening it
+		// (POSIX: O_CREAT|O_EXCL fails EEXIST when the path names a symlink).
+		f, cerr := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if cerr != nil {
+			return fmt.Errorf("store: pre-create %s: %w", path, cerr)
+		}
+		if cerr := f.Close(); cerr != nil {
+			return fmt.Errorf("store: pre-create %s: %w", path, cerr)
+		}
+	default:
+		return fmt.Errorf("store: stat %s: %w", path, err)
+	}
+
+	// Normalize the main file and any pre-existing -wal/-shm sidecars to EXACTLY
+	// 0o600 via chmod (which needs ownership, not read access). Lstat rejects
+	// symlinks and other non-regular entries before chmod, so a directory/FIFO is
+	// never damaged and the chmod never follows a link to an arbitrary target; absent
+	// sidecars are skipped (SQLite creates the real one 0o600-inherited) — never
+	// created here, because an empty -wal/-shm invented before open would corrupt WAL
+	// recovery.
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		info, err := os.Lstat(p)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("store: stat %s: %w", p, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("store: %s is not a regular file (mode %s); refusing to open", p, info.Mode())
+		}
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			if err := os.Chmod(p, 0o600); err != nil {
+				return fmt.Errorf("store: normalize permissions on %s (mode %#o) to 0o600: %w", p, perm, err)
+			}
+		}
+	}
+	return nil
 }
 
 // Close closes both handles. It is safe to call once.
