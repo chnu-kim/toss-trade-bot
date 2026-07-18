@@ -373,3 +373,51 @@ func (s *haltWriteFailingStore) TripHalt(ctx context.Context, reason string) err
 func (s *haltWriteFailingStore) SetCounter(ctx context.Context, c store.Counter) error {
 	return errStoreDown
 }
+
+// TestSentinel_MissingSentinelRowRefusesBootAndClean is the corrupted-store arm,
+// and the runtime half of the twin whose store half is
+// TestSetLifecycleFailsWhenSingletonRowMissing. A botched migration, a partial
+// restore, or manual tampering can leave the lifecycle singleton absent; the
+// store now reports that as store.ErrLifecycleRowMissing instead of a false
+// durable-ack. This asserts what runtime does with that error, so the two halves
+// cannot drift apart: without it, store could keep the check while runtime
+// quietly treated the error as advisory.
+//
+// Both ends must fail closed. The boot refuses to run at all (no durable marker
+// ⇒ this run is invisible to the next boot's crash detection), and a shutdown
+// refuses to certify the run clean (a "clean" that was never written would make
+// the next boot trust a marker that does not exist).
+func TestSentinel_MissingSentinelRowRefusesBootAndClean(t *testing.T) {
+	st := &missingRowSentinel{}
+	g := &fakeGuard{}
+
+	d := BootSentinel(context.Background(), st, g, discardLogger())
+	if !d.Fatal {
+		t.Fatalf("a missing sentinel row must make the boot fatal: %+v", d)
+	}
+	if !errors.Is(d.Err, store.ErrLifecycleRowMissing) {
+		t.Fatalf("boot error must wrap ErrLifecycleRowMissing, got %v", d.Err)
+	}
+
+	sd := ShutdownSentinel(context.Background(), st, &fakeGuard{}, true, discardLogger())
+	if sd.WroteClean {
+		t.Fatal("a missing sentinel row must not yield a clean certification")
+	}
+	if !errors.Is(sd.Err, store.ErrLifecycleRowMissing) {
+		t.Fatalf("shutdown error must wrap ErrLifecycleRowMissing, got %v", sd.Err)
+	}
+}
+
+// missingRowSentinel models the store after the lifecycle singleton has been
+// deleted: reads fail and every write reports the row is gone.
+type missingRowSentinel struct{}
+
+func (missingRowSentinel) Lifecycle(ctx context.Context) (store.LifecycleState, error) {
+	return "", store.ErrLifecycleRowMissing
+}
+func (missingRowSentinel) SetLifecycle(ctx context.Context, s store.LifecycleState) error {
+	return store.ErrLifecycleRowMissing
+}
+func (missingRowSentinel) Halt(ctx context.Context) (store.HaltState, error) {
+	return store.HaltState{Phase: store.HaltNone}, nil
+}

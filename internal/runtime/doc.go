@@ -37,6 +37,29 @@
 // boundary deliberately logs-and-continues and never escalates to stopping the
 // process: a panic-count trip is kill-switch territory.
 //
+// # The sentinel is NOT a mutual-exclusion primitive
+//
+// Read this before assuming the boot flip protects against a second process.
+// The sentinel answers "did the PREVIOUS run end cleanly", not "am I the only
+// run". Its boot transition is a read followed by an unconditional write, not a
+// compare-and-set or a lease: if two cmd/bot processes start against the same
+// store after a clean shutdown, both read clean, both write running, and neither
+// comes up conservatively halted.
+//
+// That is a deliberate scope boundary, not an oversight. Single-process
+// operation is an architectural premise established by ADR-0001 (a second
+// process is already self-defeating: Toss invalidates the previous token on
+// every issuance, so two runtimes would continuously kill each other's auth) and
+// ADR-0005 (one dedicated write connection). Turning the sentinel into an
+// ownership claim means deciding lease semantics — TTL, renewal, what a wedged
+// holder does to restarts — and a stale lease that blocks every restart is a new
+// unattended outage mode that trades one fail-open for a worse fail-closed. That
+// is an architectural decision (/architect), not an implementation detail to be
+// improvised here.
+//
+// So: if multi-process deployment ever becomes possible, the exclusion mechanism
+// must be designed first. Do not read the running flip as having provided it.
+//
 // Nothing here decides WHAT to trade. The submit path is assembled and dormant
 // until a strategy exists.
 package runtime
