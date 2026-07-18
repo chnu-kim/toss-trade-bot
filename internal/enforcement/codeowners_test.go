@@ -33,6 +33,7 @@ const validCodeowners = `# enforcement-integrity sacred invariant (ADR-0009) 의
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
 /.claude/skills/opensource-maintainer/ @chnu-kim
+/internal/enforcement/ @chnu-kim
 
 /.github/CODEOWNERS @chnu-kim
 `
@@ -57,150 +58,56 @@ func TestCheckCodeowners_Empty(t *testing.T) {
 	}
 }
 
-func TestCheckCodeowners_Missing0011FailsClosed(t *testing.T) {
-	// ADR-0011 registered itself under the enforcement-integrity umbrella
-	// (ADR-0011 point 11) — a CODEOWNERS that drops its line must fail check
-	// (a), otherwise the registration exists only on paper (codex review
-	// finding on PR #45: the mechanical check and the CODEOWNERS entry must
-	// move together).
-	content := `/.github/workflows/ @chnu-kim
-/docs/adr/0004-*.md @chnu-kim
-/docs/adr/0007-*.md @chnu-kim
-/docs/adr/0008-*.md @chnu-kim
-/docs/adr/0009-*.md @chnu-kim
-/docs/adr/0010-*.md @chnu-kim
-/.github/CODEOWNERS @chnu-kim
-`
-	got := CheckCodeowners(content)
-	if got.Satisfied {
-		t.Fatal("missing sacred path (0011) must not satisfy the check")
+// TestCheckCodeowners_EverySacredADRLineDroppedFailsClosed replaces the former
+// per-ADR TestCheckCodeowners_Missing0011/0012/0013/0014/0015FailsClosed
+// fixtures (issue #64). Those were hand-written copies of the whole CODEOWNERS
+// file with exactly one ADR line deleted, so every new sacred ADR meant editing
+// ~10 fixtures by hand — the very manual mirroring that kept drifting.
+//
+// This derives the same assertion from the real file: for each ADR path in
+// sacredRequiredPaths, remove EVERY entry whose pattern matches it (not just
+// the obvious line — a broader directory rule could still cover it) and require
+// the check to fail closed. New sacred ADRs are covered automatically.
+//
+// The complementary direction — an ADR that declares protects: but was never
+// added to either surface — is TestADRProtectsCompleteness_RealRepo, which no
+// hardcoded fixture could ever catch.
+func TestCheckCodeowners_EverySacredADRLineDroppedFailsClosed(t *testing.T) {
+	real, err := os.ReadFile("../../.github/CODEOWNERS")
+	if err != nil {
+		t.Fatalf("read real CODEOWNERS: %v", err)
 	}
-}
 
-func TestCheckCodeowners_Missing0012FailsClosed(t *testing.T) {
-	// ADR-0012 declares protects: [live-execution-human-gate] and joins the
-	// sacred set (like ADR-0004). A CODEOWNERS that drops its line must fail
-	// check (a) — the twin-artifact rule (codex review finding on PR #59: the
-	// protects: declaration and the CODEOWNERS/sacredRequiredPaths registration
-	// must move together).
-	// Otherwise-VALID sample with only the /docs/adr/0012-*.md line removed, so
-	// the check fails specifically because 0012 is missing (not because some
-	// other required owner is absent) — this is what actually guards the
-	// twin-artifact requirement (codex review [P3] on PR #59).
-	content := `/.github/workflows/ @chnu-kim
-/docs/adr/0004-*.md @chnu-kim
-/docs/adr/0007-*.md @chnu-kim
-/docs/adr/0008-*.md @chnu-kim
-/docs/adr/0009-*.md @chnu-kim
-/docs/adr/0010-*.md @chnu-kim
-/docs/adr/0011-*.md @chnu-kim
-/docs/adr/0013-*.md @chnu-kim
-/docs/adr/0014-*.md @chnu-kim
-/docs/adr/0015-*.md @chnu-kim
-/docs/runbooks/phase-b-entry.md @chnu-kim
-/scripts/ @chnu-kim
-/internal/gate/ @chnu-kim
-/cmd/verdict-gate/ @chnu-kim
-/configs/gate/ @chnu-kim
-/.claude/skills/opensource-maintainer/ @chnu-kim
-/.github/CODEOWNERS @chnu-kim
-`
-	got := CheckCodeowners(content)
-	if got.Satisfied {
-		t.Fatal("missing sacred path (0012) must not satisfy the check")
+	var adrPaths []string
+	for _, p := range sacredRequiredPaths {
+		if strings.HasPrefix(p, "docs/adr/") {
+			adrPaths = append(adrPaths, p)
+		}
 	}
-}
-
-func TestCheckCodeowners_Missing0013FailsClosed(t *testing.T) {
-	// ADR-0013 declares protects: [live-execution-human-gate] and joins the
-	// sacred set (like ADR-0004/0012). A CODEOWNERS that drops its line must fail
-	// check (a) — the twin-artifact rule (codex review finding on PR #63: the
-	// protects: declaration and the CODEOWNERS/sacredRequiredPaths registration
-	// must move together). Otherwise-VALID sample with only the /docs/adr/0013-*.md
-	// line removed, so the check fails specifically because 0013 is missing.
-	content := `/.github/workflows/ @chnu-kim
-/docs/adr/0004-*.md @chnu-kim
-/docs/adr/0007-*.md @chnu-kim
-/docs/adr/0008-*.md @chnu-kim
-/docs/adr/0009-*.md @chnu-kim
-/docs/adr/0010-*.md @chnu-kim
-/docs/adr/0011-*.md @chnu-kim
-/docs/adr/0012-*.md @chnu-kim
-/docs/adr/0014-*.md @chnu-kim
-/docs/adr/0015-*.md @chnu-kim
-/docs/runbooks/phase-b-entry.md @chnu-kim
-/scripts/ @chnu-kim
-/.github/workflows/verdict-gate.yml @chnu-kim
-/internal/gate/ @chnu-kim
-/cmd/verdict-gate/ @chnu-kim
-/configs/gate/ @chnu-kim
-/.claude/skills/opensource-maintainer/ @chnu-kim
-/.github/CODEOWNERS @chnu-kim
-`
-	got := CheckCodeowners(content)
-	if got.Satisfied {
-		t.Fatal("missing sacred path (0013) must not satisfy the check")
+	if len(adrPaths) == 0 {
+		t.Fatal("sacredRequiredPaths에 docs/adr 경로가 하나도 없음 — 이 테스트가 무의미해졌다")
 	}
-}
 
-func TestCheckCodeowners_Missing0014FailsClosed(t *testing.T) {
-	// ADR-0014 declares protects: [live-execution-human-gate] and joins the
-	// sacred set (like ADR-0004/0012/0013). A CODEOWNERS that drops its line
-	// must fail check (a) — the twin-artifact rule: the protects: declaration
-	// and the CODEOWNERS/sacredRequiredPaths registration must move together.
-	// Otherwise-VALID sample with only the /docs/adr/0014-*.md line removed.
-	content := `/.github/workflows/ @chnu-kim
-/docs/adr/0004-*.md @chnu-kim
-/docs/adr/0007-*.md @chnu-kim
-/docs/adr/0008-*.md @chnu-kim
-/docs/adr/0009-*.md @chnu-kim
-/docs/adr/0010-*.md @chnu-kim
-/docs/adr/0011-*.md @chnu-kim
-/docs/adr/0012-*.md @chnu-kim
-/docs/adr/0013-*.md @chnu-kim
-/docs/adr/0015-*.md @chnu-kim
-/docs/runbooks/phase-b-entry.md @chnu-kim
-/scripts/ @chnu-kim
-/.github/workflows/verdict-gate.yml @chnu-kim
-/internal/gate/ @chnu-kim
-/cmd/verdict-gate/ @chnu-kim
-/configs/gate/ @chnu-kim
-/.github/CODEOWNERS @chnu-kim
-`
-	got := CheckCodeowners(content)
-	if got.Satisfied {
-		t.Fatal("missing sacred path (0014) must not satisfy the check")
-	}
-}
-
-func TestCheckCodeowners_Missing0015FailsClosed(t *testing.T) {
-	// ADR-0015 declares protects: [enforcement-integrity, live-execution-human-gate]
-	// and joins the sacred set (ADR-0011 amendment: Phase A/B activation procedure).
-	// A CODEOWNERS that drops its line must fail check (a) — the twin-artifact rule:
-	// the protects: declaration and the CODEOWNERS/sacredRequiredPaths registration
-	// must move together. Otherwise-VALID sample with only the /docs/adr/0015-*.md
-	// line removed.
-	content := `/.github/workflows/ @chnu-kim
-/docs/adr/0004-*.md @chnu-kim
-/docs/adr/0007-*.md @chnu-kim
-/docs/adr/0008-*.md @chnu-kim
-/docs/adr/0009-*.md @chnu-kim
-/docs/adr/0010-*.md @chnu-kim
-/docs/adr/0011-*.md @chnu-kim
-/docs/adr/0012-*.md @chnu-kim
-/docs/adr/0013-*.md @chnu-kim
-/docs/adr/0014-*.md @chnu-kim
-/docs/runbooks/phase-b-entry.md @chnu-kim
-/scripts/ @chnu-kim
-/.github/workflows/verdict-gate.yml @chnu-kim
-/internal/gate/ @chnu-kim
-/cmd/verdict-gate/ @chnu-kim
-/configs/gate/ @chnu-kim
-/.github/CODEOWNERS @chnu-kim
-`
-	got := CheckCodeowners(content)
-	if got.Satisfied {
-		t.Fatal("missing sacred path (0015) must not satisfy the check")
+	for _, path := range adrPaths {
+		t.Run(path, func(t *testing.T) {
+			var kept []string
+			for _, line := range strings.Split(string(real), "\n") {
+				trimmed := strings.TrimSpace(line)
+				if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+					if fields := strings.Fields(trimmed); codeownersPatternMatches(fields[0], path) {
+						continue // drop every rule that covers this ADR
+					}
+				}
+				kept = append(kept, line)
+			}
+			got := CheckCodeowners(strings.Join(kept, "\n"))
+			if got.Satisfied {
+				t.Fatalf("%s의 CODEOWNERS 보호를 전부 제거했는데도 통과함 — fail-closed가 아님", path)
+			}
+			if !strings.Contains(got.Reason, path) {
+				t.Fatalf("실패 사유가 어느 경로인지 지목하지 않음: %q", got.Reason)
+			}
+		})
 	}
 }
 
@@ -229,6 +136,7 @@ func TestCheckCodeowners_MissingPhaseBRunbookFailsClosed(t *testing.T) {
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
+/internal/enforcement/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
@@ -261,6 +169,7 @@ func TestCheckCodeowners_MissingNarrowingScriptFailsClosed(t *testing.T) {
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
+/internal/enforcement/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
@@ -339,6 +248,7 @@ func TestCheckCodeowners_CommentsAndBlankLinesIgnored(t *testing.T) {
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
 /.claude/skills/opensource-maintainer/ @chnu-kim
+/internal/enforcement/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
@@ -434,6 +344,7 @@ func TestCheckCodeowners_LaterEntryWithSameOwnerStillSatisfies(t *testing.T) {
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
 /.claude/skills/opensource-maintainer/ @chnu-kim
+/internal/enforcement/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 /.github/workflows/ci.yml @chnu-kim
 /.github/workflows/verdict-gate.yml @chnu-kim
@@ -497,6 +408,7 @@ func TestCheckCodeowners_GateArtifactOwnerStripped(t *testing.T) {
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
 /.claude/skills/opensource-maintainer/ @chnu-kim
+/internal/enforcement/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
@@ -532,11 +444,95 @@ func TestCheckCodeowners_NarrowerCarveOutOnOneGateFileNotCaught(t *testing.T) {
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
 /.claude/skills/opensource-maintainer/ @chnu-kim
+/internal/enforcement/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
 	if got.Satisfied {
 		t.Fatal("a narrower ownerless entry stripping protection from internal/gate/sanity.go specifically must not satisfy the check, even though riskclassification.go (and the directory pattern) still look protected")
+	}
+}
+
+// TestSacredRequiredPaths_CoversEveryEnforcementGoFile keeps the checker's own
+// self-registration from drifting, the same way sacredADRRegistry keeps the ADR
+// roster from drifting: a .go file added to this package later must be
+// registered too, or it becomes an unprotected hole in the checker.
+//
+// _test.go files are included deliberately, unlike the internal/gate precedent.
+// In internal/gate the gate logic lives in non-test files and the tests merely
+// verify it; in THIS package the enforcement IS the tests —
+// TestADRProtectsCompleteness_RealRepo, TestSacredADRRegistry_* and this test
+// are the only things standing between the repo and silent de-wiring. Leaving
+// them out would let a later ownerless entry for, say,
+// /internal/enforcement/adrprotects_test.go make the whole completeness suite
+// editable with no code-owner review while CheckCodeowners still passed,
+// because that path would never be evaluated (codex adversarial-review [high]
+// on PR #74).
+//
+// Files are registered INDIVIDUALLY rather than relying on the
+// /internal/enforcement/ directory rule alone: GitHub resolves ownership by
+// last-match-wins, so a later, narrower ownerless entry can strip exactly one
+// file while the directory rule still looks protective.
+func TestSacredRequiredPaths_CoversEveryEnforcementGoFile(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	registered := map[string]bool{}
+	for _, p := range sacredRequiredPaths {
+		registered[p] = true
+	}
+
+	var found int
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") {
+			continue
+		}
+		found++
+		path := "internal/enforcement/" + name
+		if !registered[path] {
+			t.Errorf("%s가 sacredRequiredPaths에 미등재 — 검사기 자신의 파일이 무보호면 presence-check 전체가 공동화된다(이 패키지는 테스트가 곧 강제 로직이다). 같은 PR에서 등재하라", path)
+		}
+	}
+	if found == 0 {
+		t.Fatal("enforcement .go 파일을 하나도 찾지 못함 — 경로 해석 오류로 보임")
+	}
+}
+
+// TestCheckCodeowners_EnforcementFileCarveOutCaught is the fail-closed
+// regression for that self-registration: a later, narrower ownerless entry that
+// strips protection from exactly one enforcement source file must be caught.
+// Without it, a loop could silently take ownership of the very code that
+// decides whether the sacred paths are protected — weaken CheckCodeowners or
+// delete an entry from sacredRequiredPaths with no code-owner review.
+func TestCheckCodeowners_EnforcementFileCarveOutCaught(t *testing.T) {
+	content := `/.github/workflows/ @chnu-kim
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+/docs/adr/0011-*.md @chnu-kim
+/docs/adr/0012-*.md @chnu-kim
+/docs/adr/0013-*.md @chnu-kim
+/docs/adr/0014-*.md @chnu-kim
+/docs/adr/0015-*.md @chnu-kim
+/docs/runbooks/phase-b-entry.md @chnu-kim
+/scripts/ @chnu-kim
+/internal/gate/ @chnu-kim
+/cmd/verdict-gate/ @chnu-kim
+/configs/gate/ @chnu-kim
+/internal/enforcement/ @chnu-kim
+/internal/enforcement/adrprotects.go
+/.github/CODEOWNERS @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if got.Satisfied {
+		t.Fatal("enforcement 파일 하나만 벗겨내는 후행 ownerless 항목이 통과해선 안 된다 — 디렉터리 규칙이 여전히 보호처럼 보여도 last-match-wins로 그 파일은 무보호다")
+	}
+	if !strings.Contains(got.Reason, "adrprotects.go") {
+		t.Fatalf("실패 사유가 벗겨진 파일을 지목하지 않음: %q", got.Reason)
 	}
 }
 
@@ -567,6 +563,7 @@ func TestCheckCodeowners_PRCreationWorkflowCarveOutCaught(t *testing.T) {
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
 /.claude/skills/opensource-maintainer/ @chnu-kim
+/internal/enforcement/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
@@ -634,6 +631,7 @@ internal/gate/** @chnu-kim
 cmd/verdict-gate/** @chnu-kim
 configs/gate/** @chnu-kim
 .claude/skills/opensource-maintainer/** @chnu-kim
+internal/enforcement/** @chnu-kim
 .github/CODEOWNERS @chnu-kim
 `
 	got := CheckCodeowners(content)
