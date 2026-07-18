@@ -96,5 +96,13 @@
 # 여전히 GitHub branch protection + code-owner 리뷰(사람)가 수행한다(ADR-0009 point 4).
 /internal/enforcement/ @chnu-kim
 
+# 지시 표면(instruction surface) — 게이트가 *적용될지*를 좌우하는 상시-로드 정책과 워커 절차.
+# CLAUDE.md는 "게이트로 승격하면 sacred 등재" 규칙 자체를 담고, .claude/agents/는 codex 리뷰
+# 호출·ADR 충돌 처리·검증 게이트를 지시하는 실행 절차다. 무보호면 loop가 규칙이나 절차를 고쳐
+# 게이트를 *부르지 않게* 만들 수 있다 — 게이트 코드를 한 줄도 건드리지 않고 게이트를 끄는 경로다.
+# (이 누락을 codex 적대 리뷰가 PR #81에서 잡았다: 새 규칙이 자기 자신에게 적용되지 않았다.)
+/CLAUDE.md @chnu-kim
+/.claude/agents/ @chnu-kim
+
 # 이 파일 자신 (self-owned — 반드시 마지막 줄에 유지)
 /.github/CODEOWNERS @chnu-kim

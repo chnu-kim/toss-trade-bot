@@ -123,6 +123,15 @@ var sacredRequiredPaths = []string{
 	".claude/skills/opensource-maintainer/scripts/scan.sh",
 	".claude/skills/opensource-maintainer/scripts/scan_test.sh",
 	".claude/skills/opensource-maintainer/allowlist.txt",
+	// Instruction surfaces: the always-loaded policy (CLAUDE.md) and the worker's
+	// executable procedure (.claude/agents/) decide whether the gates get INVOKED
+	// at all — codex review invocation, ADR-conflict handling, verification gates,
+	// and the "promote to gate => register as sacred" rule itself all live there.
+	// Leaving them unprotected is a path to turning a gate off without touching a
+	// single line of gate code. Caught by codex adversarial review on PR #81: the
+	// new rule had not been applied to the files that carry it.
+	".claude/agents/go-tdd-implementer.md",
+	"CLAUDE.md",
 	// This package itself (#64). The checker that decides whether the sacred
 	// paths are protected was, until now, the one gate-defining component with
 	// no protection of its own: neither .github/CODEOWNERS nor this slice

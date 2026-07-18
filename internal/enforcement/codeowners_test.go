@@ -33,6 +33,8 @@ const validCodeowners = `# enforcement-integrity sacred invariant (ADR-0009) 의
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
 /.claude/skills/opensource-maintainer/ @chnu-kim
+/CLAUDE.md @chnu-kim
+/.claude/agents/ @chnu-kim
 /internal/enforcement/ @chnu-kim
 
 /.github/CODEOWNERS @chnu-kim
@@ -178,6 +180,41 @@ func TestCheckCodeowners_MissingNarrowingScriptFailsClosed(t *testing.T) {
 	}
 }
 
+func TestCheckCodeowners_MissingInstructionSurfacesFailsClosed(t *testing.T) {
+	// CLAUDE.md (always-loaded policy) and .claude/agents/ (the worker's executable
+	// procedure) decide whether the gates get INVOKED: codex review invocation, ADR
+	// conflict handling, verification gates, and the "promote to gate => register as
+	// sacred" rule itself. Leaving them unowned lets a loop PR turn a gate off
+	// without touching gate code. Caught by codex adversarial review on PR #81 —
+	// the new rule had not been applied to the files that carry it.
+	// Otherwise-VALID sample with only the two instruction-surface rules removed.
+	content := `/.github/workflows/ @chnu-kim
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+/docs/adr/0011-*.md @chnu-kim
+/docs/adr/0012-*.md @chnu-kim
+/docs/adr/0013-*.md @chnu-kim
+/docs/adr/0014-*.md @chnu-kim
+/docs/adr/0015-*.md @chnu-kim
+/docs/runbooks/phase-b-entry.md @chnu-kim
+/scripts/ @chnu-kim
+/.claude/skills/opensource-maintainer/ @chnu-kim
+/.github/workflows/verdict-gate.yml @chnu-kim
+/internal/gate/ @chnu-kim
+/cmd/verdict-gate/ @chnu-kim
+/configs/gate/ @chnu-kim
+/internal/enforcement/ @chnu-kim
+/.github/CODEOWNERS @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if got.Satisfied {
+		t.Fatal("missing sacred paths (CLAUDE.md, .claude/agents/) must not satisfy the check")
+	}
+}
+
 func TestCheckCodeowners_MissingSacredPath(t *testing.T) {
 	// docs/adr/0009-*.md line removed entirely.
 	content := `/.github/workflows/ @chnu-kim
@@ -248,6 +285,8 @@ func TestCheckCodeowners_CommentsAndBlankLinesIgnored(t *testing.T) {
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
 /.claude/skills/opensource-maintainer/ @chnu-kim
+/CLAUDE.md @chnu-kim
+/.claude/agents/ @chnu-kim
 /internal/enforcement/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
@@ -344,6 +383,8 @@ func TestCheckCodeowners_LaterEntryWithSameOwnerStillSatisfies(t *testing.T) {
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
 /.claude/skills/opensource-maintainer/ @chnu-kim
+/CLAUDE.md @chnu-kim
+/.claude/agents/ @chnu-kim
 /internal/enforcement/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 /.github/workflows/ci.yml @chnu-kim
@@ -408,6 +449,8 @@ func TestCheckCodeowners_GateArtifactOwnerStripped(t *testing.T) {
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
 /.claude/skills/opensource-maintainer/ @chnu-kim
+/CLAUDE.md @chnu-kim
+/.claude/agents/ @chnu-kim
 /internal/enforcement/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
@@ -444,6 +487,8 @@ func TestCheckCodeowners_NarrowerCarveOutOnOneGateFileNotCaught(t *testing.T) {
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
 /.claude/skills/opensource-maintainer/ @chnu-kim
+/CLAUDE.md @chnu-kim
+/.claude/agents/ @chnu-kim
 /internal/enforcement/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
@@ -563,6 +608,8 @@ func TestCheckCodeowners_PRCreationWorkflowCarveOutCaught(t *testing.T) {
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
 /.claude/skills/opensource-maintainer/ @chnu-kim
+/CLAUDE.md @chnu-kim
+/.claude/agents/ @chnu-kim
 /internal/enforcement/ @chnu-kim
 /.github/CODEOWNERS @chnu-kim
 `
@@ -631,6 +678,8 @@ internal/gate/** @chnu-kim
 cmd/verdict-gate/** @chnu-kim
 configs/gate/** @chnu-kim
 .claude/skills/opensource-maintainer/** @chnu-kim
+CLAUDE.md @chnu-kim
+.claude/agents/** @chnu-kim
 internal/enforcement/** @chnu-kim
 .github/CODEOWNERS @chnu-kim
 `
