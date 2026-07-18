@@ -11,9 +11,27 @@
 //     or closed). This is the primary post-submission truth source
 //     (ADR-0002/0003); the primary key is orderId, not clientOrderId.
 //
+// On top of the wrapper, submit.go implements the intent submit path (#34): a
+// fail-closed, idempotent, 2-marker write-ahead sequence that turns a strategy
+// Intent into at most one real POST.
+//
+//   - Submitter.SubmitIntent — the sequence: idempotent replay guard → kill-switch
+//     CanSubmit (before prepared) → prepared (durable) + audit → TOCTOU Reconfirm
+//     (before submit-attempted) → submit-attempted (durable) + audit → exactly one
+//     POST → acked+orderId (durable) + audit, or leave unresolved and wake the
+//     reconciler. Each marker is its own durable commit (ADR-0005 point 3); a
+//     fail-closed audit write trips the global kill-switch (ADR-0006 point 6).
+//   - DeriveClientOrderID — the deterministic intentId→clientOrderId map
+//     (ADR-0002 point 4), reproducible from the intentId alone.
+//
+// order does not resolve order-failures or report them to the kill-switch — an
+// ambiguous submit and an unresolved rejection are delegated to the reconciler
+// (#35), which owns the count-first ordering (ADR-0012 Decision 3). The submit
+// path's dependency seams are deliberately narrow so those couplings are
+// structurally impossible (submit.go).
+//
 // Out of scope here (separate consumers): order cancel/modify wrappers, the
-// submission sequence with its write-ahead journal and guards (#34), and the
-// reconciler that recovers order truth on restart (#35).
+// reconciler that recovers order truth on restart (#35), and main wiring (#36).
 //
 // Encoding rules that matter for correctness:
 //   - Monetary/quantity fields (price, quantity, orderAmount, and every
