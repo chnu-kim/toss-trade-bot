@@ -49,3 +49,32 @@ jobs:
       # modernc.org/sqlite는 순수 Go라 cgo/외부 C 컴파일러가 필요 없다.
       - name: Test (race)
         run: go test -race ./...
+
+      # 공급망: 코드가 실제 호출하는(도달 가능한) stdlib·의존성 취약점을 자동 감지한다.
+      # 무인 봇에선 malformed 입력에 대한 stdlib panic = 주문 루프 정지이므로, go.mod의
+      # toolchain floor가 패치되지 않아 도달 가능 취약점이 생기면 이 스텝이 non-zero로
+      # 게이트를 실패시킨다(govulncheck는 호출되는 취약점이 있을 때만 exit ≠ 0). 툴 버전은
+      # 재현성을 위해 태그로 핀 고정하고, stdlib 분석 버전은 go.mod의 toolchain을 따른다.
+      - name: govulncheck (reachable stdlib/deps)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+      # 커밋 전 시크릿 게이트(scan.sh)의 회귀 테스트를 CI에서도 강제한다. scan_test.sh는
+      # go test가 아닌 독립 셸 테스트라 CI에 명시 배선하지 않으면 게이트가 조용히
+      # false-green으로 퇴행(정규식 오수정 등)해도 CI가 초록으로 통과할 수 있다.
+      # (bash 3.2 fail-open 케이스는 runner의 bash가 4.4+라 자동 SKIP된다.)
+      - name: Secret-gate regression (scan.sh)
+        run: bash .claude/skills/opensource-maintainer/scripts/scan_test.sh
+
+      # 위 스텝은 "스캐너가 올바로 동작하는가"만 본다(격리 픽스처 레포 대상). 이 스텝은
+      # "이 PR의 실제 내용에 유출이 없는가"를 본다 — 서로 다른 보장이고 둘 다 필요하다.
+      # 이게 없으면 로컬 pre-commit을 우회한 PR이 시크릿을 넣어도 회귀 테스트만 통과하면
+      # CI가 초록이 된다(시크릿 게이트의 false-green).
+      # --content-only: 레포 내용 스캔은 전부 수행하고, 커밋 머신의 git config 점검만
+      # 건너뛴다(러너는 커밋 주체가 아니고 user.email이 없어 항상 실패하므로).
+      # 의도적 합성 픽스처는 allowlist 매니페스트(경로+리터럴 pin, CODEOWNERS 보호)로만
+      # 좁게 허용된다 — 소스 인라인 주석은 우회 수단으로 인정하지 않는다(그걸 인정하면
+      # PR이 진짜 자격증명 옆에 주석만 달아 이 게이트를 통과할 수 있다).
+      - name: Secret scan (repository contents)
+        run: bash .claude/skills/opensource-maintainer/scripts/scan.sh --all --content-only

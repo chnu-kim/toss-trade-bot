@@ -38,7 +38,7 @@ ADR-0011 Consequences 사람 액션 순서 그대로: **(3) → (1) → (2)**.
 사용 등으로 잠재 노출 이력이 있다고 간주한다 — **새로 생성한 key만 사용하고, 기존 key는 전부 revoke한다.**
 
 1. GitHub App(Mechanu) 설정 페이지 → "Generate a private key"로 **새 key**를 생성해 안전하게 보관한다
-   (레포 밖 — 1Password 등. 이 레포에 원문을 두지 않는다).
+   (레포 밖 — 시크릿 매니저 등. 이 레포에 원문을 두지 않는다).
 2. 같은 페이지에서 **기존에 생성돼 있던 private key를 전부 삭제(revoke)**한다.
 3. **teardown 실측(ADR-0011 실측 목록 12 — 완료 판정은 단언이 아니라 capability 실측)**: 삭제된
    구 key로 서명한 App JWT로 `GET /app`을 호출해 **401**이 반환되는지 확인한다.
