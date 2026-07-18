@@ -54,12 +54,17 @@ Phase B까지 durable하게 잔존한다.
   ref의 env secret 접근 거부 실측(ADR-0011 실측목록 3).
 - 실패경로: 401 아님(구 key 유효) → rotate 미완, 중단.
 
-### ④ main-무접촉 probe (payload 리허설)
-- 확인주체: 에이전트(준비) + 사람(임시 규칙)
-- 확인방법: 일회용 브랜치에 임시 규칙으로 flip payload 문법·권한 리허설. `probe/pr-creation-tamper-47`로
-  변조 정의 미실행 실측(main 정의만 실행). **단 count=0 code-owner/verdict 강제는 main-스코프라 probe로
-  검증 불가** — 그 최초 실검증은 flip 직후(④b).
-- 통과판정: payload 문법 유효 + 변조 마커 부재.
+### ④ main-무접촉 probe (pre-main 거동 실측 — ADR-0011 (4a)·목록 142.2)
+- 확인주체: 에이전트(준비) + 사람(임시 규칙·실측)
+- 확인방법: 일회용 **보호 브랜치**에 임시 규칙(count=0 + `require_code_owner_reviews=true` + "require a
+  pull request before merging")을 걸어 **main 변경 전에** (i) code owner 승인 없는 머지가 실제로
+  차단되는지, (ii) PR 없는 direct-push가 거부되는지를 **거동으로 실측**한다 — branch protection은
+  per-branch이므로 이 거동은 임시 브랜치에서 검증 가능하다(ADR-0011 (4a)가 이를 hard precondition으로
+  요구). flip payload 문법·권한 리허설도 함께. `probe/pr-creation-tamper-47`로 변조 정의 미실행 실측
+  (main 정의만 실행). **verdict-gate required *context*의 PR-head-SHA 바인딩만** main/PR-특정이라
+  flip 직후(④b) 테스트 PR에서 확증한다.
+- 통과판정: count=0에서 code-owner 미승인 머지 차단 + direct-push 거부 실측 + payload 유효 + 변조 마커 부재.
+- 실패경로: main 불변경 · Phase A 잔류 · ADR amend.
 
 ### ⑤ red-team 인젝션 실측 (verdict leg별)
 - 확인주체: 에이전트
