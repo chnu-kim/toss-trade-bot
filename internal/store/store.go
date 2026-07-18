@@ -181,26 +181,44 @@ func validateDBPath(path string) error {
 // unattended upgrade keeps booting rather than refusing to start); if a file cannot
 // be normalized Open fails closed rather than proceeding with the wrong mode.
 func secureDBFile(path string) error {
-	f, err := os.OpenFile(path, os.O_CREATE, 0o600)
-	if err != nil {
-		return fmt.Errorf("store: pre-create %s: %w", path, err)
+	// Stat the main path FIRST — never open an existing entry for read before
+	// validating it. stat() does not block on a FIFO/socket the way open() does
+	// (so a misconfigured special path fails closed instead of hanging Open) and
+	// needs no read permission on the file itself (so an owner-unreadable 0o200/0o000
+	// DB is still reachable for the chmod repair below). Create the file only when
+	// it is genuinely absent.
+	switch info, err := os.Stat(path); {
+	case err == nil:
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("store: %s is not a regular file (mode %s); refusing to open", path, info.Mode())
+		}
+	case os.IsNotExist(err):
+		// O_EXCL so that if a special file races into existence between the stat and
+		// here, we get a fail-closed EEXIST rather than opening (and blocking on) it.
+		f, cerr := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if cerr != nil {
+			return fmt.Errorf("store: pre-create %s: %w", path, cerr)
+		}
+		if cerr := f.Close(); cerr != nil {
+			return fmt.Errorf("store: pre-create %s: %w", path, cerr)
+		}
+	default:
+		return fmt.Errorf("store: stat %s: %w", path, err)
 	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("store: pre-create %s: %w", path, err)
-	}
+
+	// Normalize the main file and any pre-existing -wal/-shm sidecars to EXACTLY
+	// 0o600 via chmod (which needs ownership, not read access). Non-regular entries
+	// are rejected before chmod so a directory/FIFO is never damaged; absent sidecars
+	// are skipped (SQLite creates the real one 0o600-inherited) — never created here,
+	// because an empty -wal/-shm invented before open would corrupt WAL recovery.
 	for _, p := range []string{path, path + "-wal", path + "-shm"} {
 		info, err := os.Stat(p)
 		if err != nil {
 			if os.IsNotExist(err) {
-				continue // absent sidecar: SQLite will create it 0o600-inherited
+				continue
 			}
 			return fmt.Errorf("store: stat %s: %w", p, err)
 		}
-		// Only ever chmod a regular file. If the path (or a sidecar path) is
-		// accidentally a directory or other non-regular entry, chmodding it to
-		// 0o600 would damage it (a 0o755 directory becomes non-traversable even for
-		// the owner), so fail closed BEFORE the repair rather than corrupting a
-		// misconfigured filesystem entry the store does not own.
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("store: %s is not a regular file (mode %s); refusing to open", p, info.Mode())
 		}

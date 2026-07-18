@@ -5,7 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // TestOpenCreatesOwnerOnlyFiles is the M-2 guard: the .db and its WAL/SHM
@@ -140,6 +142,57 @@ func TestSecureDBFileNormalizesOwnerBits(t *testing.T) {
 	}
 	if perm := info.Mode().Perm(); perm != 0o600 {
 		t.Errorf("owner-restricted file mode after secureDBFile = %#o, want 0o600 (normalize owner bits)", perm)
+	}
+}
+
+// TestSecureDBFileRepairsUnreadableFile guards that an existing DB file the owner
+// cannot read (mode 0o200/0o000 from a restrictive umask or a botched manual
+// repair) is still normalized to 0o600 — the owner can chmod their own file, so
+// Open must not refuse a file the hardening path claims to repair. This fails if
+// secureDBFile opens the file for read before chmodding.
+func TestSecureDBFileRepairsUnreadableFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "store.db")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := os.Chmod(path, 0o200); err != nil {
+		t.Fatalf("chmod 0o200: %v", err)
+	}
+
+	if err := secureDBFile(path); err != nil {
+		t.Fatalf("secureDBFile on 0o200 file: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("unreadable file mode after secureDBFile = %#o, want 0o600 (repair must not require read access)", perm)
+	}
+}
+
+// TestSecureDBFileRejectsFifoWithoutHanging guards that a FIFO (or other special
+// file) configured as the DB path fails closed rather than hanging: opening a FIFO
+// for read blocks until a writer appears, so secureDBFile must stat (which does not
+// block) and reject before any blocking open.
+func TestSecureDBFileRejectsFifoWithoutHanging(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "store.db")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Skipf("mkfifo unsupported: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- secureDBFile(path) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("secureDBFile on a FIFO returned nil, want error (fail closed)")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("secureDBFile on a FIFO hung (must stat-and-reject, not open-and-block)")
 	}
 }
 
