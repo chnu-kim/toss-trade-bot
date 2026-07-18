@@ -194,6 +194,14 @@ func secureDBFile(path string) error {
 			}
 			return fmt.Errorf("store: stat %s: %w", p, err)
 		}
+		// Only ever chmod a regular file. If the path (or a sidecar path) is
+		// accidentally a directory or other non-regular entry, chmodding it to
+		// 0o600 would damage it (a 0o755 directory becomes non-traversable even for
+		// the owner), so fail closed BEFORE the repair rather than corrupting a
+		// misconfigured filesystem entry the store does not own.
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("store: %s is not a regular file (mode %s); refusing to open", p, info.Mode())
+		}
 		if perm := info.Mode().Perm(); perm&0o077 != 0 {
 			if err := os.Chmod(p, 0o600); err != nil {
 				return fmt.Errorf("store: tighten permissions on %s (mode %#o is group/other-accessible): %w", p, perm, err)

@@ -116,6 +116,31 @@ func TestSecureDBFileTightensSidecars(t *testing.T) {
 	}
 }
 
+// TestOpenRejectsNonRegularPathWithoutDamage guards the permission-repair path
+// against collateral damage: if the configured DB path (or a sidecar path) is
+// accidentally a directory or other non-regular entry, Open must fail closed
+// WITHOUT chmodding it — chmod 0o600 on a 0o755 directory makes it non-traversable
+// even for the owner, damaging a filesystem entry outside the database-file case.
+func TestOpenRejectsNonRegularPathWithoutDamage(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "notafile")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	if _, err := Open(target); err == nil {
+		t.Fatal("Open on a directory path succeeded, want error")
+	}
+
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("stat target: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o755 {
+		t.Errorf("directory mode after failed Open = %#o, want unchanged 0o755 (repair must not damage non-regular entries)", perm)
+	}
+}
+
 // TestHaltWritersFailWhenSingletonRowMissing is the L-1 guard: if the halt
 // singleton (id=1) is absent, the UPDATE matches zero rows. The write must fail
 // closed (ErrHaltRowMissing) rather than return a false durable-ack — otherwise
