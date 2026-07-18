@@ -160,7 +160,7 @@ func Assemble(ctx context.Context, cfg config.Config, logger *slog.Logger) (app 
 		client:    client,
 		db:        db,
 		sentinel:  db,
-		quiesce:   client.WaitForRefreshFailureReports,
+		quiesce:   client.WaitForRefreshQuiescence,
 		sink:      sink,
 		guard:     guard,
 		rec:       rec,
@@ -240,14 +240,17 @@ func (a *App) Run(ctx context.Context) error {
 			"drain_timeout", a.cfg.ShutdownTimeout.String())
 	}
 
-	// Settle outstanding token-refresh escalations before judging the sentinel.
+	// Wait for token refresh to go quiescent before judging the sentinel: no
+	// issuance flight running and no failure report owed.
 	//
-	// sup.Wait is not sufficient here: token issuance runs on flights DETACHED
-	// from the supervisor, so a refresh that failed moments before shutdown may
-	// still owe its escalation. Certifying the run clean underneath it would be
-	// worse than crashing — a crash leaves the sentinel unclean (fail-closed),
-	// whereas a clean marker over a lost non-reconstructable failure lets the
-	// next boot come up unhalted with no evidence left to re-derive.
+	// sup.Wait is not sufficient here, because token issuance runs on flights
+	// DETACHED from the supervisor. A refresh that failed moments before
+	// shutdown may still owe its escalation, and one that is merely still IN
+	// FLIGHT has not failed yet — it could fail after the clean sentinel was
+	// written and the store closed. Certifying the run clean underneath either
+	// case would be worse than crashing: a crash leaves the sentinel unclean
+	// (fail-closed), whereas a clean marker over a lost non-reconstructable
+	// failure lets the next boot come up unhalted with no evidence to re-derive.
 	//
 	// The hook also stays registered throughout, so a report that lands while the
 	// store is still open is durably counted rather than dropped. Waiting makes
@@ -256,9 +259,9 @@ func (a *App) Run(ctx context.Context) error {
 	// and refuses the clean for.
 	qctx, qcancel := context.WithTimeout(context.WithoutCancel(ctx), tokenEscalationTimeout)
 	if err := a.quiesce(qctx); err != nil {
-		// Unsettled escalations mean this run cannot prove the failure was
-		// counted, so it is not a proven-normal exit.
-		a.logger.Warn("token refresh escalations did not settle before shutdown; the run will not be certified clean",
+		// Not quiescent within the budget: this run cannot prove a refresh
+		// failure was counted, so it is not a proven-normal exit.
+		a.logger.Warn("token refresh did not go quiescent before shutdown; the run will not be certified clean",
 			"err", err)
 		drained = false
 	}

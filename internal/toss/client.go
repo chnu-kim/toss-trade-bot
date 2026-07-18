@@ -161,7 +161,7 @@ func (c *Client) SetTokenRefreshFailureHook(fn func(occurredAt time.Time)) {
 	c.tokens.setRefreshFailureHook(fn)
 }
 
-// WaitForRefreshFailureReports blocks until every observed token-refresh failure
+// WaitForRefreshQuiescence blocks until every observed token-refresh failure
 // has finished being reported through the hook, or ctx expires.
 //
 // A graceful shutdown MUST call this before certifying the run clean. Token
@@ -176,8 +176,8 @@ func (c *Client) SetTokenRefreshFailureHook(fn func(occurredAt time.Time)) {
 //
 // It returns ctx.Err() if reports are still outstanding when ctx expires; the
 // caller should treat that as "not cleanly drained" rather than as success.
-func (c *Client) WaitForRefreshFailureReports(ctx context.Context) error {
-	return c.tokens.waitForFailureReports(ctx)
+func (c *Client) WaitForRefreshQuiescence(ctx context.Context) error {
+	return c.tokens.waitForRefreshQuiescence(ctx)
 }
 
 // Format, String and GoString use VALUE receivers on purpose: with pointer

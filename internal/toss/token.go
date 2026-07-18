@@ -190,8 +190,8 @@ func (m *tokenManager) releaseFailureReport() {
 	}
 }
 
-// waitForFailureReports blocks until no refresh-failure escalation is
-// outstanding, or ctx expires.
+// waitForRefreshQuiescence blocks until token refresh is quiescent — no
+// issuance flight running AND no failure report owed — or ctx expires.
 //
 // A graceful shutdown must call this BEFORE deciding the clean-shutdown
 // sentinel. Token flights are detached from any supervisor, so without it a run
@@ -200,18 +200,33 @@ func (m *tokenManager) releaseFailureReport() {
 // just closed), the failure would survive only as an in-memory latch in an
 // exiting process, leaving the next boot to trust a clean marker and come up
 // unhalted. A crash is SAFER than that, since it leaves the sentinel unclean.
-func (m *tokenManager) waitForFailureReports(ctx context.Context) error {
+//
+// BOTH conditions are required. Waiting only on owed reports would return
+// immediately for a refresh that is still in flight and has not failed YET; that
+// flight could then fail after the clean sentinel was written and the store
+// closed, which is the very outcome this wait exists to prevent.
+//
+// The two conditions can never both read idle while a failure is owed: the
+// flight clears m.inflight and claims its report inside the SAME critical
+// section, and it claims the report before closing fl.done. So a waiter woken by
+// fl.done always observes the claim.
+func (m *tokenManager) waitForRefreshQuiescence(ctx context.Context) error {
 	for {
 		m.mu.Lock()
-		if m.pendingFailureReports == 0 {
+		if m.pendingFailureReports == 0 && m.inflight == nil {
 			m.mu.Unlock()
 			return nil
 		}
-		idle := m.reportsIdle
+		// Wake on whichever is outstanding. A running flight is waited on first
+		// because its completion is what may CREATE an owed report.
+		wake := m.reportsIdle
+		if m.inflight != nil {
+			wake = m.inflight.done
+		}
 		m.mu.Unlock()
 
 		select {
-		case <-idle:
+		case <-wake:
 		case <-ctx.Done():
 			return ctx.Err()
 		}

@@ -221,20 +221,20 @@ func TestClient_SetTokenRefreshFailureHook_NilIsIgnored(t *testing.T) {
 // would have been SAFER (it leaves the sentinel unclean), which is what makes
 // this a real fail-open rather than an accepted residual.
 
-func TestWaitForFailureReports_ReturnsImmediatelyWhenIdle(t *testing.T) {
+func TestWaitForRefreshQuiescence_ReturnsImmediatelyWhenIdle(t *testing.T) {
 	m := newTokenManager(func(ctx context.Context) (string, time.Duration, error) {
 		return "tok", time.Hour, nil
 	})
-	if err := m.waitForFailureReports(context.Background()); err != nil {
+	if err := m.waitForRefreshQuiescence(context.Background()); err != nil {
 		t.Fatalf("idle wait: %v", err)
 	}
 }
 
-// TestWaitForFailureReports_BlocksUntilTheHookCompletes is the core assertion:
+// TestWaitForRefreshQuiescence_BlocksUntilTheHookCompletes is the core assertion:
 // the outstanding-report count must rise BEFORE the flight's waiters are
 // released, so a shutdown that starts the instant a caller returns still sees
 // the pending report.
-func TestWaitForFailureReports_BlocksUntilTheHookCompletes(t *testing.T) {
+func TestWaitForRefreshQuiescence_BlocksUntilTheHookCompletes(t *testing.T) {
 	release := make(chan struct{})
 	entered := make(chan struct{})
 	m := newTokenManager(func(ctx context.Context) (string, time.Duration, error) {
@@ -253,7 +253,7 @@ func TestWaitForFailureReports_BlocksUntilTheHookCompletes(t *testing.T) {
 	<-entered
 
 	waited := make(chan error, 1)
-	go func() { waited <- m.waitForFailureReports(context.Background()) }()
+	go func() { waited <- m.waitForRefreshQuiescence(context.Background()) }()
 
 	select {
 	case <-waited:
@@ -275,11 +275,11 @@ func TestWaitForFailureReports_BlocksUntilTheHookCompletes(t *testing.T) {
 	}
 }
 
-// TestWaitForFailureReports_CountsRiseBeforeWaitersAreReleased closes the race
+// TestWaitForRefreshQuiescence_CountsRiseBeforeWaitersAreReleased closes the race
 // the whole seam exists for: if the count rose only inside the notify goroutine,
 // a shutdown starting right after get() returned could observe zero pending
 // reports and certify clean anyway.
-func TestWaitForFailureReports_CountsRiseBeforeWaitersAreReleased(t *testing.T) {
+func TestWaitForRefreshQuiescence_CountsRiseBeforeWaitersAreReleased(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
 	m := newTokenManager(func(ctx context.Context) (string, time.Duration, error) {
@@ -294,12 +294,12 @@ func TestWaitForFailureReports_CountsRiseBeforeWaitersAreReleased(t *testing.T) 
 
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
-	if err := m.waitForFailureReports(ctx); err == nil {
+	if err := m.waitForRefreshQuiescence(ctx); err == nil {
 		t.Fatal("wait must not report quiescence while a report is outstanding")
 	}
 }
 
-func TestWaitForFailureReports_RespectsContext(t *testing.T) {
+func TestWaitForRefreshQuiescence_RespectsContext(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
 	m := newTokenManager(func(ctx context.Context) (string, time.Duration, error) {
@@ -312,14 +312,14 @@ func TestWaitForFailureReports_RespectsContext(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := m.waitForFailureReports(ctx); err == nil {
+	if err := m.waitForRefreshQuiescence(ctx); err == nil {
 		t.Fatal("wait must honour a cancelled context instead of blocking forever")
 	}
 }
 
-// TestWaitForFailureReports_ClearsAfterAPanickingHook keeps a panicking hook
+// TestWaitForRefreshQuiescence_ClearsAfterAPanickingHook keeps a panicking hook
 // from wedging every future shutdown on a report that will never complete.
-func TestWaitForFailureReports_ClearsAfterAPanickingHook(t *testing.T) {
+func TestWaitForRefreshQuiescence_ClearsAfterAPanickingHook(t *testing.T) {
 	m := newTokenManager(func(ctx context.Context) (string, time.Duration, error) {
 		return "", 0, errors.New("toss: token issuance failed (500)")
 	})
@@ -330,17 +330,96 @@ func TestWaitForFailureReports_ClearsAfterAPanickingHook(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := m.waitForFailureReports(ctx); err != nil {
+	if err := m.waitForRefreshQuiescence(ctx); err != nil {
 		t.Fatalf("a panicking hook must still release the outstanding report: %v", err)
 	}
 }
 
-func TestClient_WaitForRefreshFailureReports(t *testing.T) {
+func TestClient_WaitForRefreshQuiescence(t *testing.T) {
 	c, err := NewClient("https://openapi.tossinvest.com", "id", "secret")
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	if err := c.WaitForRefreshFailureReports(context.Background()); err != nil {
+	if err := c.WaitForRefreshQuiescence(context.Background()); err != nil {
 		t.Fatalf("idle wait: %v", err)
+	}
+}
+
+// TestWaitForRefreshQuiescence_WaitsForAnInFlightRefresh closes the last gap in
+// the shutdown race: a refresh that is still IN FLIGHT has not failed yet, so no
+// report is outstanding and a count-only wait would return immediately. The
+// flight can then fail after the clean sentinel was written and the store
+// closed, losing the non-reconstructable failure exactly as if we had never
+// waited. Quiescence therefore means "no flight running AND no report owed".
+func TestWaitForRefreshQuiescence_WaitsForAnInFlightRefresh(t *testing.T) {
+	release := make(chan struct{})
+	issuing := make(chan struct{})
+	var once sync.Once
+	reported := make(chan struct{})
+
+	m := newTokenManager(func(ctx context.Context) (string, time.Duration, error) {
+		once.Do(func() { close(issuing) })
+		<-release // the refresh is slow: still in flight when shutdown begins
+		return "", 0, errors.New("toss: token issuance failed (500)")
+	})
+	m.setRefreshFailureHook(func(at time.Time) { close(reported) })
+
+	go func() { _, _ = m.get(context.Background()) }()
+	<-issuing // a flight is running and has NOT failed yet
+
+	quiesced := make(chan error, 1)
+	go func() { quiesced <- m.waitForRefreshQuiescence(context.Background()) }()
+
+	select {
+	case <-quiesced:
+		t.Fatal("quiescence returned while a refresh was still in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case err := <-quiesced:
+		if err != nil {
+			t.Fatalf("quiescence: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("quiescence never returned after the flight completed")
+	}
+
+	// The failure report must already have run by the time quiescence returns —
+	// that is the whole guarantee the shutdown path relies on.
+	select {
+	case <-reported:
+	default:
+		t.Fatal("quiescence returned before the refresh failure was reported")
+	}
+}
+
+// TestWaitForRefreshQuiescence_ReturnsAfterASuccessfulFlight keeps the wait from
+// being a permanent block on healthy shutdowns.
+func TestWaitForRefreshQuiescence_ReturnsAfterASuccessfulFlight(t *testing.T) {
+	release := make(chan struct{})
+	issuing := make(chan struct{})
+	var once sync.Once
+	m := newTokenManager(func(ctx context.Context) (string, time.Duration, error) {
+		once.Do(func() { close(issuing) })
+		<-release
+		return "tok", time.Hour, nil
+	})
+
+	go func() { _, _ = m.get(context.Background()) }()
+	<-issuing
+
+	quiesced := make(chan error, 1)
+	go func() { quiesced <- m.waitForRefreshQuiescence(context.Background()) }()
+	close(release)
+
+	select {
+	case err := <-quiesced:
+		if err != nil {
+			t.Fatalf("quiescence after a successful refresh: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("quiescence never returned after a successful flight")
 	}
 }
