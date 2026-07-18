@@ -152,6 +152,21 @@ OUT=$(run_scan bash "$D" --all); RC=$?
 [ "$RC" -eq 0 ] && pass "값 자체가 placeholder면 제외 유지(exit 0)" || { fail "placeholder 값 과검출(exit=$RC)"; printf '%s\n' "$OUT"; }
 rm -rf "$D"
 
+echo "== 한 줄의 매치를 전부 평가한다 (앞 매치로 뒤의 실제 키를 숨길 수 없음) =="
+# 압축된 JSON/YAML은 한 줄에 여러 키/값이 온다. '첫 매치'나 '줄 전체'로 판정하면
+# 앞의 example/allowlist 매치 하나가 뒤의 진짜 자격증명을 통째로 가린다(false-green).
+D=$(make_repo \
+  '.claude/skills/opensource-maintainer/allowlist.txt|conf.json|AllowedFixtureValue1|합성 픽스처' \
+  'json1.json|{"client_secret":"example-placeholder-value","api_key":"RealLeakValue123456"}' \
+  'conf.json|{"client_secret":"AllowedFixtureValue1","api_key":"RealLeakValue987654"}')
+OUT=$(run_scan bash "$D" --all); RC=$?
+grep -q 'json1.json' <<<"$OUT" && pass "앞 매치가 placeholder여도 뒤의 실제 키 검출" \
+  || fail "첫 매치 placeholder가 줄 전체를 은닉(false-green)"
+grep -q 'conf.json' <<<"$OUT" && pass "앞 매치가 allowlist여도 뒤의 실제 키 검출" \
+  || fail "allowlist 매치가 줄 전체를 은닉(false-green)"
+[ "$RC" -eq 1 ] && pass "동일 줄 다중 매치 시 exit 1" || fail "exit=$RC (1 기대)"
+rm -rf "$D"
+
 echo "== 스캐너 디렉토리도 스캔한다 (회귀 스위트 1개 파일만 예외) =="
 # 디렉토리를 통째로 빼면 '보호는 되지만 검사되지 않는' 사각지대가 생겨, 거기 실제
 # 자격증명이 들어가도 CI가 초록으로 통과한다.
