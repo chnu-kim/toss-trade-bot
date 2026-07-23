@@ -43,6 +43,12 @@
 # [enforcement-integrity, live-execution-human-gate] — 게이트 활성화 절차·flip 트랜잭션을
 # 정의하므로 조용한 개정이 enforcement를 약화(ADR-0015).
 /docs/adr/0015-*.md @chnu-kim
+# 0016: Phase B 활성화 실행 순서·enforce_admins 목표값(=true)·W0(sacred 머지 불가 창)·
+# 이슈 #76 non-blocking 판정을 정의. 0017: flip payload 생성기(쓰기 능력 없는 순수 변환기)의
+# 타입·CLI·완결성 헌장. 둘 다 protects: [enforcement-integrity] — 게이트 활성화 계약을
+# 정의하므로 조용한 개정이 enforcement를 약화(ADR-0016/0017, ADR-0011·0015 amend).
+/docs/adr/0016-*.md @chnu-kim
+/docs/adr/0017-*.md @chnu-kim
 # Phase B 진입 절차서(#50) — narrowing 순서·flip-and-verify-or-rollback·부트스트랩 프리체크 등
 # 활성화의 *실행* 단계를 담은 gate-defining 문서. ADR-0015가 이를 지배 절차로 참조하므로,
 # 이 파일이 무보호면 loop가 App key 프로비저닝을 narrowing 앞으로 옮기거나 rollback을 빼는 식으로
