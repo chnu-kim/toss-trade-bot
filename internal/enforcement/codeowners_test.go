@@ -25,6 +25,8 @@ const validCodeowners = `# enforcement-integrity sacred invariant (ADR-0009) 의
 /docs/adr/0013-*.md @chnu-kim
 /docs/adr/0014-*.md @chnu-kim
 /docs/adr/0015-*.md @chnu-kim
+/docs/adr/0016-*.md @chnu-kim
+/docs/adr/0017-*.md @chnu-kim
 /docs/runbooks/phase-b-entry.md @chnu-kim
 /scripts/ @chnu-kim
 
@@ -320,6 +322,8 @@ func TestCheckCodeowners_CommentsAndBlankLinesIgnored(t *testing.T) {
 /docs/adr/0013-*.md @chnu-kim
 /docs/adr/0014-*.md @chnu-kim
 /docs/adr/0015-*.md @chnu-kim
+/docs/adr/0016-*.md @chnu-kim
+/docs/adr/0017-*.md @chnu-kim
 /docs/runbooks/phase-b-entry.md @chnu-kim
 /scripts/ @chnu-kim
 /internal/gate/ @chnu-kim
@@ -419,6 +423,8 @@ func TestCheckCodeowners_LaterEntryWithSameOwnerStillSatisfies(t *testing.T) {
 /docs/adr/0013-*.md @chnu-kim
 /docs/adr/0014-*.md @chnu-kim
 /docs/adr/0015-*.md @chnu-kim
+/docs/adr/0016-*.md @chnu-kim
+/docs/adr/0017-*.md @chnu-kim
 /docs/runbooks/phase-b-entry.md @chnu-kim
 /scripts/ @chnu-kim
 /internal/gate/ @chnu-kim
@@ -524,6 +530,8 @@ func TestCheckCodeowners_NarrowerCarveOutOnOneGateFileNotCaught(t *testing.T) {
 /docs/adr/0013-*.md @chnu-kim
 /docs/adr/0014-*.md @chnu-kim
 /docs/adr/0015-*.md @chnu-kim
+/docs/adr/0016-*.md @chnu-kim
+/docs/adr/0017-*.md @chnu-kim
 /docs/runbooks/phase-b-entry.md @chnu-kim
 /scripts/ @chnu-kim
 /internal/gate/ @chnu-kim
@@ -608,6 +616,8 @@ func TestCheckCodeowners_EnforcementFileCarveOutCaught(t *testing.T) {
 /docs/adr/0013-*.md @chnu-kim
 /docs/adr/0014-*.md @chnu-kim
 /docs/adr/0015-*.md @chnu-kim
+/docs/adr/0016-*.md @chnu-kim
+/docs/adr/0017-*.md @chnu-kim
 /docs/runbooks/phase-b-entry.md @chnu-kim
 /scripts/ @chnu-kim
 /internal/gate/ @chnu-kim
@@ -718,6 +728,8 @@ docs/adr/0012-*.md @chnu-kim
 docs/adr/0013-*.md @chnu-kim
 docs/adr/0014-*.md @chnu-kim
 docs/adr/0015-*.md @chnu-kim
+docs/adr/0016-*.md @chnu-kim
+docs/adr/0017-*.md @chnu-kim
 docs/runbooks/phase-b-entry.md @chnu-kim
 scripts/** @chnu-kim
 internal/gate/** @chnu-kim

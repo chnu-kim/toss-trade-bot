@@ -78,6 +78,13 @@ var sacredRequiredPaths = []string{
 	// amendment; a later, narrower CODEOWNERS entry stripping its protection would
 	// let the loop quietly rewrite the gate-activation contract. Same twin-artifact rule.
 	"docs/adr/0015-loop-pr-amendment-bootstrap-activation.md",
+	// ADR-0016/0017 declare protects: [enforcement-integrity] — 0016 pins the
+	// Phase B activation ordering (enforce_admins=true target + W0 sacred-merge
+	// window + #76 non-blocking disposition), 0017 the flip-payload pure-transformer
+	// charter. A later, narrower CODEOWNERS entry stripping either would let the loop
+	// quietly rewrite the gate-activation contract. Same twin-artifact rule as 0015.
+	"docs/adr/0016-phase-b-activation-ordering.md",
+	"docs/adr/0017-protection-flip-pure-transformer.md",
 	// The Phase B entry runbook (#50) holds the *executable* activation steps
 	// (credential narrowing order, App-key provisioning, flip-and-verify-or-
 	// rollback, bootstrap prechecks) that ADR-0015 governs by reference. Per

@@ -96,6 +96,8 @@ var sacredADRRegistry = []string{
 	"0013", // live-execution-human-gate — kill-switch mirror concurrency
 	"0014", // live-execution-human-gate — reconciler escalation / bounded re-count
 	"0015", // enforcement-integrity, live-execution-human-gate — Phase A/B activation
+	"0016", // enforcement-integrity — Phase B activation ordering / enforce_admins target / #76 disposition
+	"0017", // enforcement-integrity — protection-flip pure transformer charter
 }
 
 // adrFileNameRE matches the canonical ADR filename form (docs/adr/README.md and
