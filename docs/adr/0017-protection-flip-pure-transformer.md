@@ -12,9 +12,9 @@ verification:
   - reviewer: multi-agent adversarial workflow (5 렌즈: fail-open·fail-closed-direction·twin-artifact·operator-execution·self-consistency)
     date: 2026-07-24
     verdict: 5라운드 적대 하드닝. flip payload 생성기를 쓰기 능력 없는 순수 변환기로 확정 — GET/PUT 별개 타입으로 contexts[] 핀 강등을 표현 불가능하게(라이브 GET에서 contexts·checks 공존 실측), restrictions 부재↔PUT null 비대칭·enforce_admins bare bool·--branch 필수(probe·main 동일 경로)·롤백 payload 동시 산출·전체 동치 비교 검증·소스 레벨 무-쓰기 테스트. enforce_admins는 생성기가 결정하지 않고 assert만(verify-credential-narrowing.sh 연역).
-  - reviewer: codex (예정)
-    date: null
-    verdict: null
+  - reviewer: codex (review + adversarial-review, PR#82 2채널)
+    date: 2026-07-24
+    verdict: no material findings. PR#82 리뷰에서 지적된 P1 3건은 전부 ADR-0016(순서·착지 단계)에 대한 것이고 이 ADR 자신에는 discrete regression 없음. 2R 수렴 후 adversarial approve.
   - reviewer: chnu-kim (예정 — Accepted 승격·머지 게이트)
     date: null
     verdict: null

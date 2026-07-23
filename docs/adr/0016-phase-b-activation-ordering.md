@@ -12,9 +12,9 @@ verification:
   - reviewer: multi-agent adversarial workflow (5 렌즈: fail-open·fail-closed-direction·twin-artifact·operator-execution·self-consistency)
     date: 2026-07-24
     verdict: 5라운드 적대 하드닝(캠페인 전체 90건 반영, blocking 25). 실측 grounding — enforce_admins는 모순이 아니라 시제 분류 누락(ADR-0011:39 stale 스냅샷·:73 규범 미충족·ADR-0015:94 부트스트랩 창 관측·:82 오분류)로 판정, 목표값=true·Step 0.5 독립 액션·W0(sacred 머지 불가 창)로 확정. #76은 blocksPhaseB=false(ADR-0011:62 point 4(a) 비특권 잡 배제 + secret_scanning/push_protection 둘 다 disabled 실측). 근거: 라이브 GET protection·verify-credential-narrowing.sh:234(enforce_admins=false→INCONCLUSIVE→exit1).
-  - reviewer: codex (예정)
-    date: null
-    verdict: null
+  - reviewer: codex (review + adversarial-review, PR#82 2채널)
+    date: 2026-07-24
+    verdict: 1R P1 3건 → 반영 후 2R 수렴. (1) 순서 순환[GitHub 네이티브] — point 7(a) APPROVE_TARGET_PR base가 step-2 probe 브랜치를 지목(실행 시점 부재) → 런북 실제 구현(step-1 PROBE1)에 맞춤(ADR↔런북 서술 불일치였음). (2)(3) same-PR 배선 누락[CLI review+adversarial] — point 12·15·twin 표 배선이 이 PR에 없다 → "같은 PR"=승격 수행 PR임을 §E에 명시, 이 PR은 두 ADR 자신만 등재(승격 안 함), 무보호가 fail-open 안 되는 근거를 순서 상호배제로 book. 2R: adversarial approve(no material findings)·review clean(no discrete regression).
   - reviewer: chnu-kim (예정 — Accepted 승격·머지 게이트)
     date: null
     verdict: null
