@@ -1,6 +1,6 @@
 ---
 id: "0017"
-status: Proposed
+status: Accepted
 date: 2026-07-23
 deciders: [chnu-kim]
 domain: [loop-governance, ci, auth]
@@ -15,14 +15,14 @@ verification:
   - reviewer: codex (review + adversarial-review, PR#82 2채널)
     date: 2026-07-24
     verdict: no material findings. PR#82 리뷰에서 지적된 P1 3건은 전부 ADR-0016(순서·착지 단계)에 대한 것이고 이 ADR 자신에는 discrete regression 없음. 2R 수렴 후 adversarial approve.
-  - reviewer: chnu-kim (예정 — Accepted 승격·머지 게이트)
-    date: null
-    verdict: null
+  - reviewer: chnu-kim
+    date: 2026-07-24
+    verdict: approved (ADR-0009 point 1 위임 경로 — codex 2채널 no material findings 확인 후 대화로 Accepted 승격·머지 지시. 최종 확정은 PR #82 부트스트랩 --admin 머지). 생성기·CLI·테스트의 실제 구현은 이슈 03(ADR-0017 지배)로.
 ---
 
 # ADR-0017: Phase B flip payload 생성기는 쓰기 능력이 없는 순수 변환기다 — 엄격 파싱·단일 뮤테이터·롤백 동시 산출·브랜치 파라미터화, 그리고 phase 개념 없이 기계 생성 기대상태로 검증한다
 
-- **Status**: Proposed (적대 하드닝 전)
+- **Status**: Accepted (5라운드 멀티에이전트 적대 하드닝 + codex 2채널 수렴 · ADR-0009 point 1 위임 승인)
 - **Date**: 2026-07-23
 - **Deciders**: chnu-kim
 - **관련 이슈/PR**: ADR-0015 point 7(이 ADR이 amend — flip 트랜잭션의 미구현 residual을 해소), ADR-0016(이 ADR의 선행 결정 — `enforce_admins` 목표값·W0 순서), ADR-0011 point 5 (b)(app_id 핀 = check-위조 벡터의 봉쇄), `docs/runbooks/phase-b-entry.md:95-102`(런북이 스스로 건 fail-closed 게이트)

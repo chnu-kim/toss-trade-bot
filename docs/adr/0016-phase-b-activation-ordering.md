@@ -1,6 +1,6 @@
 ---
 id: "0016"
-status: Proposed
+status: Accepted
 date: 2026-07-23
 deciders: [chnu-kim]
 domain: [loop-governance, ci, auth]
@@ -15,14 +15,14 @@ verification:
   - reviewer: codex (review + adversarial-review, PR#82 2채널)
     date: 2026-07-24
     verdict: 1R P1 3건 → 반영 후 2R 수렴. (1) 순서 순환[GitHub 네이티브] — point 7(a) APPROVE_TARGET_PR base가 step-2 probe 브랜치를 지목(실행 시점 부재) → 런북 실제 구현(step-1 PROBE1)에 맞춤(ADR↔런북 서술 불일치였음). (2)(3) same-PR 배선 누락[CLI review+adversarial] — point 12·15·twin 표 배선이 이 PR에 없다 → "같은 PR"=승격 수행 PR임을 §E에 명시, 이 PR은 두 ADR 자신만 등재(승격 안 함), 무보호가 fail-open 안 되는 근거를 순서 상호배제로 book. 2R: adversarial approve(no material findings)·review clean(no discrete regression).
-  - reviewer: chnu-kim (예정 — Accepted 승격·머지 게이트)
-    date: null
-    verdict: null
+  - reviewer: chnu-kim
+    date: 2026-07-24
+    verdict: approved (ADR-0009 point 1 위임 경로 — codex 2채널 수렴·CI green 확인 후 대화로 Accepted 승격·머지 지시. 최종 확정은 PR #82 부트스트랩 --admin 머지). point 12·15·twin 표의 무보호 표면 배선은 이슈 01 구현 PR(blocksPhaseB=true)로 넘어가며 Phase B flip 전 hard precondition으로 유지한다.
 ---
 
 # ADR-0016: `enforce_admins=false`는 stale 기록이 아니라 의도된 부트스트랩 임시값이다 — narrowing 앞에서 true로 복원하고, 그 복원이 여는 "sacred 머지 불가 창(W0)"이 활성화 실행 순서를 지배한다. 이슈 #76은 Phase B blocking이 아니다
 
-- **Status**: Proposed (적대 하드닝 전 — ADR-0009/MEMORY `adr-hardening-before-accept`에 따라 Accepted 전 적대 수렴 필요)
+- **Status**: Accepted (5라운드 멀티에이전트 적대 하드닝 + codex 2채널 수렴 · ADR-0009 point 1 위임 승인)
 - **Date**: 2026-07-23
 - **Deciders**: chnu-kim
 - **관련 이슈/PR**: ADR-0011(지배 결정 — 이 ADR이 amend), ADR-0015(활성화 부트스트랩 — 이 ADR이 amend), ADR-0017(이 ADR이 확정한 flip 헌장의 메커니즘 구현), #76(CI 시크릿 게이트 신뢰 경계 — 이 ADR이 지위 판정), #46/#47/#50(전부 CLOSED — 증거 기록 위치 아님)
