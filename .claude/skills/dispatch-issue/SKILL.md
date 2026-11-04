@@ -1,226 +1,135 @@
 ---
 name: dispatch-issue
-description: GitHub 이슈 하나를 worktree 격리 + 서브에이전트 위임으로 끝까지(TDD→테스트→PR→자체리뷰) 처리하는 오케스트레이터. 사용자가 "이슈 N 착수", "이슈 N 디스패치", "/dispatch-issue N", "이슈 N 작업 시작", "이거 에이전트한테 맡겨" 같이 특정 이슈를 자율 구현 흐름으로 넘기고 싶다는 신호를 줄 때 반드시 사용한다. 메인 에이전트는 얇게 유지하고 구현은 서브에이전트에 위임하는 것이 이 스킬의 핵심이다.
+description: GitHub 이슈 1개를 worktree 격리 + go-tdd-implementer 위임으로 PR까지 처리하는 오케스트레이터. 리뷰는 사다리(REVIEWER), 머지는 사람. 사용자가 "/dispatch-issue N", "이슈 N 디스패치"처럼 특정 이슈를 자율 구현 흐름으로 넘기려 할 때 사용한다.
 ---
 
 # dispatch-issue
 
-이슈 1개를 **사람 게이트 2곳(이슈 검수 → PR 검수·머지)** 사이에서 자율 처리한다.
-메인 에이전트는 **오케스트레이션만** 하고, 실제 구현(TDD→테스트→PR)은 **단일 서브에이전트**에 위임한다.
-**머지는 절대 자동화하지 않는다 — 최종 책임은 사용자에게 있다.**
+이슈 1개를 **사람 게이트 2곳(이슈 검수 → PR 검수·머지)** 사이에서 자율 처리한다. 메인은 **오케스트레이션만** 하고 구현은 이슈당 워커 1개(`subagent_type: go-tdd-implementer`)에 위임한다. **머지는 절대 자동화하지 않는다 — 최종 책임은 사용자에게 있다.**
+인자: 이슈 번호 `N`. 정리 모드: `/dispatch-issue --cleanup N`.
+이 디렉터리에 다른 파일을 추가하지 않는다 — `.claude/` 트리 전수 테스트가 등재 전까지 Red다(CLAUDE.md "게이트 승격 규칙").
 
-인자: 이슈 번호 `N` (예: `/dispatch-issue 1`). 정리 모드: `/dispatch-issue --cleanup N`.
+## 0. 환경·경로 결정 (런타임 도출 — 하드코딩 금지)
 
----
-
-## 0. 환경 도출 (하드코딩 금지 — 런타임에 구한다)
-
-이 레포는 언제든 public 전환 가능하므로 절대 경로·계정명을 이 문서에 박지 않는다. 항상 아래로 도출한다:
+**(a) SLUG** — 이 블록이 정본이다(issue-drafter는 여기를 가리킨다). 모든 `gh` 호출에 `--repo "$SLUG"`.
 
 ```bash
 REPO=$(git rev-parse --show-toplevel)
-url=$(git -C "$REPO" remote get-url origin); url=${url%.git}
-norm=${url//:/\/}                       # scp-style 'git@host:owner/repo'의 ':'를 '/'로 정규화
-repo=${norm##*/}; rest=${norm%/*}; owner=${rest##*/}
-SLUG="$owner/$repo"                       # owner/repo — https·ssh://·scp 모든 remote 형식 대응
+url=$(git -C "$REPO" remote get-url origin); url=${url%.git}; norm=${url//:/\/}   # scp-style ':' → '/'
+repo=${norm##*/}; rest=${norm%/*}; owner=${rest##*/}; SLUG="$owner/$repo"
 ```
 
-> ⚠️ `dirname`/`basename`이나 BSD sed(lazy 미지원)로 파싱하면 scp-style URL에서 깨진다. 위 정규화 방식을 쓸 것.
+**(b) HARNESS_ENV / GH_WRITE** — `CLAUDE_CODE_REMOTE`가 `true`면 `cloud`(GraphQL 불가 → 읽기는 `gh api` REST, `GH_WRITE`=`mcp__github__*`), 아니면 `local`(`GH_WRITE`=`gh`; 계정 선택은 프로파일 표 'GitHub 쓰기' 행 — `gh api "repos/$SLUG"`가 성공하는 계정을 `GH_ACCOUNT`로 워커에 넘긴다). 나머지 분기는 CLAUDE.md "모델/런타임 프로파일" 표만 참조한다.
 
-모든 `gh` 호출에 `--repo "$SLUG"` 를 명시한다(기본 레포 미설정 + 잘못된 active 계정 fallback 방지).
+**(c) 자격증명** — 세션 것을 그대로 쓴다. 새로 구성·토큰 교체·push/서명 identity 전환·remote 변경 금지(`gh` 계정 선택은 (b)만), 거부되면 정지·보고(ADR-0011 p2·5②). `local`이면 세션의 `SSH_AUTH_SOCK`을 워커에 전달한다. 첫 push에 승인 프롬프트가 뜰 수 있다 — 무인을 가정하지 않는다.
 
-**계정 핀**: active gh 계정이 이 레포에 접근 못 할 수 있고(예: 기본 계정이 collaborator 아님),
-**active 계정은 명령 사이에 되돌아갈 수 있다.** 따라서 접근 가능한 계정을 한 번 알아낸 뒤, gh 작업(특히
-이슈 조회·`pr create`)은 **같은 셸 명령 안에서 `gh auth switch` 직후 곧바로 실행**한다:
+**(d) PR_PATH** — 기계적으로 정한다(presence-check c-1/c-2와 같은 증거): `gh api "repos/$SLUG/contents/.github/workflows/pr-creation.yml?ref=main"`이 존재 **AND** `gh api "repos/$SLUG/pulls?state=all&per_page=50"`에 `.user.login=="mechanu[bot]" and .base.ref=="main" and .head.repo.full_name==$SLUG`인 PR ≥1(c-1/c-2의 단순화 — 동일 레포·main 대상만 센다) → `dispatch`, 아니면 `human-bootstrap`(ADR-0015 p8). `human-bootstrap`인데 이슈 범위가 sacred 경로(`.github/CODEOWNERS`가 `@chnu-kim` 소유로 등재한 경로 = `internal/enforcement` `sacredRequiredPaths`)를 건드리면 디스패치 전에 self-approval 교착(ADR-0011 p6, PR #42/#44)을 사용자에게 알리고 확인받는다. 워커는 경로를 고르지 않는다.
 
-```bash
-if ! gh repo view "$SLUG" >/dev/null 2>&1; then
-  # gh auth status로 로그인된 계정들을 보고, 접근 가능한 계정으로 전환:
-  #   gh auth switch --user <그 계정> && gh repo view "$SLUG"  (검증)
-  # 끝까지 실패하면 정리하지 말고 사용자에게 보고.
-  gh auth status
-fi
-# 이후 모든 gh 호출 예시: gh auth switch --user <그 계정> >/dev/null && gh <cmd> --repo "$SLUG" ...
-```
+**(e) REVIEWER**(ADR-0008) — 세션 Skill 목록에 codex 리뷰 스킬이 있으면 `codex-pr-review`(워커가 `--wait --base origin/main`으로 실행, 유일한 독립 검증자); 없으면 `risk:low/high` → `claude-advisory`(§4), `risk:critical` → `none-report`(대체 금지, 사용자 보고).
 
-**loop PR 작성 identity(ADR-0011)**: 3단계 서브에이전트가 만드는 PR의 목표 작성자는 사람 계정이
-아니라 GitHub App(`mechanu[bot]`)이다 — 사람 검토자와 identity가 같으면 GitHub의 self-approval
-차단 때문에 사람 본인이 그 PR을 승인하지 못한다(#41/#42에서 실측). 흐름: 커밋·push는 그대로
-`chnu-kim`(identity 분할 — point 2), 이후 `gh pr create`를 직접 부르지 않고
-`POST /repos/{owner}/{repo}/dispatches`(`event_type: create-loop-pr`)로 트리거하면 main에 고정된
-`.github/workflows/pr-creation.yml`이 narrowing된 App 토큰으로 PR을 생성한다 — 구체적 CLI 사용법·
-`client_payload` 구성·PR 확인 폴링은 `.claude/agents/go-tdd-implementer.md`의 "완료 절차"에 있다.
-App private key는 main-제한 GitHub Actions environment(`loop-pr`) 시크릿에서만 읽히고, 이
-오케스트레이터·서브에이전트 세션에는 절대 존재하지 않는다(point 1 — 조회·발급 시도조차 금지).
-**사람이 직접 개입하는 PR**(`/architect` grilling 세션 산출물, 수동 hotfix 등 이 스킬 밖의 작업)은
-이 흐름과 무관하게 계속 사람 계정으로 만든다.
+**(f) W0** — 부트스트랩 창·W0(sacred 머지 불가 창)의 정의·순서는 CLAUDE.md "PR 생성 흐름"(ADR-0016 point 5·6) — W0 안에서는 sacred 경로 PR을 만들 수 없다.
 
-> ⚠️ **가동 전제**: 이 흐름은 `pr-creation.yml`이 main에 존재하고 + loop 자격증명 narrowing(ADR-0011
-> point 5 ②)이 완료되고 + `loop-pr` environment가 실키로 프로비저닝된 뒤에만 실제로 동작한다(절차:
-> `docs/runbooks/loop-pr-environment-provisioning.md`). 그 전(부트스트랩 구간 — 이 workflow 자체를
-> 도입하는 PR들이 여기 해당한다)에는 서브에이전트가 기존 `gh auth switch --user <사람 계정>` →
-> `gh pr create` 경로로 폴백한다(go-tdd-implementer.md에 명시).
+**(g) 절대 금지**: main/master 직접 작업, `gh issue develop`, 자동 머지, 주문/쓰기 경로 자동 재시도.
+App private key·installation token은 이 오케스트레이터·워커 세션에 절대 없다(ADR-0011 p1). PR 생성 payload·폴링 spec은 `.claude/agents/go-tdd-implementer.md` "완료 절차"가 정본이다.
 
-**절대 금지**: main/master 직접 작업, `gh issue develop`(권한 부족), 자동 머지, 주문/쓰기 경로 자동 재시도.
-**git 서명/인증**: repo-local 설정이 이미 잡혀 있다. 단, **CLI로 커밋·푸시하기 전 SSH agent 소켓이
-설정돼야** 서명·인증이 된다(메인이 환경/메모리에서 실제 `SSH_AUTH_SOCK`
-값을 구해 서브에이전트 프롬프트에 넣어 전달한다. 이 문서엔 개인 경로를 박지 않는다). 첫 push 때 승인
-프롬프트가 뜰 수 있다 — 사용자가 PR 단계에 함께 있을 때이므로 정상. 무인 가정하지 말 것.
+## 1. 전제 점검
 
----
+이슈 fetch: local `gh issue view N --repo "$SLUG" --json number,title,body,labels,state` / cloud `gh api "repos/$SLUG/issues/N"` 또는 `mcp__github__issue_read`. 판정:
 
-## 1. 전제 점검 (메인 에이전트)
+- state가 open이 아니면(대소문자 무시 — local `OPEN`, cloud REST `open`) → 중단, 보고.
+- `agent:blocked`·`agent:needs-decision` → **중단**. 무엇이 풀려야 하는지 본문에서 찾아 보고.
+- `agent:ready` 없음 → 중단, 사용자 확인.
+- `risk:critical` → **사용자 명시 확인 전 진행 금지**(실주문·자금이동·비가역은 사람 리뷰 필수). `risk:high`는 진행하되 PR 본문에 위험 요지를 적도록 워커에 지시.
+
+**지배 ADR**: 본문 `## 설계 근거`가 링크한 `docs/adr/NNNN-*.md` 전문을 확보해 §3 프롬프트에 첨부한다. frontmatter `status`가 `Accepted`가 아니면(Proposed/Superseded) **중단**하고 사용자에게 알린다 — 미승인·폐기된 결정을 근거로 구현하지 않는다.
 
 ```bash
-gh issue view N --repo "$SLUG" --json number,title,body,labels,state
-```
-
-이슈 본문·라벨을 읽고 **디스패치 가능 여부**를 판정한다:
-
-- `state != OPEN` → 중단, 사용자에게 보고.
-- 라벨에 `agent:blocked` 또는 `agent:needs-decision` → **중단**. "자율 디스패치 대상 아님(선행 의존/사람
-  결정 대기)"이라 알리고, 무엇이 풀려야 하는지 본문에서 찾아 보고.
-- 라벨에 `agent:ready` 없음 → 중단, 사용자 확인 요청.
-- 라벨에 `risk:critical` → **사용자 명시 확인 전까지 진행 금지**(실주문·자금이동·비가역은 사람 리뷰 필수).
-  `risk:high`면 진행하되 PR 본문에 위험 요지를 적도록 서브에이전트에 지시.
-
-**지배 ADR 읽기**: 이슈 본문의 `## 설계 근거`에 `ADR-NNNN` / `docs/adr/NNNN-*.md` 링크가 있으면 해당 파일을
-`cat`해 전문을 확보한다. 이 결정의 *근거와 버린 대안*을 서브에이전트가 모르면 구현 중 결정을 모른 채 위반한다
-(이 파이프라인이 실제로 겪은 통증). 확보한 ADR 전문은 3단계 프롬프트에 첨부한다.
-**단, 링크된 ADR의 `Status`를 확인한다** — `Accepted`가 아니면(Proposed/Superseded) **중단하고 사용자에게 알린다**:
-미승인·폐기된 결정을 확정 근거로 구현하면 안 된다. 사용자가 그 ADR을 Accepted로 올리거나 이슈 링크를 고친 뒤 재개한다.
-
-작업 트리가 깨끗한지 확인하고 main을 최신화한다:
-
-```bash
-git -C "$REPO" status --porcelain   # 비어 있어야 함
+git -C "$REPO" status --porcelain                                    # 비어 있어야 함
 git -C "$REPO" checkout main && git -C "$REPO" pull --ff-only
 ```
 
-**서브에이전트 preflight** (worktree 만들기 *전* — stateful 셋업이 시작되면 늦다): 3단계는
-`subagent_type: go-tdd-implementer`에 전적으로 의존하고, 프롬프트엔 변수만 담겨 규칙이 없다. 따라서 **이
-에이전트가 사용 가능한지 먼저 확인한다** — `Agent` 툴의 "Available agent types" 목록(시스템 리마인더)에
-`go-tdd-implementer`가 있어야 한다. 없으면(`.claude/agents/go-tdd-implementer.md` 미로드·이름 변경·해당 런타임이
-프로젝트 에이전트 미지원 등) **worktree를 만들기 전에 중단**하고 사용자에게 알린다(예: "go-tdd-implementer
-에이전트가 로드되지 않았다 — .claude/agents/ 확인 필요"). **절대 general-purpose로 폴백하지 마라** — 지금
-프롬프트엔 TDD·검증 게이트·PR·리뷰 루프 규칙이 빠져 있어, 규칙 없는 일반 에이전트가 구현을 시도하면 무인 안전
-계약이 통째로 사라진다(조용한 성능 저하가 하드 실패보다 나쁘다).
+**preflight**: `Agent` 툴에 `subagent_type: go-tdd-implementer`가 없으면 worktree 생성 **전**에 중단하고 보고한다. `general-purpose` 대체 절대 금지 — 규칙 없는 에이전트 = 무인 안전 계약 소실.
 
----
+## 2. 브랜치 + worktree
 
-## 2. 브랜치 + worktree 격리 (메인 에이전트)
-
-이슈 제목에서 ascii kebab slug를 만든다 (예: "internal/toss: OAuth2 토큰 매니저" → `oauth2-token-manager`).
-CLAUDE.md의 worktree 댄스를 그대로 따른다(`gh issue develop` 금지):
+`BR="<N>-<slug>"`(slug: 제목의 ascii 영숫자 토큰을 소문자 kebab으로, 없으면 `issue`; §6은 `<N>-` 접두로 복원한다). `WT`는 레포 밖 sibling — go 모듈 오염 방지. local·cloud 동일(cloud 부모 디렉터리 쓰기 가능 실측). Agent `isolation` 옵션은 쓰지 않는다(경로·baseRef·정리 의미 실측 전; 메인이 WT를 알아야 정리·진단 보존). sibling 생성 불가면 중단·보고.
 
 ```bash
-BR="<N>-<slug>"                                   # 예: 1-oauth2-token-manager
-WT="$(dirname "$REPO")/$(basename "$REPO")-worktrees/$BR"   # 레포 밖 sibling — go 모듈 오염 방지
-
-git -C "$REPO" checkout -b "$BR"
-git -C "$REPO" checkout main
-git -C "$REPO" worktree add "$WT" "$BR"
+WT="$(dirname "$REPO")/$(basename "$REPO")-worktrees/$BR"
+git -C "$REPO" checkout -b "$BR" && git -C "$REPO" checkout main && git -C "$REPO" worktree add "$WT" "$BR"
 ```
 
----
+## 3. 위임
 
-## 3. 구현 위임 (서브에이전트 — 위임은 여기가 전부)
+`Agent` 툴, `subagent_type: go-tdd-implementer`, `effort: high`(`risk:high`면 `xhigh`). 페르소나·TDD 규칙·검증 게이트·완료 절차·반환 명세는 에이전트 파일이 가진다 — 프롬프트에는 **변수 블록만** 넘긴다(규칙 이중 보유 금지; 규칙 수정은 에이전트 파일에서). Workflow 툴로 다중 이슈를 병렬 디스패치하지 않는다(프로파일).
 
-`Agent` 툴로 **단일 서브에이전트**를 띄우되 `subagent_type: go-tdd-implementer`로 지정한다
-(`.claude/agents/go-tdd-implementer.md`). 이 에이전트가 **TDD 규칙·검증 게이트·완료 절차·리뷰-수정 루프·반환값
-명세라는 워커 페르소나를 시스템 프롬프트로 이미 갖고 있다** — 메인은 그걸 프롬프트에 다시 쓰지 않고, **per-issue
-변수만** 넘긴다. `isolation` 옵션은 쓰지 않는다(우리가 만든 named worktree에서 작업해야 하므로).
-
-> 페르소나를 인라인으로 반복하지 않는 이유: 오케스트레이터 출력 토큰 절감 + 워커 툴 스키마 slim(에이전트가
-> `tools:`로 스코프됨) + 페르소나 drift 방지. 규칙을 고치려면 **여기가 아니라 에이전트 정의 파일을 고친다** —
-> 이 §3과 `go-tdd-implementer.md`가 규칙을 이중으로 들고 있으면 안 된다.
-
-아래 변수 블록만 채워 `prompt`로 전달한다(`{...}`를 실제 값으로 치환):
-
-> ```
-> 작업 디렉토리(WT): {WT}
-> 브랜치(BR): {BR}
-> 레포 슬러그(SLUG): {SLUG}
-> SSH_AUTH_SOCK: {메인이 환경/메모리에서 구한 SSH agent 소켓 경로}
-> gh 접근 가능 계정: {§0에서 검증한, 이 레포 접근 가능한 계정}
->
-> 이슈 #{N}: {title}
-> --- 이슈 본문 ---
-> {issue body 전문}
-> --- 지배 ADR (있으면 — 이 결정을 따르라, 위반 금지 / 없으면 "해당 없음") ---
-> {이슈가 링크한 docs/adr/*.md 전문}
-> ```
-
-서브에이전트가 `null` 반환/사망 시, 메인은 worktree를 **정리하지 말고**(진단 보존) 실패를 그대로 보고한다.
-
----
-
-## 4. 사람 게이트 2 + 보고 (메인 에이전트)
-
-머지 안내를 하기 **전에** 회고 증거를 먼저 handoff한다(4a) — 그래야 성공/실패를 알고 사용자 리포트(4b)에 그 상태를 함께 담아, 실패를 모른 채 머지시키지 않는다.
-
-### 4a. 회고 증거 durable handoff (§6 선행, 리포트보다 먼저)
-
-cleanup·회고는 **다른 세션에서 머지 후** 돌 수 있어 그때 서브에이전트 반환이 컨텍스트에 없다. 그래서 지금(반환이 손에 있을 때) 서브에이전트의 **마찰·판단·codex 대응**을 PR 코멘트로 persist한다 — 세션에 안 묶이고 PR에 붙는 유일한 durable 표면이다.
-
-> ⚠️ **게시 전 public-readiness 게이트(필수).** PR 코멘트는 durable GitHub 히스토리인데 **커밋-타임 `opensource-maintainer` 게이트를 우회**한다. 이 레포는 언제든 public 전환 가능하므로, 반환 필드를 raw로 덤프하지 말고 **큐레이션한 구조적 요약**으로 옮기며 시크릿·`/Users/…` 등 개인 경로·account/tool 식별자·env 값·raw 명령 출력/로그가 없는지 확인한다(opensource-maintainer와 같은 기준). **안전하게 못 쓰겠으면 게시하지 말고** handoff 상태를 `민감으로 skip`으로 둔다.
-
-**코멘트는 self-identifying해야 한다** — §6이 낡은/다른 코멘트를 evidence로 오인하지 않도록 헤더에 issue#·PR#·시각을 박는다. (PR 코멘트는 사람·자동화가 편집·추가할 수 있어 마커만 맞으면 옛 retry 코멘트를 소비할 위험. **solo private repo라 author 위조 방어는 과설계로 스코프 아웃**하고, staleness/중복만 막는다.)
-
-```bash
-# $FRICTION/$JUDGMENT/$CODEX 는 위 게이트를 통과한 public-safe 요약. TS=실행 시각(date -u +%FT%TZ).
-# §0 규칙: active gh 계정이 명령 사이 되돌아갈 수 있으므로 검증 계정으로 핀 후 같은 셸에서 게시.
-gh auth switch --user <§0 검증 계정> >/dev/null && \
-  gh pr comment <PR> --repo "$SLUG" --body "$(printf '## 회고 증거 (retro evidence) · issue #%s · PR #%s · %s\n- 마찰: %s\n- 판단/모호: %s\n- codex 대응: %s\n' "$N" "$PR" "$TS" "$FRICTION" "$JUDGMENT" "$CODEX")"
+```
+WT: {WT} / BR: {BR} / SLUG: {SLUG} / N: {N}
+HARNESS_ENV: {local|cloud} / GH_WRITE: {gh|mcp__github__*}
+PR_PATH: {dispatch|human-bootstrap} / REVIEWER: {codex-pr-review(워커가 --wait --base origin/main)|claude-advisory|none-report}
+SSH_AUTH_SOCK: {local만} / GH_ACCOUNT: {local만 — §0(b) 접근 가능 계정}
+이슈 #{N}: {title}
+--- 이슈 본문 --- {전문}
+--- 지배 ADR (따르라, 위반 금지 / 없으면 "해당 없음") --- {전문}
+--- FINDINGS (재디스패치 시에만) --- {§4 findings JSON — codex 또는 advisory}
 ```
 
-게시 후 코멘트가 검증 계정 author로 실제 붙었는지 확인한다. **handoff 상태**를 `게시·검증됨` / `민감 skip` / `실패` 중 하나로 확정한다. 실패면 persist된 척 계속하지 않는다(§6이 이 코멘트에 의존).
+워커가 `null` 반환·사망하면 worktree를 **정리하지 말고**(진단 보존) 실패를 그대로 보고한다.
 
-### 4b. 사용자 보고
+## 4. PR 확보 + 독립 리뷰 사다리
 
-- PR URL (← 사용자가 **검수하고 직접 머지**)
-- 테스트/검증 게이트 통과 현황
-- 서브에이전트가 보고한 판단·모호했던 점
-- **회고 handoff 상태**(4a): `게시·검증됨` / `민감 skip` / `실패` — skip·실패면 "cleanup 회고가 오케스트레이션 수준으로 한정됨"을 명시.
-- 안내: "검수 후 머지하면 `/dispatch-issue --cleanup {N}` 로 worktree·브랜치를 정리하겠습니다."
+워커 반환의 PR URL 또는 '미생성+사유'를 확인한다.
+
+- `PR_PATH=dispatch`인데 미생성(403/타임아웃) → 사용자에게 보고하고 중단. 임의로 `human-bootstrap`으로 전환하지 않는다.
+- `PR_PATH=human-bootstrap` → 오케스트레이터가 만든다: local `gh pr create --repo "$SLUG" --head "$BR" --title … --body-file …`(기본 브랜치 사용), cloud `mcp__github__create_pull_request`. 본문에 `Closes #N` + "부트스트랩 사람 계정 PR(ADR-0015 p8)"을 명시한다.
+
+`REVIEWER=codex-pr-review`: `dispatch`면 워커가 이미 수행했다(base `origin/main`, 대응은 반환의 "리뷰 대응"). `human-bootstrap`이면 PR 생성 직후 오케스트레이터가 Skill 툴로 `codex-pr-review`를 `--wait --base origin/main`으로 실행하고 findings는 FINDINGS로 §3 재디스패치(최대 3라운드, 진동·포크 판정은 아래와 동일).
+
+`REVIEWER=claude-advisory`(advisory, 오케스트레이터가 실행 — 워커는 서브에이전트를 띄울 수 없다): `Agent` 툴 `subagent_type: general-purpose`, `effort: xhigh`, 읽기 전용 적대 리뷰 1회. 프롬프트: "WT에서 `git fetch origin main && git diff origin/main...HEAD`만 읽고 파일을 바꾸지 말 것. 관점은 무인 안전·지배 ADR 준수. 주장마다 실행한 명령·관찰을 evidence로. 출력 첫 줄 `advisory (same-model)`, 이어서 JSON `findings[{severity,file,line,claim,evidence,governing_adr,repeat_of}]`". findings가 있으면 §3의 워커를 같은 WT/BR + FINDINGS로 재디스패치 → 재푸시 → 재리뷰, **최대 3라운드**. 같은 지적이 2라운드 연속이면 진동 → 보류·보고; 매 라운드 새 지적인데 전부 같은 표면이면 설계 포크 → 후속 이슈. same-model 리뷰는 ADR-0008 p2의 독립 검증자가 **아니다** — 보고에 advisory로 표기한다.
+
+`REVIEWER=none-report`: 리뷰 없이 "독립 리뷰 미수행 — 사람 리뷰 필수"로 보고한다.
+
+## 5. 핸드오프 + 보고
+
+### 5a. 회고 증거 PR 코멘트 (머지 안내보다 먼저)
+
+cleanup·회고는 다른 세션에서 돌 수 있으므로 워커 반환의 **마찰·판단·리뷰 대응**을 지금 PR 코멘트로 persist한다. PR 코멘트는 커밋-타임 `opensource-maintainer` 게이트를 우회하므로 raw 덤프 금지 — 같은 기준의 public-readiness 게이트를 통과한 큐레이션 요약만 쓴다(시크릿·개인 경로·account/tool 식별자·env 값·raw 로그 없음). 안전하게 못 쓰면 게시하지 말고 `민감 skip`.
+
+```
+## 회고 증거 (retro evidence) · issue #N · PR #P · <UTC>
+- 마찰: … / - 판단·모호: … / - 리뷰 대응: …
+```
+
+게시: local `gh pr comment P --repo "$SLUG" --body-file …` / cloud `mcp__github__add_issue_comment`. 게시 후 실제로 붙었는지 확인하고 handoff 상태를 `게시·검증됨` / `민감 skip` / `실패` 중 하나로 확정한다 — 실패를 성공처럼 계속하지 않는다(§7이 이 코멘트에 의존).
+
+### 5b. 사용자 보고
+
+- PR URL(사용자가 **검수하고 직접 머지**) / 검증 게이트 통과 현황 / 워커가 보고한 판단·모호점
+- 리뷰어 종류(`REVIEWER`)·advisory 여부·독립 리뷰 미수행 여부
+- handoff 상태(5a) — skip·실패면 "cleanup 회고가 오케스트레이션 수준으로 한정됨" 명시
+- 안내: "검수 후 머지하면 `/dispatch-issue --cleanup N`으로 worktree·브랜치를 정리하겠습니다."
 
 **메인은 절대 머지하지 않는다.**
 
----
+## 6. 정리 `--cleanup N`
 
-## 5. 정리 모드: `/dispatch-issue --cleanup N`
-
-사용자가 PR을 머지한 **후에만** 실행. 먼저 머지 확인:
+다른 세션일 수 있으므로 `N`에서 복원한다(REST — 양 환경):
 
 ```bash
-gh pr view <PR번호> --repo "$SLUG" --json state,mergedAt
+BR=$(git -C "$REPO" worktree list --porcelain | grep -oE "refs/heads/${N}-[^[:space:]]*" | head -1 | sed 's#refs/heads/##')
+WT="$(dirname "$REPO")/$(basename "$REPO")-worktrees/$BR"
+P=$(gh api "repos/$SLUG/pulls?head=${SLUG%%/*}:$BR&state=all" --jq '.[0].number')
 ```
 
-머지됐으면:
+머지 확인 **후에만**: local `gh pr view "$P" --repo "$SLUG" --json state,mergedAt` / cloud `gh api "repos/$SLUG/pulls/$P" --jq '{state,merged_at}'` 또는 `mcp__github__pull_request_read`.
 
 ```bash
 git -C "$REPO" worktree remove "$WT"
-git -C "$REPO" checkout main && git -C "$REPO" pull --ff-only
-git -C "$REPO" branch -d "$BR"
+git -C "$REPO" checkout main && git -C "$REPO" pull --ff-only && git -C "$REPO" branch -d "$BR"
 ```
 
-머지 안 됐으면 정리하지 말고 사용자에게 알린다.
-이 이슈가 선행이던 `agent:blocked` 이슈가 있으면 `agent:blocked`→`agent:ready` 라벨 전환을 제안한다.
+미머지면 정리하지 말고 보고한다. 이 이슈가 선행이던 `agent:blocked` 이슈가 있으면 `agent:ready` 전환을 제안한다. 이어서 §7.
 
-## 6. 회고 (정리 직후 — 작업이 진짜 닫히는 지점)
+## 7. 회고
 
-정리가 끝나면 이슈가 완전히 종결된 것이다 — 회고의 이상적 트리거다. `retro` 스킬을 돌려 이번 이슈에서 **재사용 가능한 학습을 실행 가능한 형태로 durable 표면에 남긴다**(없으면 self-skip).
-
-**증거는 컨텍스트가 아니라 PR 코멘트에서 fetch한다** — cleanup은 dispatch와 다른 세션일 수 있어 서브에이전트 반환이 컨텍스트에 없다. §4가 남긴 "회고 증거" 코멘트를 읽는다:
-
-```bash
-# §0 규칙대로 검증 계정 핀 후 같은 셸에서 fetch. gh pr view <PR>가 이미 이 PR로 스코프하지만,
-# PR 마커는 경계까지 매칭한다("PR #2"는 substring이라 "PR #21"에도 걸림 — 실증 확인. "PR #<PR> ·"로 경계).
-gh auth switch --user <§0 검증 계정> >/dev/null && \
-  gh pr view <PR> --repo "$SLUG" --json comments --jq \
-    '[.comments[] | select(.author.login=="<§0 검증 계정>" and (.body|startswith("## 회고 증거")) and (.body|contains("PR #<PR> ·")))] | sort_by(.createdAt) | last | .body // "NONE"'
-```
-
-`NONE`이면 증거 부재 — 오케스트레이션 수준으로만 회고하거나 skip한다(없는 걸 추측하지 않는다). 후보가 모순되게 여럿이면(예: 서로 다른 재실행 흔적) 최신을 쓰되 사용자에게 그 사실을 알려 확인받는다.
-
-이 코멘트의 **마찰·판단·codex 대응**이 회고 증거다. 너는 서브에이전트 transcript를 못 봤으므로 회고를 그 증거 + 오케스트레이션 수준으로 한정한다(retro §1의 서브에이전트 맹점). 코멘트가 없으면(구버전 PR 등) 증거 부재를 인정하고 오케스트레이션 수준으로만 회고하거나 skip한다 — 없는 걸 추측하지 않는다. 학습이 memory면 자율 기록, CLAUDE.md·ADR·스킬급이면 프리뷰 후 승인받는다.
+`retro` 스킬을 호출한다. 증거는 컨텍스트가 아니라 5a 코멘트에서 fetch한다(다른 세션일 수 있다): `gh api "repos/$SLUG/issues/P/comments"`(양 환경; cloud는 `mcp__github__pull_request_read`도 가능)에서 `## 회고 증거 (retro evidence)`로 시작하고 `PR #P ·`를 **경계까지** 매칭하는 최신 1건. 없으면(`NONE`) 오케스트레이션 수준으로만 회고하거나 skip한다 — 추측 금지(retro §1의 서브에이전트 맹점). 학습이 CLAUDE.md·ADR·스킬급이면 프리뷰 후 승인받는다(retro §5).

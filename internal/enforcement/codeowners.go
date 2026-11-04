@@ -93,6 +93,10 @@ var sacredRequiredPaths = []string{
 	// loop PR could reorder provisioning ahead of narrowing or drop rollback
 	// without tripping the code-owner gate that protects ADR-0015 itself.
 	"docs/runbooks/phase-b-entry.md",
+	// The loop-pr environment provisioning runbook is the sibling runbook that
+	// carries the narrowing-before-App-key order and the main-only deployment
+	// branch policy ADR-0016 point 12 requires protected alongside phase-b-entry.
+	"docs/runbooks/loop-pr-environment-provisioning.md",
 	// The credential-narrowing verifier is the capability-measurement path that
 	// decides hard precondition ② ("narrowing complete"). If a loop-controlled
 	// change can weaken it, the loop manufactures its own green for the check
@@ -136,7 +140,9 @@ var sacredRequiredPaths = []string{
 	// and the "promote to gate => register as sacred" rule itself all live there.
 	// Leaving them unprotected is a path to turning a gate off without touching a
 	// single line of gate code. Caught by codex adversarial review on PR #81: the
-	// new rule had not been applied to the files that carry it.
+	// new rule had not been applied to the files that carry it. Completeness is
+	// checked by instructionsurface_test.go walking the whole .claude/ tree and
+	// the whole docs/runbooks/ tree, so a new file there is Red until listed here.
 	".claude/agents/go-tdd-implementer.md",
 	"CLAUDE.md",
 	// Orchestration skills: protecting the worker leaf while leaving the procedure
@@ -148,6 +154,13 @@ var sacredRequiredPaths = []string{
 	// evidence?" (codex adversarial review on PR #81, R3 — same class, fifth instance.)
 	".claude/skills/dispatch-issue/SKILL.md",
 	".claude/skills/opensource-maintainer/SKILL.md",
+	// ADR-0016 point 15: the remaining three skills instruct gates too —
+	// architect holds the Accepted-promotion human gate and protects: twin wiring,
+	// issue-drafter the risk:critical human-review and Accepted-only rules, retro
+	// the human gate on durable repo writes (registered in harness Stage A).
+	".claude/skills/architect/SKILL.md",
+	".claude/skills/issue-drafter/SKILL.md",
+	".claude/skills/retro/SKILL.md",
 	// This package itself (#64). The checker that decides whether the sacred
 	// paths are protected was, until now, the one gate-defining component with
 	// no protection of its own: neither .github/CODEOWNERS nor this slice
@@ -194,6 +207,8 @@ var sacredRequiredPaths = []string{
 	"internal/enforcement/codeowners_test.go",
 	"internal/enforcement/doc.go",
 	"internal/enforcement/github_client.go",
+	// Harness contract drift detector: review base = origin/main, W0 literal present (replaces the worker's self-grep).
+	"internal/enforcement/harnesscontract_test.go",
 	"internal/enforcement/identity.go",
 	"internal/enforcement/identity_test.go",
 	"internal/enforcement/instructionsurface_test.go",
@@ -204,6 +219,8 @@ var sacredRequiredPaths = []string{
 	"internal/enforcement/repocontent.go",
 	"internal/enforcement/repocontent_test.go",
 	"internal/enforcement/result.go",
+	// sacred => risk:critical pairing + .claude/** carve-out guard (ADR-0016 point 15).
+	"internal/enforcement/riskclasspairing_test.go",
 	"internal/enforcement/workflowrevision.go",
 }
 

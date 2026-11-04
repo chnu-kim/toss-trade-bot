@@ -24,19 +24,20 @@
     "Refining this mapping (adding narrower carve-outs, moving a package from",
     "one class to the other) is expected as the codebase grows — it does not",
     "require an ADR amend, only the same CODEOWNERS-protected PR review every",
-    "change to this file already gets."
+    "change to this file already gets.",
+    "",
+    "ADR-0016 point 15 (d)/(e), point 12: every internal/enforcement sacredRequiredPaths entry must classify critical here (sacred => critical pairing, asserted fail-closed by internal/enforcement/riskclasspairing_test.go) — hence no .claude/** carve-out, and docs/runbooks/** re-asserts critical under docs/**."
   ],
   "rules": [
     { "pattern": "**", "class": "critical" },
 
     { "pattern": "docs/**", "class": "non-critical" },
     { "pattern": "docs/adr/**", "class": "critical" },
+    { "pattern": "docs/runbooks/**", "class": "critical" },
 
     { "pattern": "internal/market/**", "class": "non-critical" },
     { "pattern": "internal/account/**", "class": "non-critical" },
     { "pattern": "internal/strategy/**", "class": "non-critical" },
-
-    { "pattern": ".claude/**", "class": "non-critical" },
 
     { "pattern": "internal/order/**", "class": "critical" },
     { "pattern": "internal/toss/**", "class": "critical" },
