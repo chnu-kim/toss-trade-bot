@@ -207,6 +207,8 @@ var sacredRequiredPaths = []string{
 	"internal/enforcement/codeowners_test.go",
 	"internal/enforcement/doc.go",
 	"internal/enforcement/github_client.go",
+	// Harness contract drift detector: review base = origin/main, W0 literal present (replaces the worker's self-grep).
+	"internal/enforcement/harnesscontract_test.go",
 	"internal/enforcement/identity.go",
 	"internal/enforcement/identity_test.go",
 	"internal/enforcement/instructionsurface_test.go",

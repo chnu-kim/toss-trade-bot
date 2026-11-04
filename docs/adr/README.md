@@ -25,6 +25,7 @@
 - `domain` — 이슈 라벨의 `area:` 축과 어휘를 통일한다(killswitch/order/auth/persistence/loop-governance 등).
 - `protects` — 이 ADR이 지키는/건드리면 안 되는 sacred invariant id 배열(없으면 빈 배열). sacred invariant 목록과 그 강제 메커니즘은 ADR-0009 참조.
 - `supersedes` / `superseded_by` — 대체 관계.
+- `amends` — 결정을 바꾸지 않고 보완하는 선행 ADR id 배열(ADR-0015~0017 용례). 템플릿에는 없고 보완 ADR에만 추가하며, 보완되는 ADR의 해당 point에 amend 포인터 인용문을 같은 PR에서 넣는다.
 - `verification` — 독립 검증자 이력(누가/언제/verdict). N-of-2 게이트는 ADR-0008 참조.
 
 **본문(사람이 읽는 서사, 4칸)**:
@@ -40,10 +41,14 @@
 - 번호는 **순차 증가**, 재사용 금지. frontmatter의 `id`는 파일명의 네 자리와 정확히 일치해야 한다.
 - `Status`: `Proposed`(검토 중) → `Accepted`(사용자 승인) → `Superseded by ADR-NNNN`(대체됨). frontmatter `status`와 본문 헤더의 `Status`는 항상 동일해야 한다.
 - **수정하지 말고 대체한다.** 결정이 바뀌면 기존 ADR을 `Superseded`로 표시하고 새 ADR을 쓴다. 역사를 지우지 않는다.
-- ADR은 결정을 *기록*할 뿐 강제하지 않는다. 강제는 CLAUDE.md(원칙)·코드 리뷰, 그리고 ADR-0009/0010이 설계한 CODEOWNERS·branch protection(`protects`가 걸린 경로)이 맡는다. **단, 이 CODEOWNERS·branch protection 강제는 ADR-0009 point 8이 규정한 enforcement 계층(GitHub App 설치·branch protection 실제 적용)이 사람 손으로 완성돼야 비로소 발효된다 — 그 전까지는 이 문서 3칸이 설계일 뿐 아직 발효된 강제가 아니다.** enforcement 계층이 서 있는지 불확실하면 **이 레포의 기존 사람 게이트 체제(CLAUDE.md의 사람 PR 검수·머지)가 계속 유효하다**고 가정한다 — "설계돼 있음"을 "이미 강제되고 있음"으로 읽지 않는다(codex adversarial-review 지적: 이 README를 현재형으로 읽으면 미래의 loop나 검수자가 존재하지 않는 가드를 존재한다고 오인할 수 있다). **CI는 frontmatter 구조 정합성(스키마·`id` 중복·참조 무결성)만 검증하고, `status`/`protects` 값을 근거로 merge를 직접 막거나 허용하지 않는다** — 그 판단은 CI가 아니라 CODEOWNERS+branch protection의 몫이다(ADR-0009/0010, CI 자가검증은 loop가 우회 가능해 순환이라 기각됨).
+- ADR은 결정을 *기록*할 뿐 강제하지 않는다. 강제는 CLAUDE.md(원칙)·코드 리뷰, 그리고 ADR-0009/0010이 설계한 CODEOWNERS·branch protection(`protects`가 걸린 경로)이 맡는다. **단, 이 CODEOWNERS·branch protection 강제는 ADR-0009 point 8이 규정한 enforcement 계층(GitHub App 설치·branch protection 실제 적용)이 사람 손으로 완성돼야 비로소 발효된다 — 그 전까지는 이 문서 3칸이 설계일 뿐 아직 발효된 강제가 아니다.** enforcement 계층이 서 있는지 불확실하면 **이 레포의 기존 사람 게이트 체제(CLAUDE.md의 사람 PR 검수·머지)가 계속 유효하다**고 가정한다 — "설계돼 있음"을 "이미 강제되고 있음"으로 읽지 않는다(codex adversarial-review 지적: 이 README를 현재형으로 읽으면 미래의 loop나 검수자가 존재하지 않는 가드를 존재한다고 오인할 수 있다). **`ci.yml`에는 ADR frontmatter 검증 단계가 없다.** 기계 검사는 `go test ./internal/enforcement`뿐이다 — `adrprotects.go`가 모든 ADR의 frontmatter 파싱 가능성과 `protects:` 선언 ↔ `sacredRequiredPaths`·CODEOWNERS 등재 완결성을 검사하는 드리프트 검출기이지 enforcer가 아니며, `status`/`protects` 값을 근거로 merge를 막거나 허용하지 않는다 — 그 판단은 CODEOWNERS+branch protection의 몫이다(ADR-0009/0010, CI 자가검증은 loop가 우회 가능해 순환이라 기각됨; ADR-0010 Consequences의 frontmatter 검증 CI 잡은 미구현으로 남는다).
 
 ## 파이프라인과의 연결
 
-- 아키텍처 결정은 `/architect`(grilling → ADR) 단계에서 만든다.
-- `/issue-drafter`는 이슈를 분해할 때 각 이슈에 **지배 ADR을 링크**하고, 근거 ADR이 없는 아키텍처 포크를 만나면 멈춘다("`/architect` 먼저").
-- `/dispatch-issue`는 이슈가 링크한 ADR을 구현 서브에이전트에게 전달해, 에이전트가 결정을 모른 채 위반하지 않게 한다.
+고도표·사람 게이트의 정본은 CLAUDE.md "개발 파이프라인", sacred 경로 PR의 착지 경로는 CLAUDE.md "PR 생성 흐름"이다. 여기는 ADR이 각 단계에 어떻게 물리는지만 적는다.
+
+- `/architect`가 ADR을 만든다. 고-stakes ADR(비가역·자금·인증·무인 안전·enforcement)은 Accepted 전에 적대 검토를 수렴까지 돌리고, Accepted 승격은 사용자 승인으로만 한다.
+- `/issue-drafter`는 각 이슈에 **지배 Accepted ADR을 링크**하고, 근거 ADR이 없는 아키텍처 포크를 만나면 멈춘다("`/architect` 먼저"). Proposed·Superseded ADR은 지배 근거로 쓰지 않는다.
+- `/dispatch-issue`는 지배 ADR 전문을 구현 워커에 전달하고, frontmatter `status`가 `Accepted`가 아니면 중단한다 — 미승인·폐기된 결정을 근거로 구현하지 않는다.
+- `/retro`는 완료 게이트 뒤에 돈다. 학습이 결정의 why·버린 대안이면 ADR 또는 `/architect`로 라우팅한다.
+- sacred 배선 규칙은 CLAUDE.md "게이트 승격 규칙"·architect §4. 이 README.md와 `0000-template.md`는 CODEOWNERS 소유 경로다(`TestCodeowners_ADRSchemaDocsOwned`); `docs/runbooks/`는 sacred 디렉터리다(ADR-0016 point 12).
