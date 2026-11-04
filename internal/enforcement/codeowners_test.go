@@ -28,14 +28,20 @@ const validCodeowners = `# enforcement-integrity sacred invariant (ADR-0009) 의
 /docs/adr/0016-*.md @chnu-kim
 /docs/adr/0017-*.md @chnu-kim
 /docs/runbooks/phase-b-entry.md @chnu-kim
+/docs/runbooks/ @chnu-kim
 /scripts/ @chnu-kim
 
 /.github/workflows/verdict-gate.yml @chnu-kim
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
+/.claude/ @chnu-kim
 /.claude/skills/opensource-maintainer/ @chnu-kim
 /.claude/skills/dispatch-issue/ @chnu-kim
+/.claude/skills/ @chnu-kim
+/.claude/skills/architect/SKILL.md @chnu-kim
+/.claude/skills/issue-drafter/SKILL.md @chnu-kim
+/.claude/skills/retro/SKILL.md @chnu-kim
 /CLAUDE.md @chnu-kim
 /.claude/agents/ @chnu-kim
 /internal/enforcement/ @chnu-kim
@@ -325,12 +331,18 @@ func TestCheckCodeowners_CommentsAndBlankLinesIgnored(t *testing.T) {
 /docs/adr/0016-*.md @chnu-kim
 /docs/adr/0017-*.md @chnu-kim
 /docs/runbooks/phase-b-entry.md @chnu-kim
+/docs/runbooks/ @chnu-kim
 /scripts/ @chnu-kim
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
+/.claude/ @chnu-kim
 /.claude/skills/opensource-maintainer/ @chnu-kim
 /.claude/skills/dispatch-issue/ @chnu-kim
+/.claude/skills/ @chnu-kim
+/.claude/skills/architect/SKILL.md @chnu-kim
+/.claude/skills/issue-drafter/SKILL.md @chnu-kim
+/.claude/skills/retro/SKILL.md @chnu-kim
 /CLAUDE.md @chnu-kim
 /.claude/agents/ @chnu-kim
 /internal/enforcement/ @chnu-kim
@@ -426,12 +438,18 @@ func TestCheckCodeowners_LaterEntryWithSameOwnerStillSatisfies(t *testing.T) {
 /docs/adr/0016-*.md @chnu-kim
 /docs/adr/0017-*.md @chnu-kim
 /docs/runbooks/phase-b-entry.md @chnu-kim
+/docs/runbooks/ @chnu-kim
 /scripts/ @chnu-kim
 /internal/gate/ @chnu-kim
 /cmd/verdict-gate/ @chnu-kim
 /configs/gate/ @chnu-kim
+/.claude/ @chnu-kim
 /.claude/skills/opensource-maintainer/ @chnu-kim
 /.claude/skills/dispatch-issue/ @chnu-kim
+/.claude/skills/ @chnu-kim
+/.claude/skills/architect/SKILL.md @chnu-kim
+/.claude/skills/issue-drafter/SKILL.md @chnu-kim
+/.claude/skills/retro/SKILL.md @chnu-kim
 /CLAUDE.md @chnu-kim
 /.claude/agents/ @chnu-kim
 /internal/enforcement/ @chnu-kim
@@ -731,12 +749,18 @@ docs/adr/0015-*.md @chnu-kim
 docs/adr/0016-*.md @chnu-kim
 docs/adr/0017-*.md @chnu-kim
 docs/runbooks/phase-b-entry.md @chnu-kim
+docs/runbooks/** @chnu-kim
 scripts/** @chnu-kim
 internal/gate/** @chnu-kim
 cmd/verdict-gate/** @chnu-kim
 configs/gate/** @chnu-kim
+.claude/** @chnu-kim
 .claude/skills/opensource-maintainer/** @chnu-kim
 .claude/skills/dispatch-issue/** @chnu-kim
+.claude/skills/** @chnu-kim
+.claude/skills/architect/SKILL.md @chnu-kim
+.claude/skills/issue-drafter/SKILL.md @chnu-kim
+.claude/skills/retro/SKILL.md @chnu-kim
 CLAUDE.md @chnu-kim
 .claude/agents/** @chnu-kim
 internal/enforcement/** @chnu-kim
@@ -746,4 +770,224 @@ internal/enforcement/** @chnu-kim
 	if !got.Satisfied {
 		t.Fatalf("CheckCodeowners() = %+v, want Satisfied=true for ** notation", got)
 	}
+}
+
+// --- Regression tests for ADR-0016 point 12 / point 15: the .claude root rule,
+// the remaining orchestration skills (architect / issue-drafter / retro) and the
+// docs/runbooks/ directory rule. Same class as the instruction-surface and
+// secret-gate registrations above — a gate that is *instructed* from an unowned
+// file can be turned off without touching gate code ("main에 있음 ≠ 보호됨",
+// ADR-0011 point 4(b)).
+
+func TestCheckCodeowners_MissingHarnessSkillsFailsClosed(t *testing.T) {
+	// ADR-0016 point 15: architect holds the Accepted-promotion human gate and
+	// the protects: twin wiring, issue-drafter the risk:critical human-review and
+	// Accepted-only rules, retro the human gate on durable repo writes. Each
+	// passes the "would editing this change a gate verdict or its evidence?"
+	// test, so leaving them unowned while dispatch-issue is owned is the same
+	// hole MissingInstructionSurfacesFailsClosed guards: the loop rewrites the
+	// procedure that INVOKES the gate. Otherwise-VALID sample with only the
+	// /.claude/ root rule, the /.claude/skills/ directory rule and the three
+	// individual SKILL.md lines removed.
+	content := `/.github/workflows/ @chnu-kim
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+/docs/adr/0011-*.md @chnu-kim
+/docs/adr/0012-*.md @chnu-kim
+/docs/adr/0013-*.md @chnu-kim
+/docs/adr/0014-*.md @chnu-kim
+/docs/adr/0015-*.md @chnu-kim
+/docs/adr/0016-*.md @chnu-kim
+/docs/adr/0017-*.md @chnu-kim
+/docs/runbooks/phase-b-entry.md @chnu-kim
+/docs/runbooks/ @chnu-kim
+/scripts/ @chnu-kim
+/.github/workflows/verdict-gate.yml @chnu-kim
+/internal/gate/ @chnu-kim
+/cmd/verdict-gate/ @chnu-kim
+/configs/gate/ @chnu-kim
+/.claude/skills/opensource-maintainer/ @chnu-kim
+/.claude/skills/dispatch-issue/ @chnu-kim
+/CLAUDE.md @chnu-kim
+/.claude/agents/ @chnu-kim
+/internal/enforcement/ @chnu-kim
+/.github/CODEOWNERS @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if got.Satisfied {
+		t.Fatal("missing sacred paths (architect/issue-drafter/retro SKILL.md) must not satisfy the check")
+	}
+	for _, want := range []string{
+		".claude/skills/architect/SKILL.md",
+		".claude/skills/issue-drafter/SKILL.md",
+		".claude/skills/retro/SKILL.md",
+	} {
+		if !strings.Contains(got.Reason, want) {
+			t.Fatalf("reason %q must name the unprotected path %q", got.Reason, want)
+		}
+	}
+}
+
+func TestCheckCodeowners_HarnessSkillCarveOutCaught(t *testing.T) {
+	// The /.claude/ root rule and the /.claude/skills/ directory rule both look
+	// protective, but GitHub resolves last-match-wins entirely: a later, narrower
+	// ownerless entry for exactly one SKILL.md strips that file while every
+	// directory rule above it still reads as owned. That is the
+	// SecretGateProcedureCarveOutCaught failure mode applied to the retro skill
+	// (its human gate on durable repo writes is what a loop would most like to
+	// relax). Only the individually registered path catches it — which is why
+	// ADR-0016 point 15 registers the three skills file-by-file, not by the
+	// directory rule alone.
+	content := `/.github/workflows/ @chnu-kim
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+/docs/adr/0011-*.md @chnu-kim
+/docs/adr/0012-*.md @chnu-kim
+/docs/adr/0013-*.md @chnu-kim
+/docs/adr/0014-*.md @chnu-kim
+/docs/adr/0015-*.md @chnu-kim
+/docs/adr/0016-*.md @chnu-kim
+/docs/adr/0017-*.md @chnu-kim
+/docs/runbooks/phase-b-entry.md @chnu-kim
+/docs/runbooks/ @chnu-kim
+/scripts/ @chnu-kim
+/.github/workflows/verdict-gate.yml @chnu-kim
+/internal/gate/ @chnu-kim
+/cmd/verdict-gate/ @chnu-kim
+/configs/gate/ @chnu-kim
+/.claude/ @chnu-kim
+/.claude/skills/opensource-maintainer/ @chnu-kim
+/.claude/skills/dispatch-issue/ @chnu-kim
+/.claude/skills/ @chnu-kim
+/.claude/skills/architect/SKILL.md @chnu-kim
+/.claude/skills/issue-drafter/SKILL.md @chnu-kim
+/.claude/skills/retro/SKILL.md @chnu-kim
+/.claude/skills/retro/SKILL.md
+/CLAUDE.md @chnu-kim
+/.claude/agents/ @chnu-kim
+/internal/enforcement/ @chnu-kim
+/.github/CODEOWNERS @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if got.Satisfied {
+		t.Fatal("a narrower ownerless entry stripping one harness skill must not satisfy the check, even though the /.claude/ and /.claude/skills/ directory rules still look protective")
+	}
+	if !strings.Contains(got.Reason, ".claude/skills/retro/SKILL.md") {
+		t.Fatalf("실패 사유가 벗겨진 파일을 지목하지 않음: %q", got.Reason)
+	}
+}
+
+func TestCheckCodeowners_MissingRunbookDirFailsClosed(t *testing.T) {
+	// ADR-0016 point 12: the loop-pr environment provisioning runbook is the
+	// sibling of phase-b-entry.md that carries the narrowing-before-App-key order
+	// and the main-only deployment-branch policy. Protecting only phase-b-entry.md
+	// by its individual line re-creates the #73 false-reassurance: the protected
+	// ADR points operators at an unprotected procedure. Otherwise-VALID sample
+	// with only the /docs/runbooks/ directory rule removed (the phase-b-entry.md
+	// individual line stays), so the check must fail specifically on the
+	// provisioning runbook.
+	content := `/.github/workflows/ @chnu-kim
+/docs/adr/0004-*.md @chnu-kim
+/docs/adr/0007-*.md @chnu-kim
+/docs/adr/0008-*.md @chnu-kim
+/docs/adr/0009-*.md @chnu-kim
+/docs/adr/0010-*.md @chnu-kim
+/docs/adr/0011-*.md @chnu-kim
+/docs/adr/0012-*.md @chnu-kim
+/docs/adr/0013-*.md @chnu-kim
+/docs/adr/0014-*.md @chnu-kim
+/docs/adr/0015-*.md @chnu-kim
+/docs/adr/0016-*.md @chnu-kim
+/docs/adr/0017-*.md @chnu-kim
+/docs/runbooks/phase-b-entry.md @chnu-kim
+/scripts/ @chnu-kim
+/.github/workflows/verdict-gate.yml @chnu-kim
+/internal/gate/ @chnu-kim
+/cmd/verdict-gate/ @chnu-kim
+/configs/gate/ @chnu-kim
+/.claude/ @chnu-kim
+/.claude/skills/opensource-maintainer/ @chnu-kim
+/.claude/skills/dispatch-issue/ @chnu-kim
+/.claude/skills/ @chnu-kim
+/.claude/skills/architect/SKILL.md @chnu-kim
+/.claude/skills/issue-drafter/SKILL.md @chnu-kim
+/.claude/skills/retro/SKILL.md @chnu-kim
+/CLAUDE.md @chnu-kim
+/.claude/agents/ @chnu-kim
+/internal/enforcement/ @chnu-kim
+/.github/CODEOWNERS @chnu-kim
+`
+	got := CheckCodeowners(content)
+	if got.Satisfied {
+		t.Fatal("missing /docs/runbooks/ directory rule must not satisfy the check — the provisioning runbook is then unprotected")
+	}
+	if !strings.Contains(got.Reason, "docs/runbooks/loop-pr-environment-provisioning.md") {
+		t.Fatalf("reason %q must name the unprotected provisioning runbook", got.Reason)
+	}
+}
+
+// TestCodeowners_ADRSchemaDocsOwned is a dedicated owner check that does NOT go
+// through sacredRequiredPaths. docs/adr/README.md (the ADR status-promotion
+// procedure and frontmatter rules) and docs/adr/0000-template.md (the
+// `protects: []` schema) are the canonical sources the ADR-0016 twin table
+// requires owned, but neither matches the `/docs/adr/00XX-*.md` globs that
+// cover numbered ADRs. Registering them in sacredRequiredPaths would collide
+// with sacredADRPathProblems' fail-closed "docs/adr/ prefix => an ADR that
+// declares protects:" check, and widening that checker with a carve-out list
+// is a larger blast radius than the gap it closes — so ownership is protected
+// by the CODEOWNERS lines plus this test, and the registration mechanism
+// decision stays with issue #83 §E-3.
+func TestCodeowners_ADRSchemaDocsOwned(t *testing.T) {
+	schemaDocs := []string{
+		"docs/adr/README.md",
+		"docs/adr/0000-template.md",
+	}
+
+	t.Run("real CODEOWNERS owns both", func(t *testing.T) {
+		raw, err := os.ReadFile("../../.github/CODEOWNERS")
+		if err != nil {
+			t.Fatalf("read real CODEOWNERS: %v", err)
+		}
+		entries := parseCodeowners(string(raw))
+		for _, path := range schemaDocs {
+			owners, matched := effectiveOwner(entries, path)
+			if !matched {
+				t.Fatalf("%s: 매칭되는 CODEOWNERS 패턴이 없음 — ADR status 절차·protects 스키마 정본이 무보호다", path)
+			}
+			if !hasOwner(owners, RequiredOwner) {
+				t.Fatalf("%s: 최종 적용되는 owner가 %s가 아님(실측: %v)", path, RequiredOwner, owners)
+			}
+		}
+	})
+
+	t.Run("later ownerless carve-out strips the template", func(t *testing.T) {
+		// Synthetic: both lines present and owned, then a later, narrower
+		// ownerless entry for exactly 0000-template.md. GitHub applies the LAST
+		// matching entry entirely, so the earlier owned line is not what governs
+		// review — hasOwner must report false for the effective owner set.
+		content := `/docs/adr/README.md @chnu-kim
+/docs/adr/0000-template.md @chnu-kim
+/docs/adr/0000-template.md
+/.github/CODEOWNERS @chnu-kim
+`
+		entries := parseCodeowners(content)
+		owners, matched := effectiveOwner(entries, "docs/adr/0000-template.md")
+		if !matched {
+			t.Fatal("0000-template.md must still match some entry — the carve-out line itself matches")
+		}
+		if hasOwner(owners, RequiredOwner) {
+			t.Fatalf("후행 ownerless 항목이 0000-template.md를 벗겨냈는데도 owner가 남아 있음(실측: %v) — last-match-wins가 아님", owners)
+		}
+		// The sibling line stays owned: the carve-out must be file-precise.
+		owners, matched = effectiveOwner(entries, "docs/adr/README.md")
+		if !matched || !hasOwner(owners, RequiredOwner) {
+			t.Fatalf("README.md must remain owned by %s in the same sample (실측: matched=%v owners=%v)", RequiredOwner, matched, owners)
+		}
+	})
 }

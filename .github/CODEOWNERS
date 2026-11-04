@@ -49,11 +49,20 @@
 # 정의하므로 조용한 개정이 enforcement를 약화(ADR-0016/0017, ADR-0011·0015 amend).
 /docs/adr/0016-*.md @chnu-kim
 /docs/adr/0017-*.md @chnu-kim
+# ADR-0016 twin 표: README.md는 status 승격 절차·frontmatter 규칙의 정본, 0000-template.md는
+# `protects: []` 스키마의 정본이다 — 위 `/docs/adr/00XX-*.md` 글롭에 매치되지 않아 무보호였다.
+# 소유권은 TestCodeowners_ADRSchemaDocsOwned가 검사한다.
+/docs/adr/README.md @chnu-kim
+/docs/adr/0000-template.md @chnu-kim
 # Phase B 진입 절차서(#50) — narrowing 순서·flip-and-verify-or-rollback·부트스트랩 프리체크 등
 # 활성화의 *실행* 단계를 담은 gate-defining 문서. ADR-0015가 이를 지배 절차로 참조하므로,
 # 이 파일이 무보호면 loop가 App key 프로비저닝을 narrowing 앞으로 옮기거나 rollback을 빼는 식으로
 # 보호된 ADR을 우회해 활성화 경로를 조용히 약화할 수 있다("main에 있음 ≠ 보호됨", ADR-0011 point 4(b)).
 /docs/runbooks/phase-b-entry.md @chnu-kim
+# 형제 런북(loop-pr-environment-provisioning.md 등)도 같은 클래스다 — 보호된 ADR이 가리키는
+# 실행 런북이 무보호면 거짓 안심(#73)이 재발한다. 디렉터리 규칙으로 두어 이후 추가되는 런북도
+# 자동 보호하되, 개별 등재는 sacredRequiredPaths가 한다(ADR-0016 point 12).
+/docs/runbooks/ @chnu-kim
 
 # 활성화 증명·변환 스크립트 — hard precondition의 *증거*를 만들어내는 load-bearing 코드.
 # verify-credential-narrowing.sh는 ②(narrowing) 완료 판정의 capability 실측 경로이고, 향후
@@ -80,6 +89,12 @@
 # risk:critical 경로 분류 매핑 파일(ADR-0008 point 5) — 위치는 이슈 #48에서
 # 확정(configs/gate/risk-classification.json). 위 이유와 동일하게 보호 대상.
 /configs/gate/ @chnu-kim
+
+# .claude 루트 규칙(ADR-0016 point 15 R46) — 이 규칙이 없으면 `.claude/settings.json`(프로젝트
+# 훅=임의 명령 실행, 커밋 가능)·새 스킬·새 에이전트가 CODEOWNERS 매칭 0건으로 리뷰 없이 통과한다.
+# last-match-wins이므로 아래 모든 .claude 규칙은 @chnu-kim을 유지해야 한다 — 한 줄이라도 owner가
+# 다르면 그 파일만 벗겨진다(개별 파일 등재는 sacredRequiredPaths + 트리 전수 테스트가 잡는다).
+/.claude/ @chnu-kim
 
 # 커밋 전/CI 시크릿 스캐너와 그 회귀 스위트·allowlist 매니페스트(이슈 #27).
 # ci.yml이 PR 체크아웃에서 이 스크립트를 직접 실행해 유출을 차단하므로 이건
@@ -116,6 +131,13 @@
 #  설치돼 있어 레포 CODEOWNERS로 보호 불가 — 신뢰 경계 밖이라는 알려진 한계로 book한다.)
 # (PR #81 적대 리뷰 R3: leaf는 보호하고 orchestrator를 놓친 같은 클래스 다섯 번째 발생.)
 /.claude/skills/dispatch-issue/ @chnu-kim
+# 나머지 오케스트레이션 스킬도 게이트를 지시한다(ADR-0016 point 15): architect=ADR Accepted 승격
+# 사람 승인 게이트·protects twin 배선, issue-drafter=risk:critical 사람 리뷰 명시·Accepted ADR만 링크,
+# retro=레포 영속 표면 쓰기의 사람 게이트. 디렉터리 규칙 + 개별 줄로 carve-out을 막는다.
+/.claude/skills/ @chnu-kim
+/.claude/skills/architect/SKILL.md @chnu-kim
+/.claude/skills/issue-drafter/SKILL.md @chnu-kim
+/.claude/skills/retro/SKILL.md @chnu-kim
 
 # 이 파일 자신 (self-owned — 반드시 마지막 줄에 유지)
 /.github/CODEOWNERS @chnu-kim
